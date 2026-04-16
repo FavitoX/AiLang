@@ -629,6 +629,12 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
         fn = 'Compensate' + pascal_case(saga) + 'Async'
         lines.append(f"{pad}await {fn}();")
 
+    elif op == 'PARALLEL':
+        lines.extend(_compile_parallel_csharp(inst, indent, ctx))
+
+    elif op == 'AWAIT_ALL':
+        lines.extend(_compile_await_all_csharp(inst, indent, ctx))
+
     elif op == 'CALL_SERVICE':
         # (CALL_SERVICE name (method X) (path "..") (idempotent b) (body {...}) → assign)
         service = inst['service']
@@ -937,6 +943,85 @@ def _compile_store_filter_csharp(inst: dict, indent: int, ctx: dict) -> list[str
     return lines
 
 
+def _compile_parallel_csharp(inst: dict, indent: int, ctx: dict) -> list[str]:
+    """Emit one Task per fiber + a tuple assigned to `inst['assign']` whose fields
+    match fiber names. Actual awaiting happens when AWAIT_ALL compiles — this
+    only spawns and stores the task handles.
+
+    The fiber's "return value" is the assign of its LAST instruction.
+    """
+    pad = "    " * indent
+    assign = inst['assign']
+    fibers = inst.get('fibers', []) or []
+
+    lines = [f"{pad}// ── PARALLEL {assign}: {len(fibers)} fiber(s) ──"]
+    fiber_task_names = []
+    for fiber in fibers:
+        fname = fiber['name']
+        task_var = f"_task_{assign}_{fname}"
+        fiber_task_names.append((fname, task_var))
+
+        # Determine the fiber's "result var" from the last instruction's assign.
+        result_var = None
+        for f_inst in fiber.get('instructions', []):
+            if f_inst.get('assign'):
+                result_var = f_inst['assign']
+
+        lines.append(f"{pad}var {task_var} = Task.Run<System.Text.Json.Nodes.JsonNode?>(async () =>")
+        lines.append(f"{pad}{{")
+        inner_ctx = dict(ctx)
+        inner_ctx['locals'] = dict(ctx.get('locals', {}))
+        for f_inst in fiber.get('instructions', []):
+            lines.extend(compile_instruction_csharp(f_inst, indent + 1, inner_ctx))
+        if result_var:
+            lines.append(f"{pad}    return {result_var};")
+        else:
+            lines.append(f"{pad}    return null;")
+        lines.append(f"{pad}}});")
+
+    # Save the task-name map in ctx so AWAIT_ALL can find it by the assign name.
+    parallel_map = ctx.setdefault('_parallel_tasks', {})
+    parallel_map[assign] = fiber_task_names
+    ctx.setdefault('locals', {})[assign] = 'ParallelResults'
+    return lines
+
+
+def _compile_await_all_csharp(inst: dict, indent: int, ctx: dict) -> list[str]:
+    """Join the tasks from the matching PARALLEL with a timeout, then materialize
+    a tuple variable whose fields carry each fiber's result (or null on
+    failure/timeout). The MATCH OK/ERR idiom on `parallel_results.fiberName`
+    works naturally because non-null = OK, null = ERR."""
+    pad = "    " * indent
+    source = inst['source']
+    timeout_ms = inst.get('timeout_ms') or 0
+    parallel_map = (ctx or {}).get('_parallel_tasks', {})
+    fibers = parallel_map.get(source, [])
+    if not fibers:
+        return [f"{pad}// WARN: AWAIT_ALL {source} — no matching PARALLEL block"]
+
+    task_list = ", ".join(tv for _, tv in fibers)
+    lines = [f"{pad}// ── AWAIT_ALL {source} (timeout {timeout_ms}ms) ──"]
+    lines.append(f"{pad}try")
+    lines.append(f"{pad}{{")
+    if timeout_ms and timeout_ms > 0:
+        lines.append(f"{pad}    await Task.WhenAll({task_list}).WaitAsync(TimeSpan.FromMilliseconds({timeout_ms}));")
+    else:
+        lines.append(f"{pad}    await Task.WhenAll({task_list});")
+    lines.append(f"{pad}}}")
+    lines.append(f"{pad}catch (Exception ex) when (ex is TimeoutException || ex is TaskCanceledException)")
+    lines.append(f"{pad}{{")
+    lines.append(f'{pad}    Console.WriteLine($"[PARALLEL] {source} timed out after {timeout_ms}ms — partial results");')
+    lines.append(f"{pad}}}")
+    # Build the tuple. Named-tuple fields match fiber names verbatim so the
+    # member-access idiom `parallel_results.fetch_products` just works.
+    tuple_fields = ", ".join(
+        f"{fname}: ({tv}.Status == TaskStatus.RanToCompletion ? {tv}.Result : null)"
+        for fname, tv in fibers
+    )
+    lines.append(f"{pad}var {source} = ({tuple_fields});")
+    return lines
+
+
 def _compile_sql_query_csharp(inst: dict, indent: int, ctx: dict) -> list[str]:
     pad = "    " * indent
     store_var = ctx['store_var']
@@ -1053,7 +1138,12 @@ def compile_error_csharp(inst: dict, pad: str) -> list[str]:
 
 
 def compile_match_csharp(inst: dict, indent: int, ctx: dict = None) -> list[str]:
-    """Compile MATCH instruction to C# if/else."""
+    """Compile MATCH instruction to C# if/else.
+
+    The value is used verbatim — C# tuples permit snake_case field names, so
+    `parallel_results.fetch_products` already resolves correctly. Only Go
+    requires PascalCasing of trailing segments (struct fields must be exported).
+    """
     pad = "    " * indent
     lines = []
     value = inst['value']
@@ -1281,16 +1371,18 @@ def generate_csharp(bc, output_dir: str):
     # Event bus (singleton) when any EMIT_EVENT or EVENT_HANDLER exists.
     # EMIT_EVENT can be nested inside MATCH/BRANCH bodies — walk recursively.
     def _walk_all_ops_in_handler(handler):
-        for inst in handler.get('instructions', []):
-            yield inst.get('op')
-            for case_insts in (inst.get('cases') or {}).values():
-                if isinstance(case_insts, list):
-                    for sub in case_insts:
-                        if isinstance(sub, dict):
-                            yield sub.get('op')
-            for sub in inst.get('body', []) or []:
-                if isinstance(sub, dict):
-                    yield sub.get('op')
+        def _walk(insts):
+            for inst in insts:
+                yield inst.get('op')
+                for case_insts in (inst.get('cases') or {}).values():
+                    if isinstance(case_insts, list):
+                        yield from _walk(case_insts)
+                for sub in inst.get('body', []) or []:
+                    if isinstance(sub, dict):
+                        yield from _walk([sub])
+                for fiber in inst.get('fibers', []) or []:
+                    yield from _walk(fiber.get('instructions', []) or [])
+        yield from _walk(handler.get('instructions', []))
 
     event_handlers_cs = [
         (n, h) for n, h in bc.handlers.items() if h.get('type') == 'EVENT_HANDLER'
@@ -1405,12 +1497,20 @@ def generate_csharp(bc, output_dir: str):
         instructions = handler_def.get('instructions', [])
 
         def _walk_ops(inst_list):
-            for i in inst_list:
+            for i in inst_list or []:
+                if not isinstance(i, dict):
+                    continue
                 yield i
                 cases = i.get('cases') or {}
                 for case_insts in cases.values():
                     if isinstance(case_insts, list):
                         yield from _walk_ops(case_insts)
+                # ITERATE/ITERATE_PARALLEL body + PARALLEL fibers
+                for sub in i.get('body', []) or []:
+                    if isinstance(sub, dict):
+                        yield from _walk_ops([sub])
+                for fiber in i.get('fibers', []) or []:
+                    yield from _walk_ops(fiber.get('instructions', []) or [])
 
         all_ops = [i.get('op') for i in _walk_ops(instructions)]
         needs_ctx = (
@@ -1441,7 +1541,7 @@ def generate_csharp(bc, output_dir: str):
         param_str = ", ".join(lambda_params)
         is_async = is_pg or needs_body or uses_call_service or any(
             op in ('SQL_QUERY', 'SQL_STREAM', 'SQL_EXEC', 'STORE_FIND_BY', 'STORE_FILTER',
-                   'STREAM_RESPOND', 'SAGA_COMPENSATE')
+                   'STREAM_RESPOND', 'SAGA_COMPENSATE', 'PARALLEL', 'AWAIT_ALL')
             for op in all_ops
         )
 
@@ -2251,18 +2351,25 @@ def generate_go(bc, output_dir: str):
     primary_store_name, primary_store_def = next(iter(bc.stores.items())) if bc.stores else (None, None)
     primary_schema = primary_store_def['schema'] if primary_store_def else None
 
-    # Pre-scan handlers to decide which optional imports we need.
+    # Pre-scan handlers to decide which optional imports we need — must descend
+    # into MATCH/BRANCH cases, ITERATE bodies, and PARALLEL fibers. Guard each
+    # recursive step because instruction bodies can occasionally hold raw atoms.
     def _walk_ops(h):
-        for inst in h.get('instructions', []):
-            yield inst.get('op')
-            for c in (inst.get('cases') or {}).values():
-                if isinstance(c, list):
-                    for sub in c:
-                        if isinstance(sub, dict):
-                            yield sub.get('op')
-            for sub in inst.get('body', []) or []:
-                if isinstance(sub, dict):
-                    yield sub.get('op')
+        def _walk(insts):
+            for inst in insts or []:
+                if not isinstance(inst, dict):
+                    continue
+                yield inst.get('op')
+                for case_insts in (inst.get('cases') or {}).values():
+                    if isinstance(case_insts, list):
+                        yield from _walk(case_insts)
+                body = inst.get('body') or []
+                if body:
+                    yield from _walk(body)
+                for fiber in inst.get('fibers', []) or []:
+                    yield from _walk(fiber.get('instructions', []) or [])
+        yield from _walk(h.get('instructions', []))
+
     all_ops = set()
     for h in bc.handlers.values():
         for op in _walk_ops(h):
@@ -2276,6 +2383,7 @@ def generate_go(bc, output_dir: str):
         h.get('type') == 'EVENT_HANDLER' for h in bc.handlers.values()
     )
     needs_sagas = bool(bc.sagas) or 'SAGA_COMPENSATE' in all_ops
+    needs_parallel = 'PARALLEL' in all_ops or 'AWAIT_ALL' in all_ops
 
     lines = []
     lines.append("// ═══════════════════════════════════════════════════════════════")
@@ -2306,7 +2414,7 @@ def generate_go(bc, output_dir: str):
         lines.append('\t"os"')
     lines.append('\t"strconv"')
     lines.append('\t"strings"')
-    if has_in_memory_store or needs_resilience_go or needs_events:
+    if has_in_memory_store or needs_resilience_go or needs_events or needs_parallel:
         lines.append('\t"sync"')
     lines.append('\t"time"')
     lines.append("")
@@ -2424,16 +2532,18 @@ def generate_go(bc, output_dir: str):
     ]
     # EMIT_EVENT can be nested in MATCH/BRANCH bodies — mirror the recursive walker.
     def _walk_all_ops_in_handler_go(handler):
-        for inst in handler.get('instructions', []):
-            yield inst.get('op')
-            for case_insts in (inst.get('cases') or {}).values():
-                if isinstance(case_insts, list):
-                    for sub in case_insts:
-                        if isinstance(sub, dict):
-                            yield sub.get('op')
-            for sub in inst.get('body', []) or []:
-                if isinstance(sub, dict):
-                    yield sub.get('op')
+        def _walk(insts):
+            for inst in insts:
+                yield inst.get('op')
+                for case_insts in (inst.get('cases') or {}).values():
+                    if isinstance(case_insts, list):
+                        yield from _walk(case_insts)
+                for sub in inst.get('body', []) or []:
+                    if isinstance(sub, dict):
+                        yield from _walk([sub])
+                for fiber in inst.get('fibers', []) or []:
+                    yield from _walk(fiber.get('instructions', []) or [])
+        yield from _walk(handler.get('instructions', []))
     uses_events_go = bool(event_handlers_go) or any(
         op == 'EMIT_EVENT'
         for h in bc.handlers.values()
@@ -3492,6 +3602,12 @@ def compile_instruction_go(inst: dict, indent: int, ctx: dict = None) -> list[st
         fn = 'compensate' + pascal_case(saga)
         lines.append(f"{pad}{fn}(r.Context())")
 
+    elif op == 'PARALLEL':
+        lines.extend(_compile_parallel_go(inst, indent, ctx))
+
+    elif op == 'AWAIT_ALL':
+        lines.extend(_compile_await_all_go(inst, indent, ctx))
+
     elif op == 'CALL_SERVICE':
         service = inst['service']
         method = inst.get('method', 'GET').upper()
@@ -3775,6 +3891,83 @@ def _compile_store_filter_go(inst: dict, indent: int, ctx: dict) -> list[str]:
     return lines
 
 
+def _compile_parallel_go(inst: dict, indent: int, ctx: dict) -> list[str]:
+    """Emit a goroutine per fiber, each writing its last-assign into a
+    per-fiber shared variable. An anonymous-struct `parallel_results` is
+    materialized by the AWAIT_ALL helper below once the WaitGroup drains
+    (or the timeout fires)."""
+    pad = "\t" * indent
+    assign = inst['assign']
+    fibers = inst.get('fibers', []) or []
+
+    lines = [f"{pad}// ── PARALLEL {assign}: {len(fibers)} fiber(s) ──"]
+    fiber_result_vars = []  # [(fiber_name, shared_var), ...]
+
+    for fiber in fibers:
+        fname = fiber['name']
+        shared = f"_pres_{assign}_{fname}"
+        fiber_result_vars.append((fname, shared))
+        lines.append(f"{pad}var {shared} map[string]any")
+
+    lines.append(f"{pad}var _wg_{assign} sync.WaitGroup")
+    lines.append(f"{pad}_wg_{assign}.Add({len(fibers)})")
+
+    for fiber in fibers:
+        fname = fiber['name']
+        shared = f"_pres_{assign}_{fname}"
+        result_var = None
+        for f_inst in fiber.get('instructions', []):
+            if f_inst.get('assign'):
+                result_var = f_inst['assign']
+        lines.append(f"{pad}go func() {{")
+        lines.append(f"{pad}\tdefer _wg_{assign}.Done()")
+        inner_ctx = dict(ctx)
+        inner_ctx['locals'] = dict(ctx.get('locals', {}))
+        for f_inst in fiber.get('instructions', []):
+            lines.extend(compile_instruction_go(f_inst, indent + 1, inner_ctx))
+        if result_var:
+            lines.append(f"{pad}\t{shared} = {result_var}")
+        lines.append(f"{pad}}}()")
+
+    parallel_map = ctx.setdefault('_parallel_tasks', {})
+    parallel_map[assign] = fiber_result_vars
+    ctx.setdefault('locals', {})[assign] = 'ParallelResults'
+    return lines
+
+
+def _compile_await_all_go(inst: dict, indent: int, ctx: dict) -> list[str]:
+    """Join the WaitGroup from the matching PARALLEL with a timeout, then build
+    an anonymous-struct value with PascalCased fields matching fiber names
+    (so downstream `parallel_results.fetch_products` PascalCases to
+    `parallel_results.FetchProducts`, resolvable as a struct field)."""
+    pad = "\t" * indent
+    source = inst['source']
+    timeout_ms = inst.get('timeout_ms') or 0
+    parallel_map = (ctx or {}).get('_parallel_tasks', {})
+    fibers = parallel_map.get(source, [])
+    if not fibers:
+        return [f"{pad}// WARN: AWAIT_ALL {source} — no matching PARALLEL block"]
+
+    lines = [f"{pad}// ── AWAIT_ALL {source} (timeout {timeout_ms}ms) ──"]
+    lines.append(f"{pad}_done_{source} := make(chan struct{{}})")
+    lines.append(f"{pad}go func() {{ _wg_{source}.Wait(); close(_done_{source}) }}()")
+    if timeout_ms and timeout_ms > 0:
+        lines.append(f"{pad}select {{")
+        lines.append(f"{pad}case <-_done_{source}:")
+        lines.append(f"{pad}case <-time.After({timeout_ms} * time.Millisecond):")
+        lines.append(f'{pad}\tslog.Warn("parallel timeout", "name", "{source}", "timeout_ms", {timeout_ms})')
+        lines.append(f"{pad}}}")
+    else:
+        lines.append(f"{pad}<-_done_{source}")
+
+    # Build anonymous struct — Go inline struct field separator is `;`, not `,`.
+    struct_fields = "; ".join(f"{pascal_case(fn)} map[string]any" for fn, _ in fibers)
+    field_inits = ", ".join(f"{pascal_case(fn)}: {sv}" for fn, sv in fibers)
+    lines.append(f"{pad}{source} := struct {{ {struct_fields} }}{{{field_inits}}}")
+    lines.append(f"{pad}_ = {source}  // suppress unused warning when handler reads fields conditionally")
+    return lines
+
+
 def _compile_sql_query_go(inst: dict, indent: int, ctx: dict) -> list[str]:
     pad = "\t" * indent
     store = ctx['store_accessor']
@@ -3897,7 +4090,9 @@ def _compile_stream_respond_go(inst: dict, indent: int, ctx: dict) -> list[str]:
 def compile_match_go(inst: dict, indent: int, ctx: dict = None) -> list[str]:
     pad = "\t" * indent
     lines = []
-    value = inst['value']
+    # Member access like `parallel_results.fetch_products` must PascalCase the
+    # trailing segments to match Go struct field naming.
+    value = _go_value(inst['value'])
     cases = inst.get('cases', {})
 
     if 'OK' in cases and 'NONE' in cases:

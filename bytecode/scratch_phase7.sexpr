@@ -1,0 +1,74 @@
+;; Scratch service: PARALLEL fan-out to two upstream services via CALL_SERVICE,
+;; joined by AWAIT_ALL with a timeout. Post-join the handler matches on each
+;; fiber's result (null = ERR, non-null = OK) and returns a summary.
+
+(service scratch_parallel
+  (version "0.9-phase7")
+  (port 8096))
+
+(schema FanOutResponse
+  (field products_ok bool (required))
+  (field orders_ok   bool (required)))
+
+(config
+  (jwt_secret secret "JWT_SECRET"))
+
+(auth
+  (provider jwt)
+  (secret_ref jwt_secret))
+
+(cors
+  (origins "*")
+  (methods GET)
+  (headers "Content-Type" "Authorization")
+  (max_age 3600))
+
+(dependencies
+  (product_service
+    (type SERVICE_REF)
+    (target product_service)
+    (base_url_ref ENV.PRODUCT_SERVICE_URL)
+    (default "http://localhost:8080"))
+  (order_service
+    (type SERVICE_REF)
+    (target order_service)
+    (base_url_ref ENV.ORDER_SERVICE_URL)
+    (default "http://localhost:8081")))
+
+(route GET "/fan-out" handler_fan_out)
+
+(handler handler_fan_out
+  (auth (requires authenticated))
+  (returns (RESULT FanOutResponse Error))
+  (do
+    ;; Two fibers run concurrently; AWAIT_ALL joins with a 2s cap.
+    (PARALLEL → parallel_results
+      (fiber fetch_products
+        (CALL_SERVICE product_service
+          (method GET)
+          (path "/products")
+          (idempotent true)
+          → products_response))
+      (fiber fetch_orders
+        (CALL_SERVICE order_service
+          (method GET)
+          (path "/orders")
+          (idempotent true)
+          → orders_response)))
+    (AWAIT_ALL parallel_results (timeout_ms 2000))
+
+    ;; Per-fiber match: null ⇒ ERR (graceful degradation), non-null ⇒ OK.
+    (DEFINE_VAR products_ok bool false)
+    (DEFINE_VAR orders_ok   bool false)
+    (MATCH parallel_results.fetch_products
+      (NONE (LOG WARNING "fetch_products failed"))
+      (OK   (SET_VAR products_ok true)))
+    (MATCH parallel_results.fetch_orders
+      (NONE (LOG WARNING "fetch_orders failed"))
+      (OK   (SET_VAR orders_ok true)))
+
+    (CONSTRUCT FanOutResponse
+      (products_ok products_ok)
+      (orders_ok   orders_ok)
+      → resp)
+    (RESPOND 200 resp)))

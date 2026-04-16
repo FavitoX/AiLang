@@ -523,6 +523,39 @@ def sexpr_to_instruction(expr: list) -> dict:
         # (SAGA_COMPENSATE saga_name)
         return {'op': 'SAGA_COMPENSATE', 'saga': expr[1] if len(expr) > 1 else ''}
 
+    if op == 'PARALLEL':
+        # (PARALLEL → assign (fiber name inst...) (fiber name inst...) ...)
+        # Note: the arrow comes BEFORE the fibers, not after — fibers are the
+        # tail of the form. So _split_arrow isn't the right tool here.
+        idx = _arrow_idx(expr)
+        if idx > 0 and idx + 1 < len(expr):
+            assign = expr[idx + 1]
+            tail = expr[idx + 2:]
+        else:
+            assign = None
+            tail = expr[1:]
+        fibers = []
+        for a in tail:
+            if isinstance(a, list) and a and a[0] == 'fiber':
+                fiber_name = str(a[1]) if len(a) > 1 else 'fiber'
+                fiber_insts = []
+                for sub in a[2:]:
+                    if isinstance(sub, list):
+                        parsed = sexpr_to_instruction(sub)
+                        if parsed:
+                            fiber_insts.append(parsed)
+                fibers.append({'name': fiber_name, 'instructions': fiber_insts})
+        return {'op': 'PARALLEL', 'assign': assign, 'fibers': fibers}
+
+    if op == 'AWAIT_ALL':
+        # (AWAIT_ALL source (timeout_ms N))
+        source = expr[1] if len(expr) > 1 else None
+        timeout_ms = None
+        for a in expr[2:]:
+            if isinstance(a, list) and a and a[0] == 'timeout_ms' and len(a) > 1:
+                timeout_ms = a[1]
+        return {'op': 'AWAIT_ALL', 'source': source, 'timeout_ms': timeout_ms}
+
     if op == 'CALL_SERVICE':
         # (CALL_SERVICE service_name (method GET) (path "...") (idempotent true) (body ...)? → assign)
         args, assign = _split_arrow(expr)
