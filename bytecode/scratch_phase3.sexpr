@@ -1,0 +1,78 @@
+;; Scratch service that exercises CALL_SERVICE + (dependencies SERVICE_REF).
+;; Calls a remote product_service via HTTP, matches the result null-vs-OK,
+;; and forwards success back to the client. No store, no resilience yet.
+
+(service scratch_callsvc
+  (version "0.9-phase3")
+  (port 8092))
+
+(schema ProxyRequest
+  (field product_id string (required)))
+
+(schema ProxyResponse
+  (field found bool (required)))
+
+(config
+  (jwt_secret secret "JWT_SECRET"))
+
+(auth
+  (provider jwt)
+  (secret_ref jwt_secret))
+
+(cors
+  (origins "*")
+  (methods GET POST)
+  (headers "Content-Type" "Authorization")
+  (max_age 3600))
+
+;; ── SERVICE_REF dependency ──
+(dependencies
+  (product_service
+    (type SERVICE_REF)
+    (target product_service)
+    (base_url_ref ENV.PRODUCT_SERVICE_URL)
+    (default "http://localhost:8080")))
+
+(route POST "/proxy/check" handler_proxy_check)
+(route POST "/proxy/update" handler_proxy_update)
+
+;; ── GET-style CALL_SERVICE ──
+(handler handler_proxy_check
+  (auth (requires authenticated))
+  (returns (RESULT ProxyResponse Error))
+  (do
+    (READ_BODY ProxyRequest → body)
+    (MATCH body
+      (ERR (ERR_INVALID_BODY "ProxyRequest"))
+      (OK
+        (CALL_SERVICE product_service
+          (method GET)
+          (path "/products/{body.product_id}")
+          (idempotent true)
+          → product_result)
+        (MATCH product_result
+          (NONE (ERR_NOT_FOUND "product" body.product_id))
+          (OK
+            (CONSTRUCT ProxyResponse (found true) → resp)
+            (RESPOND 200 resp)))))))
+
+;; ── POST-with-body CALL_SERVICE (non-idempotent, used to verify body codegen) ──
+(handler handler_proxy_update
+  (auth (requires authenticated))
+  (returns (RESULT ProxyResponse Error))
+  (do
+    (READ_BODY ProxyRequest → body)
+    (MATCH body
+      (ERR (ERR_INVALID_BODY "ProxyRequest"))
+      (OK
+        (CALL_SERVICE product_service
+          (method POST)
+          (path "/products/{body.product_id}/bump")
+          (idempotent false)
+          (body (reason "scratch-phase3"))
+          → update_result)
+        (MATCH update_result
+          (NONE (ERR_UNAVAILABLE "product_service"))
+          (OK
+            (CONSTRUCT ProxyResponse (found true) → resp)
+            (RESPOND 200 resp)))))))

@@ -1,0 +1,551 @@
+;; ═══════════════════════════════════════════════════════════════
+;; AILang Bytecode — S-expression format
+;; Service: product_service (con PostgreSQL provider)
+;; Version: 0.8
+;; ═══════════════════════════════════════════════════════════════
+
+(service product_service
+  (version "0.8")
+  (port 8080)
+  (on_fiber_crash RESTART_FIBER)
+  (on_service_crash NOTIFY_RESTART))
+
+;; ── Schemas ──────────────────────────────────────────────────
+
+(schema Product
+  (field id         uuid      (auto_gen))
+  (field sku        string    (required) (min 1) (max 50))
+  (field name       string    (required) (min 1) (max 200))
+  (field price      decimal   (required) (gt 0))
+  (field stock      int       (required) (gte 0))
+  (field category   string    (required) (min 1) (max 100))
+  (field active     bool      (default true))
+  (field created_at timestamp (auto_gen))
+  (field updated_at timestamp (auto_gen)))
+
+(schema ProductStats
+  (field category       string)
+  (field product_count  int)
+  (field avg_price      decimal)
+  (field total_stock    int))
+
+;; ── Provider: PostgreSQL ─────────────────────────────────────
+
+(store product_store
+  (provider PostgreSQL)
+  (connection CONFIG.db_connection)
+  (pool
+    (min 5)
+    (max 50)
+    (idle_timeout (duration 30 seconds)))
+  (schema Product)
+  (table "products")
+  (mapping
+    (field id         → column "id"         type "UUID"          default "gen_random_uuid()")
+    (field sku        → column "sku"        type "VARCHAR(50)"   not_null unique)
+    (field name       → column "name"       type "VARCHAR(200)"  not_null)
+    (field price      → column "price"      type "NUMERIC(10,2)" not_null)
+    (field stock      → column "stock"      type "INTEGER"       not_null default "0")
+    (field category   → column "category"   type "VARCHAR(100)"  not_null)
+    (field active     → column "active"     type "BOOLEAN"       not_null default "true")
+    (field created_at → column "created_at" type "TIMESTAMPTZ"   not_null default "NOW()")
+    (field updated_at → column "updated_at" type "TIMESTAMPTZ"   not_null default "NOW()")))
+
+;; ── Config ───────────────────────────────────────────────────
+
+(config
+  (port              int     8080)
+  (log_level         enum    (ERROR WARNING INFO DEBUG) INFO)
+  (db_connection     secret  "DB_CONNECTION_STRING")
+  (jwt_secret        secret  "JWT_SECRET")
+  (export_page_size  int     1000))
+
+;; ── Auth ─────────────────────────────────────────────────────
+
+(auth
+  (provider jwt)
+  (secret_ref jwt_secret))
+
+;; ── CORS ─────────────────────────────────────────────────────
+
+(cors
+  (origins "*")
+  (methods GET POST PUT DELETE)
+  (headers "Content-Type" "Authorization")
+  (max_age 3600))
+
+;; ── Rate Limiting ────────────────────────────────────────────
+
+(rate_limit
+  (max_rps 200)
+  (burst 50)
+  (on_limit ERR_RATE_LIMITED))
+
+;; ── Dependencies ─────────────────────────────────────────────
+
+(depends_on product_store CLOCK)
+
+;; ── Routes ───────────────────────────────────────────────────
+
+(route GET    "/products"                handler_list)
+(route GET    "/products/category/:cat"  handler_by_category)
+(route GET    "/products/sku/:sku"       handler_by_sku)
+(route GET    "/products/stats"          handler_stats)
+(route GET    "/products/export"         handler_export)
+(route GET    "/products/:id"            handler_get)
+(route POST   "/products"               handler_create)
+(route PUT    "/products/:id"            handler_update)
+(route DELETE "/products/:id"            handler_delete)
+
+;; ═══════════════════════════════════════════════════════════════
+;; STORE OPERATIONS — CRUD simple
+;; 
+;; STORE_FIND      → por PK, retorna RESULT(T, NONE)
+;; STORE_FIND_BY   → por campo(s), retorna RESULT(T, NONE) 
+;; STORE_FILTER    → por filtro, retorna List<T> con paginación
+;; STORE_LIST_ALL  → todos, retorna List<T> con paginación
+;; STORE_INSERT    → inserta, retorna T
+;; STORE_UPDATE    → reemplaza, retorna T
+;; STORE_DELETE    → elimina
+;;
+;; Internamente generan SQL parametrizado (prepared statements).
+;; SIEMPRE seguro. No se puede concatenar SQL.
+;; ═══════════════════════════════════════════════════════════════
+
+;; ── STORE_LIST_ALL: todos, con paginación ────────────────────
+
+(handler handler_list
+  (auth PUBLIC)
+  (returns (RESULT (Paginated Product) Error))
+  (do
+    (READ_QUERY "page"  int → page  (default 1))
+    (READ_QUERY "limit" int → limit (default 20))
+
+    ;; Genera:
+    ;; SELECT * FROM products 
+    ;; LIMIT $1 OFFSET $2
+    ;; + SELECT COUNT(*) FROM products
+    (STORE_LIST_ALL product_store
+      (paginate (page page) (limit limit) (max_limit 100))
+      → result)
+
+    ;; result = { data: [...], page: 1, limit: 20, total: 1543, total_pages: 78 }
+    (RESPOND 200 result)))
+
+;; ── STORE_FIND: por PK ───────────────────────────────────────
+
+(handler handler_get
+  (auth PUBLIC)
+  (params (id uuid))
+  (returns (RESULT Product Error))
+  (do
+    (READ_PARAM id uuid → id)
+
+    ;; Genera: SELECT * FROM products WHERE id = $1
+    (STORE_FIND product_store id → product)
+
+    (MATCH product
+      (OK   (RESPOND 200 product))
+      (NONE (ERR_NOT_FOUND "product" id)))))
+
+;; ── STORE_FIND_BY: por campo único, retorna uno o ninguno ────
+
+(handler handler_by_sku
+  (auth PUBLIC)
+  (params (sku string))
+  (returns (RESULT Product Error))
+  (do
+    (READ_PARAM sku string → sku)
+
+    ;; Genera: SELECT * FROM products WHERE sku = $1 LIMIT 1
+    (STORE_FIND_BY product_store
+      (where (= sku @sku))
+      (param sku string sku)
+      → product)
+
+    (MATCH product
+      (OK   (RESPOND 200 product))
+      (NONE (ERR_NOT_FOUND "product" sku)))))
+
+;; ── STORE_FILTER: por filtro, retorna N con paginación ───────
+
+(handler handler_by_category
+  (auth PUBLIC)
+  (params (cat string))
+  (returns (RESULT (Paginated Product) Error))
+  (do
+    (READ_PARAM cat string → category)
+    (READ_QUERY "page"  int → page  (default 1))
+    (READ_QUERY "limit" int → limit (default 20))
+
+    ;; Genera:
+    ;; SELECT * FROM products WHERE category = $1 AND active = true
+    ;; LIMIT $2 OFFSET $3
+    ;; + SELECT COUNT(*) FROM products WHERE category = $1 AND active = true
+    (STORE_FILTER product_store
+      (where (and (= category @category) (= active true)))
+      (param category string category)
+      (paginate (page page) (limit limit) (max_limit 100))
+      → result)
+
+    ;; result = { data: [...], page: 1, limit: 20, total: 87, total_pages: 5 }
+    (RESPOND 200 result)))
+
+;; ── STORE_INSERT ─────────────────────────────────────────────
+
+(handler handler_create
+  (auth (requires authenticated))
+  (returns (RESULT Product Error))
+  (do
+    (READ_BODY Product → body)
+    (MATCH body
+      (ERR (ERR_INVALID_BODY "Product"))
+      (OK
+        ;; Genera: INSERT INTO products (sku, name, price, stock, category)
+        ;;         VALUES ($1, $2, $3, $4, $5) RETURNING *
+        (STORE_INSERT product_store body → product)
+        (EMIT_EVENT product_created product)
+        (RESPOND 201 product)))))
+
+;; ── STORE_UPDATE ─────────────────────────────────────────────
+
+(handler handler_update
+  (auth (requires authenticated))
+  (params (id uuid))
+  (returns (RESULT Product Error))
+  (do
+    (READ_PARAM id uuid → id)
+    (STORE_FIND product_store id → existing)
+    (MATCH existing
+      (NONE (ERR_NOT_FOUND "product" id))
+      (OK
+        (READ_BODY Product → body)
+        (MATCH body
+          (ERR (ERR_INVALID_BODY "Product"))
+          (OK
+            ;; Genera: UPDATE products SET sku=$1, name=$2, price=$3, 
+            ;;         stock=$4, category=$5, updated_at=NOW()
+            ;;         WHERE id=$6 RETURNING *
+            (STORE_UPDATE product_store id body → updated)
+            (EMIT_EVENT product_updated updated)
+            (RESPOND 200 updated)))))))
+
+;; ── STORE_DELETE ─────────────────────────────────────────────
+
+(handler handler_delete
+  (auth (requires authenticated))
+  (params (id uuid))
+  (returns (RESULT Void Error))
+  (do
+    (READ_PARAM id uuid → id)
+    (STORE_FIND product_store id → product)
+    (MATCH product
+      (NONE (ERR_NOT_FOUND "product" id))
+      (OK
+        (BRANCH (> product.stock 0)
+          (TRUE
+            (ERR_BUSINESS_RULE "cannot_delete_with_stock"
+              "product has stock > 0"))
+          (FALSE
+            (STORE_DELETE product_store id)
+            (EMIT_EVENT product_deleted id)
+            (RESPOND 204)))))))
+
+;; ═══════════════════════════════════════════════════════════════
+;; SQL_QUERY — territorio de queries complejas
+;; JOINs, aggregations, CTEs, window functions, subqueries
+;; SIEMPRE prepared statements. No concatenación de SQL.
+;; ═══════════════════════════════════════════════════════════════
+
+(handler handler_stats
+  (auth (requires authenticated))
+  (returns (RESULT (List ProductStats) Error))
+  (do
+    (SQL_QUERY product_store
+      "SELECT
+         category,
+         COUNT(*)            AS product_count,
+         ROUND(AVG(price),2) AS avg_price,
+         SUM(stock)          AS total_stock
+       FROM products
+       WHERE active = true
+       GROUP BY category
+       ORDER BY product_count DESC"
+      → stats)
+
+    (RESPOND 200 stats)))
+
+;; ═══════════════════════════════════════════════════════════════
+;; SQL_STREAM — datasets grandes, cursor/reader
+;; No carga todo en memoria. Trae de a batches.
+;; ═══════════════════════════════════════════════════════════════
+
+(handler handler_export
+  (auth (requires authenticated))
+  (returns (RESULT Void Error))
+  (do
+    (SQL_STREAM product_store
+      "SELECT id, sku, name, price, stock, category, created_at
+       FROM products
+       WHERE active = true
+       ORDER BY created_at ASC"
+      (batch_size CONFIG.export_page_size)
+      → product_stream)
+
+    ;; STREAM_RESPOND: envía como JSON streaming (NDJSON)
+    ;; Cada batch se serializa y envía, liberando memoria
+    (STREAM_RESPOND 200 product_stream
+      (content_type "application/x-ndjson"))))
+
+;; ═══════════════════════════════════════════════════════════════
+;; SQL_EXEC — operaciones que no retornan datos
+;; ═══════════════════════════════════════════════════════════════
+
+;; Ejemplo: job de limpieza (invocado por scheduler externo)
+;; (route POST "/jobs/deactivate-old" handler_deactivate_old)
+;;
+;; (handler handler_deactivate_old
+;;   (auth (requires service_account))
+;;   (do
+;;     (CLOCK.NOW → now)
+;;     (COMPUTE_DATE now - (duration 90 days) → cutoff)
+;;
+;;     (SQL_EXEC product_store
+;;       "UPDATE products SET active = false, updated_at = NOW()
+;;        WHERE active = true AND updated_at < @cutoff"
+;;       (param cutoff timestamp cutoff)
+;;       → affected_rows)
+;;
+;;     (LOG INFO "deactivated {affected_rows} old products")
+;;     (RESPOND 200 (processed affected_rows))))
+
+;; ═══════════════════════════════════════════════════════════════
+;; SQL_TRANSACTION — atomicidad
+;; Si algo falla → rollback automático
+;; ═══════════════════════════════════════════════════════════════
+
+;; Ejemplo: transferir stock entre productos
+;; (handler handler_transfer_stock
+;;   (auth (requires authenticated))
+;;   (do
+;;     (READ_BODY TransferRequest → body)
+;;
+;;     (SQL_TRANSACTION product_store → tx_result
+;;       (do
+;;         (SQL_EXEC product_store
+;;           "UPDATE products SET stock = stock - @qty, updated_at = NOW()
+;;            WHERE id = @from_id AND stock >= @qty"
+;;           (param from_id uuid body.from_product_id)
+;;           (param qty     int  body.quantity)
+;;           → rows_from)
+;;
+;;         (BRANCH (= rows_from 0)
+;;           (TRUE (ERR_BUSINESS_RULE "insufficient_stock" "not enough stock"))
+;;           (FALSE
+;;             (SQL_EXEC product_store
+;;               "UPDATE products SET stock = stock + @qty, updated_at = NOW()
+;;                WHERE id = @to_id"
+;;               (param to_id uuid body.to_product_id)
+;;               (param qty   int  body.quantity)
+;;               → rows_to)
+;;
+;;             (BRANCH (= rows_to 0)
+;;               (TRUE  (ERR_NOT_FOUND "product" body.to_product_id))
+;;               (FALSE (RESPOND 200 (transferred body.quantity))))))))))
+
+;; ═══════════════════════════════════════════════════════════════
+;; TESTS
+;; ═══════════════════════════════════════════════════════════════
+
+(tests product_service
+
+  ;; ── STORE_INSERT + STORE_FIND ──
+
+  (test "create_and_get"
+    (setup (RESET_STORE product_store))
+    (run
+      (REQUEST POST "/products"
+        (auth true)
+        (body (sku "WDG-001") (name "Widget") (price 9.99) 
+              (stock 10) (category "electronics")))
+      (ASSERT status 201)
+      (ASSERT body.name "Widget")
+      (ASSERT body.sku "WDG-001")
+      (ASSERT body.active true)
+      (ASSERT body.id exists)
+      (ASSERT body.created_at exists)
+      (CAPTURE body.id → created_id)
+
+      (REQUEST GET "/products/{created_id}")
+      (ASSERT status 200)
+      (ASSERT body.name "Widget"))
+    (clean (RESET_STORE product_store)))
+
+  ;; ── STORE_FIND: not found ──
+
+  (test "get_not_found"
+    (run
+      (REQUEST GET "/products/00000000-0000-0000-0000-000000000000")
+      (ASSERT status 404)
+      (ASSERT body.error.type "NOT_FOUND")))
+
+  ;; ── STORE_FIND_BY: buscar por SKU ──
+
+  (test "find_by_sku"
+    (setup
+      (RESET_STORE product_store)
+      (SQL_SEED product_store
+        "INSERT INTO products (id, sku, name, price, stock, category)
+         VALUES ('a0000000-0000-0000-0000-000000000001', 'FIND-SKU', 'FindMe', 25, 10, 'test')"))
+    (run
+      (REQUEST GET "/products/sku/FIND-SKU")
+      (ASSERT status 200)
+      (ASSERT body.name "FindMe")
+      (ASSERT body.sku "FIND-SKU"))
+    (clean (RESET_STORE product_store)))
+
+  (test "find_by_sku_not_found"
+    (setup (RESET_STORE product_store))
+    (run
+      (REQUEST GET "/products/sku/NONEXISTENT")
+      (ASSERT status 404)
+      (ASSERT body.error.type "NOT_FOUND"))
+    (clean (RESET_STORE product_store)))
+
+  ;; ── STORE_FILTER: por categoría con paginación ──
+
+  (test "filter_by_category"
+    (setup
+      (RESET_STORE product_store)
+      (SQL_SEED product_store
+        "INSERT INTO products (id, sku, name, price, stock, category) VALUES
+         ('b0000000-0000-0000-0000-000000000001', 'EL-001', 'Phone',  500, 10, 'electronics'),
+         ('b0000000-0000-0000-0000-000000000002', 'EL-002', 'Laptop', 1000, 5, 'electronics'),
+         ('b0000000-0000-0000-0000-000000000003', 'CL-001', 'Shirt',  30, 100, 'clothing')"))
+    (run
+      (REQUEST GET "/products/category/electronics")
+      (ASSERT status 200)
+      (ASSERT body.data.length 2)
+      (ASSERT body.total 2)
+      (ASSERT body.page 1))
+    (clean (RESET_STORE product_store)))
+
+  (test "filter_by_category_paginated"
+    (setup
+      (RESET_STORE product_store)
+      (SQL_SEED product_store
+        "INSERT INTO products (id, sku, name, price, stock, category) VALUES
+         ('c0000000-0000-0000-0000-000000000001', 'P-01', 'Prod 1', 10, 10, 'bulk'),
+         ('c0000000-0000-0000-0000-000000000002', 'P-02', 'Prod 2', 10, 10, 'bulk'),
+         ('c0000000-0000-0000-0000-000000000003', 'P-03', 'Prod 3', 10, 10, 'bulk'),
+         ('c0000000-0000-0000-0000-000000000004', 'P-04', 'Prod 4', 10, 10, 'bulk'),
+         ('c0000000-0000-0000-0000-000000000005', 'P-05', 'Prod 5', 10, 10, 'bulk')"))
+    (run
+      (REQUEST GET "/products/category/bulk?page=1&limit=2")
+      (ASSERT status 200)
+      (ASSERT body.data.length 2)
+      (ASSERT body.total 5)
+      (ASSERT body.total_pages 3)
+      (ASSERT body.page 1)
+
+      (REQUEST GET "/products/category/bulk?page=3&limit=2")
+      (ASSERT status 200)
+      (ASSERT body.data.length 1)
+      (ASSERT body.page 3))
+    (clean (RESET_STORE product_store)))
+
+  ;; ── STORE_LIST_ALL: con paginación ──
+
+  (test "list_all_paginated"
+    (setup
+      (RESET_STORE product_store)
+      (SQL_SEED product_store
+        "INSERT INTO products (id, sku, name, price, stock, category) VALUES
+         ('d0000000-0000-0000-0000-000000000001', 'A-01', 'A', 10, 10, 'x'),
+         ('d0000000-0000-0000-0000-000000000002', 'A-02', 'B', 10, 10, 'x'),
+         ('d0000000-0000-0000-0000-000000000003', 'A-03', 'C', 10, 10, 'x')"))
+    (run
+      (REQUEST GET "/products?page=1&limit=2")
+      (ASSERT status 200)
+      (ASSERT body.data.length 2)
+      (ASSERT body.total 3)
+      (ASSERT body.total_pages 2))
+    (clean (RESET_STORE product_store)))
+
+  ;; ── STORE_DELETE: regla de negocio ──
+
+  (test "delete_with_stock_rejected"
+    (setup
+      (RESET_STORE product_store)
+      (SQL_SEED product_store
+        "INSERT INTO products (id, sku, name, price, stock, category)
+         VALUES ('e0000000-0000-0000-0000-000000000001', 'DEL-01', 'Stocked', 10, 5, 'test')"))
+    (run
+      (REQUEST DELETE "/products/e0000000-0000-0000-0000-000000000001"
+        (auth true))
+      (ASSERT status 422)
+      (ASSERT body.error.type "BUSINESS_RULE"))
+    (clean (RESET_STORE product_store)))
+
+  (test "delete_success"
+    (setup
+      (RESET_STORE product_store)
+      (SQL_SEED product_store
+        "INSERT INTO products (id, sku, name, price, stock, category)
+         VALUES ('f0000000-0000-0000-0000-000000000001', 'DEL-02', 'NoStock', 10, 0, 'test')"))
+    (run
+      (REQUEST DELETE "/products/f0000000-0000-0000-0000-000000000001"
+        (auth true))
+      (ASSERT status 204)
+
+      (REQUEST GET "/products/f0000000-0000-0000-0000-000000000001")
+      (ASSERT status 404))
+    (clean (RESET_STORE product_store)))
+
+  ;; ── SQL_QUERY: aggregation ──
+
+  (test "stats_by_category"
+    (setup
+      (RESET_STORE product_store)
+      (SQL_SEED product_store
+        "INSERT INTO products (id, sku, name, price, stock, category) VALUES
+         ('g0000000-0000-0000-0000-000000000001', 'ST-01', 'Phone',  500, 10, 'electronics'),
+         ('g0000000-0000-0000-0000-000000000002', 'ST-02', 'Laptop', 1000, 5, 'electronics'),
+         ('g0000000-0000-0000-0000-000000000003', 'ST-03', 'Shirt',  30, 100, 'clothing')"))
+    (run
+      (REQUEST GET "/products/stats"
+        (auth true))
+      (ASSERT status 200)
+      (ASSERT body.length 2))
+    (clean (RESET_STORE product_store)))
+
+  ;; ── Validación ──
+
+  (test "create_invalid_price"
+    (run
+      (REQUEST POST "/products"
+        (auth true)
+        (body (sku "BAD-01") (name "Bad") (price -5) (stock 0) (category "test")))
+      (ASSERT status 400)))
+
+  (test "create_missing_name"
+    (run
+      (REQUEST POST "/products"
+        (auth true)
+        (body (sku "BAD-02") (price 10) (stock 0) (category "test")))
+      (ASSERT status 400)))
+
+  ;; ── Auth ──
+
+  (test "unauthorized_create"
+    (run
+      (REQUEST POST "/products"
+        (auth false)
+        (body (sku "NO-AUTH") (name "NoAuth") (price 1) (stock 0) (category "test")))
+      (ASSERT status 401)))
+
+  (test "unauthorized_stats"
+    (run
+      (REQUEST GET "/products/stats"
+        (auth false))
+      (ASSERT status 401))))

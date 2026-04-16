@@ -1,0 +1,641 @@
+{
+  "version": "0.6",
+  "service": {
+    "name": "payment_service",
+    "port": 8083,
+    "on_fiber_crash": "RESTART_FIBER",
+    "on_service_crash": "NOTIFY_RESTART"
+  },
+
+  "schemas": {
+    "PaymentRequest": {
+      "fields": {
+        "order_id": { "type": "uuid", "required": true },
+        "amount": { "type": "decimal", "required": true, "gt": 0 },
+        "currency": { "type": "enum", "values": ["USD", "EUR", "ARS"], "required": true },
+        "payment_method": { "type": "enum", "values": ["credit_card", "debit_card", "bank_transfer"], "required": true },
+        "card_token": { "type": "string", "required": false }
+      }
+    },
+    "Payment": {
+      "fields": {
+        "id": { "type": "uuid", "auto_gen": true },
+        "order_id": { "type": "uuid" },
+        "amount": { "type": "decimal" },
+        "currency": { "type": "string" },
+        "payment_method": { "type": "string" },
+        "status": { "type": "enum", "values": ["pending", "fraud_check", "processing", "completed", "failed", "refunded"], "default": "pending" },
+        "fraud_score": { "type": "decimal", "required": false },
+        "gateway_ref": { "type": "string", "required": false },
+        "failure_reason": { "type": "string", "required": false },
+        "created_at": { "type": "timestamp", "auto_gen": true },
+        "completed_at": { "type": "timestamp", "required": false }
+      }
+    },
+    "FraudCheckResult": {
+      "fields": {
+        "score": { "type": "decimal" },
+        "risk_level": { "type": "enum", "values": ["low", "medium", "high"] },
+        "approved": { "type": "bool" }
+      }
+    },
+    "GatewayChargeResult": {
+      "fields": {
+        "reference": { "type": "string" },
+        "status": { "type": "enum", "values": ["approved", "declined", "error"] },
+        "decline_reason": { "type": "string", "required": false }
+      }
+    }
+  },
+
+  "stores": {
+    "payment_store": {
+      "type": "IN_MEMORY",
+      "schema": "Payment",
+      "index": { "field": "id", "type": "PRIMARY" }
+    }
+  },
+
+  "dependencies": {
+    "payment_store": "payment_store",
+    "fraud_service": {
+      "type": "SERVICE_REF",
+      "target": "fraud_service",
+      "base_url_ref": "ENV.FRAUD_SERVICE_URL",
+      "default": "http://localhost:8090",
+      "resilience": "fraud_service_policy"
+    },
+    "payment_gateway": {
+      "type": "SERVICE_REF",
+      "target": "payment_gateway",
+      "base_url_ref": "ENV.PAYMENT_GATEWAY_URL",
+      "default": "http://localhost:8091",
+      "resilience": "gateway_policy"
+    },
+    "order_service": {
+      "type": "SERVICE_REF",
+      "target": "order_service",
+      "base_url_ref": "ENV.ORDER_SERVICE_URL",
+      "default": "http://localhost:8081",
+      "resilience": "order_service_policy"
+    }
+  },
+
+  "resilience": {
+    "policies": {
+      "fraud_service_policy": {
+        "timeout": { "duration_ms": 5000, "on_timeout": "ERR_TIMEOUT" },
+        "circuit_breaker": {
+          "failure_threshold": 3,
+          "success_threshold": 2,
+          "half_open_max_calls": 1,
+          "reset_timeout_ms": 60000,
+          "on_open": { "emit_event": "circuit_open", "fallback": "ERR_UNAVAILABLE" },
+          "on_half_open": { "emit_event": "circuit_half_open" },
+          "on_close": { "emit_event": "circuit_closed" }
+        },
+        "retry": {
+          "max_attempts": 2,
+          "backoff": { "type": "exponential", "initial_ms": 200, "max_ms": 1000 },
+          "retryable_errors": ["ERR_TIMEOUT", "ERR_CONNECTION"],
+          "non_retryable_errors": ["ERR_NOT_FOUND", "ERR_VALIDATION"]
+        }
+      },
+      "gateway_policy": {
+        "timeout": { "duration_ms": 10000, "on_timeout": "ERR_TIMEOUT" },
+        "circuit_breaker": {
+          "failure_threshold": 3,
+          "success_threshold": 2,
+          "half_open_max_calls": 1,
+          "reset_timeout_ms": 120000,
+          "on_open": { "emit_event": "circuit_open", "fallback": "ERR_UNAVAILABLE" },
+          "on_half_open": { "emit_event": "circuit_half_open" },
+          "on_close": { "emit_event": "circuit_closed" }
+        },
+        "retry": {
+          "_comment": "Gateway charges are NOT idempotent. NEVER retry a charge. Only retry status checks.",
+          "max_attempts": 1,
+          "retryable_errors": [],
+          "non_retryable_errors": ["*"]
+        }
+      },
+      "order_service_policy": {
+        "timeout": { "duration_ms": 3000, "on_timeout": "ERR_TIMEOUT" },
+        "circuit_breaker": {
+          "failure_threshold": 5,
+          "success_threshold": 3,
+          "half_open_max_calls": 1,
+          "reset_timeout_ms": 30000,
+          "on_open": { "emit_event": "circuit_open", "fallback": "ERR_UNAVAILABLE" },
+          "on_half_open": { "emit_event": "circuit_half_open" },
+          "on_close": { "emit_event": "circuit_closed" }
+        },
+        "retry": {
+          "max_attempts": 3,
+          "backoff": { "type": "exponential", "initial_ms": 100, "max_ms": 2000 },
+          "retryable_errors": ["ERR_TIMEOUT", "ERR_CONNECTION"],
+          "non_retryable_errors": ["ERR_NOT_FOUND"]
+        }
+      }
+    }
+  },
+
+  "cors": {
+    "origins": ["*"],
+    "methods": ["GET", "POST"],
+    "headers": ["Content-Type", "Authorization"],
+    "max_age": 3600
+  },
+
+  "auth": {
+    "provider": "jwt",
+    "secret_ref": "ENV.JWT_SECRET"
+  },
+
+  "custom_errors": {
+    "ERR_FRAUD_REJECTED": {
+      "http_status": 422,
+      "params": ["payment_id", "score", "risk_level"],
+      "message_template": "payment {payment_id} rejected by fraud check (score: {score}, risk: {risk_level})"
+    },
+    "ERR_CHARGE_DECLINED": {
+      "http_status": 422,
+      "params": ["payment_id", "reason"],
+      "message_template": "payment {payment_id} was declined: {reason}"
+    },
+    "ERR_PAYMENT_ALREADY_PROCESSED": {
+      "http_status": 409,
+      "params": ["order_id", "payment_status"],
+      "message_template": "order {order_id} already has a payment in status {payment_status}"
+    }
+  },
+
+  "events": {
+    "definitions": {
+      "payment_initiated": { "schema": "Payment" },
+      "payment_fraud_checked": { "schema": "Payment" },
+      "payment_completed": { "schema": "Payment" },
+      "payment_failed": { "schema": "Payment" },
+      "payment_refunded": { "schema": "Payment" }
+    }
+  },
+
+  "sagas": {
+    "_comment": "Sagas define multi-step workflows with compensation. If any step fails, previous steps are compensated in reverse order.",
+
+    "process_payment": {
+      "steps": [
+        {
+          "name": "create_payment_record",
+          "action": { "op": "STORE_INSERT", "store": "payment_store" },
+          "compensate": { "op": "STORE_UPDATE_FIELDS", "store": "payment_store", "fields": { "status": "failed" } }
+        },
+        {
+          "name": "fraud_check",
+          "action": { "op": "CALL_SERVICE", "service": "fraud_service", "method": "POST", "path": "/check", "idempotent": true },
+          "compensate": { "op": "LOG", "level": "INFO", "message": "Fraud check compensated — no action needed" }
+        },
+        {
+          "name": "charge_gateway",
+          "action": { "op": "CALL_SERVICE", "service": "payment_gateway", "method": "POST", "path": "/charge", "idempotent": false },
+          "compensate": { "op": "CALL_SERVICE", "service": "payment_gateway", "method": "POST", "path": "/refund", "idempotent": false }
+        },
+        {
+          "name": "confirm_order",
+          "action": { "op": "CALL_SERVICE", "service": "order_service", "method": "PUT", "path": "/orders/{order_id}/confirm", "idempotent": true },
+          "compensate": { "op": "CALL_SERVICE", "service": "order_service", "method": "PUT", "path": "/orders/{order_id}/cancel", "idempotent": true }
+        }
+      ]
+    }
+  },
+
+  "routes": [
+    { "method": "POST", "path": "/payments",      "handler": "handler_process_payment" },
+    { "method": "GET",  "path": "/payments/:id",   "handler": "handler_get_payment" },
+    { "method": "POST", "path": "/payments/:id/refund", "handler": "handler_refund_payment" }
+  ],
+
+  "handlers": {
+    "handler_process_payment": {
+      "auth": { "requires": "authenticated" },
+      "returns": "RESULT(Payment, Error)",
+      "instructions": [
+        { "op": "READ_BODY", "schema": "PaymentRequest", "assign": "request" },
+        { "op": "MATCH", "value": "request", "cases": {
+            "ERR": [{ "op": "ERR_INVALID_BODY", "schema": "PaymentRequest" }],
+            "OK": [
+
+              { "op": "COMMENT", "text": "── Step 1: Create payment record (status: pending) ──" },
+              { "op": "CONSTRUCT", "schema": "Payment", "assign": "payment", "data": {
+                  "order_id": "request.order_id",
+                  "amount": "request.amount",
+                  "currency": "request.currency",
+                  "payment_method": "request.payment_method",
+                  "status": "pending"
+                }
+              },
+              { "op": "STORE_INSERT", "store": "payment_store", "data": "payment", "assign": "payment" },
+              { "op": "EMIT_EVENT", "event": "payment_initiated", "data": "payment" },
+
+              { "op": "COMMENT", "text": "── Step 2: Fraud check ──" },
+              { "op": "STORE_UPDATE_FIELDS", "store": "payment_store",
+                "key": "payment.id", "fields": { "status": "fraud_check" }, "assign": "payment" },
+
+              { "op": "CALL_SERVICE", "service": "fraud_service",
+                "method": "POST", "path": "/check",
+                "idempotent": true,
+                "body": {
+                  "payment_id": "payment.id",
+                  "amount": "request.amount",
+                  "currency": "request.currency",
+                  "payment_method": "request.payment_method"
+                },
+                "assign": "fraud_result" },
+
+              { "op": "MATCH", "value": "fraud_result", "cases": {
+                  "ERR": [
+                    { "op": "SAGA_COMPENSATE", "saga": "process_payment", "from_step": "create_payment_record",
+                      "reason": "fraud service unavailable" },
+                    { "op": "ERR_UNAVAILABLE", "service": "fraud_service" }
+                  ],
+                  "OK": [
+                    { "op": "STORE_UPDATE_FIELDS", "store": "payment_store",
+                      "key": "payment.id", "fields": { "fraud_score": "fraud_result.score" }, "assign": "payment" },
+
+                    { "op": "BRANCH", "condition": { "left": "fraud_result.approved", "op": "==", "right": false }, "cases": {
+                        "TRUE": [
+                          { "op": "STORE_UPDATE_FIELDS", "store": "payment_store",
+                            "key": "payment.id",
+                            "fields": { "status": "failed", "failure_reason": "fraud_rejected" },
+                            "assign": "payment" },
+                          { "op": "EMIT_EVENT", "event": "payment_failed", "data": "payment" },
+                          { "op": "ERR_CUSTOM", "type": "ERR_FRAUD_REJECTED",
+                            "params": {
+                              "payment_id": "payment.id",
+                              "score": "fraud_result.score",
+                              "risk_level": "fraud_result.risk_level"
+                            }
+                          }
+                        ],
+                        "FALSE": [
+                          { "op": "EMIT_EVENT", "event": "payment_fraud_checked", "data": "payment" },
+
+                          { "op": "COMMENT", "text": "── Step 3: Charge via payment gateway (NOT idempotent!) ──" },
+                          { "op": "STORE_UPDATE_FIELDS", "store": "payment_store",
+                            "key": "payment.id", "fields": { "status": "processing" }, "assign": "payment" },
+
+                          { "op": "CALL_SERVICE", "service": "payment_gateway",
+                            "method": "POST", "path": "/charge",
+                            "idempotent": false,
+                            "body": {
+                              "payment_id": "payment.id",
+                              "amount": "request.amount",
+                              "currency": "request.currency",
+                              "card_token": "request.card_token"
+                            },
+                            "assign": "charge_result" },
+
+                          { "op": "MATCH", "value": "charge_result", "cases": {
+                              "ERR": [
+                                { "op": "SAGA_COMPENSATE", "saga": "process_payment", "from_step": "fraud_check",
+                                  "reason": "gateway unavailable" },
+                                { "op": "ERR_UNAVAILABLE", "service": "payment_gateway" }
+                              ],
+                              "OK": [
+                                { "op": "MATCH", "value": "charge_result.status", "cases": {
+                                    "declined": [
+                                      { "op": "STORE_UPDATE_FIELDS", "store": "payment_store",
+                                        "key": "payment.id",
+                                        "fields": { "status": "failed", "failure_reason": "charge_result.decline_reason" },
+                                        "assign": "payment" },
+                                      { "op": "EMIT_EVENT", "event": "payment_failed", "data": "payment" },
+                                      { "op": "ERR_CUSTOM", "type": "ERR_CHARGE_DECLINED",
+                                        "params": { "payment_id": "payment.id", "reason": "charge_result.decline_reason" }}
+                                    ],
+                                    "error": [
+                                      { "op": "SAGA_COMPENSATE", "saga": "process_payment", "from_step": "fraud_check",
+                                        "reason": "gateway error" },
+                                      { "op": "STORE_UPDATE_FIELDS", "store": "payment_store",
+                                        "key": "payment.id",
+                                        "fields": { "status": "failed", "failure_reason": "gateway_error" },
+                                        "assign": "payment" },
+                                      { "op": "EMIT_EVENT", "event": "payment_failed", "data": "payment" },
+                                      { "op": "ERR_UNAVAILABLE", "service": "payment_gateway" }
+                                    ],
+                                    "approved": [
+                                      { "op": "COMMENT", "text": "── Step 4: Confirm order ──" },
+                                      { "op": "STORE_UPDATE_FIELDS", "store": "payment_store",
+                                        "key": "payment.id",
+                                        "fields": {
+                                          "status": "completed",
+                                          "gateway_ref": "charge_result.reference"
+                                        },
+                                        "assign": "payment" },
+
+                                      { "op": "GET_CURRENT", "what": "timestamp", "assign": "now" },
+                                      { "op": "STORE_UPDATE_FIELDS", "store": "payment_store",
+                                        "key": "payment.id",
+                                        "fields": { "completed_at": "now" },
+                                        "assign": "payment" },
+
+                                      { "op": "CALL_SERVICE", "service": "order_service",
+                                        "method": "PUT", "path": "/orders/{request.order_id}/confirm",
+                                        "idempotent": true,
+                                        "assign": "confirm_result" },
+
+                                      { "op": "MATCH", "value": "confirm_result", "cases": {
+                                          "ERR": [
+                                            { "op": "LOG", "level": "ERROR",
+                                              "message": "Failed to confirm order {request.order_id} — payment {payment.id} completed but order not confirmed. Manual intervention required." },
+                                            { "op": "EMIT_EVENT", "event": "payment_completed", "data": "payment" }
+                                          ],
+                                          "OK": [
+                                            { "op": "EMIT_EVENT", "event": "payment_completed", "data": "payment" }
+                                          ]
+                                        }
+                                      },
+
+                                      { "op": "RESPOND", "status": 201, "body": "payment" }
+                                    ]
+                                  }
+                                }
+                              ]
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+
+    "handler_get_payment": {
+      "auth": "PUBLIC",
+      "params": { "id": "uuid" },
+      "returns": "RESULT(Payment, Error)",
+      "instructions": [
+        { "op": "READ_PARAM", "name": "id", "type": "uuid", "assign": "id" },
+        { "op": "STORE_FIND", "store": "payment_store", "key": "id", "assign": "payment" },
+        { "op": "MATCH", "value": "payment", "cases": {
+            "OK": [{ "op": "RESPOND", "status": 200, "body": "payment" }],
+            "NONE": [{ "op": "ERR_NOT_FOUND", "entity": "payment", "id": "id" }]
+          }
+        }
+      ]
+    },
+
+    "handler_refund_payment": {
+      "auth": { "requires": "authenticated" },
+      "params": { "id": "uuid" },
+      "returns": "RESULT(Payment, Error)",
+      "instructions": [
+        { "op": "READ_PARAM", "name": "id", "type": "uuid", "assign": "id" },
+        { "op": "STORE_FIND", "store": "payment_store", "key": "id", "assign": "payment" },
+        { "op": "MATCH", "value": "payment", "cases": {
+            "NONE": [{ "op": "ERR_NOT_FOUND", "entity": "payment", "id": "id" }],
+            "OK": [
+              { "op": "BRANCH", "condition": { "left": "payment.status", "op": "!=", "right": "'completed'" }, "cases": {
+                  "TRUE": [
+                    { "op": "ERR_BUSINESS_RULE", "rule": "cannot_refund",
+                      "detail": "only completed payments can be refunded" }
+                  ],
+                  "FALSE": [
+                    { "op": "CALL_SERVICE", "service": "payment_gateway",
+                      "method": "POST", "path": "/refund",
+                      "idempotent": false,
+                      "body": {
+                        "gateway_ref": "payment.gateway_ref",
+                        "amount": "payment.amount"
+                      },
+                      "assign": "refund_result" },
+
+                    { "op": "MATCH", "value": "refund_result", "cases": {
+                        "ERR": [
+                          { "op": "ERR_UNAVAILABLE", "service": "payment_gateway" }
+                        ],
+                        "OK": [
+                          { "op": "STORE_UPDATE_FIELDS", "store": "payment_store",
+                            "key": "id",
+                            "fields": { "status": "refunded" },
+                            "assign": "payment" },
+                          { "op": "EMIT_EVENT", "event": "payment_refunded", "data": "payment" },
+                          { "op": "RESPOND", "status": 200, "body": "payment" }
+                        ]
+                      }
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  },
+
+  "tests": {
+    "cases": [
+      {
+        "name": "payment_full_success",
+        "setup": {
+          "mock_services": {
+            "fraud_service": [
+              { "method": "POST", "path": "/check",
+                "response": { "status": 200, "body": { "score": 0.1, "risk_level": "low", "approved": true }}}
+            ],
+            "payment_gateway": [
+              { "method": "POST", "path": "/charge",
+                "response": { "status": 200, "body": { "reference": "gw-ref-001", "status": "approved" }}}
+            ],
+            "order_service": [
+              { "method": "PUT", "path": "/orders/order-001/confirm",
+                "response": { "status": 200, "body": { "id": "order-001", "status": "confirmed" }}}
+            ]
+          }
+        },
+        "run": [
+          { "action": "REQUEST", "method": "POST", "path": "/payments", "auth": true,
+            "body": {
+              "order_id": "order-001",
+              "amount": 99.99,
+              "currency": "USD",
+              "payment_method": "credit_card",
+              "card_token": "tok_test_123"
+            }
+          },
+          { "assert": "status", "equals": 201 },
+          { "assert": "body.status", "equals": "completed" },
+          { "assert": "body.gateway_ref", "equals": "gw-ref-001" },
+          { "assert": "body.fraud_score", "equals": 0.1 }
+        ],
+        "clean": "RESET_STORE(payment_store)"
+      },
+
+      {
+        "name": "payment_fraud_rejected",
+        "setup": {
+          "mock_services": {
+            "fraud_service": [
+              { "method": "POST", "path": "/check",
+                "response": { "status": 200, "body": { "score": 0.95, "risk_level": "high", "approved": false }}}
+            ]
+          }
+        },
+        "run": [
+          { "action": "REQUEST", "method": "POST", "path": "/payments", "auth": true,
+            "body": {
+              "order_id": "order-002",
+              "amount": 5000.00,
+              "currency": "USD",
+              "payment_method": "credit_card",
+              "card_token": "tok_suspicious"
+            }
+          },
+          { "assert": "status", "equals": 422 },
+          { "assert": "body.error.type", "equals": "FRAUD_REJECTED" }
+        ],
+        "clean": "RESET_STORE(payment_store)"
+      },
+
+      {
+        "name": "payment_charge_declined",
+        "setup": {
+          "mock_services": {
+            "fraud_service": [
+              { "method": "POST", "path": "/check",
+                "response": { "status": 200, "body": { "score": 0.2, "risk_level": "low", "approved": true }}}
+            ],
+            "payment_gateway": [
+              { "method": "POST", "path": "/charge",
+                "response": { "status": 200, "body": { "reference": "", "status": "declined", "decline_reason": "insufficient_funds" }}}
+            ]
+          }
+        },
+        "run": [
+          { "action": "REQUEST", "method": "POST", "path": "/payments", "auth": true,
+            "body": {
+              "order_id": "order-003",
+              "amount": 99.99,
+              "currency": "USD",
+              "payment_method": "debit_card",
+              "card_token": "tok_no_funds"
+            }
+          },
+          { "assert": "status", "equals": 422 },
+          { "assert": "body.error.type", "equals": "CHARGE_DECLINED" }
+        ],
+        "clean": "RESET_STORE(payment_store)"
+      },
+
+      {
+        "name": "payment_gateway_timeout_no_retry",
+        "setup": {
+          "mock_services": {
+            "fraud_service": [
+              { "method": "POST", "path": "/check",
+                "response": { "status": 200, "body": { "score": 0.1, "risk_level": "low", "approved": true }}}
+            ],
+            "payment_gateway": [
+              { "method": "POST", "path": "/charge",
+                "response": { "delay_ms": 15000, "status": 200, "body": {} },
+                "_comment": "Gateway timeout. Because idempotent=false, NO retry happens. This is critical for payments."
+              }
+            ]
+          }
+        },
+        "run": [
+          { "action": "REQUEST", "method": "POST", "path": "/payments", "auth": true,
+            "body": {
+              "order_id": "order-004",
+              "amount": 50.00,
+              "currency": "USD",
+              "payment_method": "credit_card",
+              "card_token": "tok_slow"
+            }
+          },
+          { "assert": "status", "equals": 503 }
+        ],
+        "clean": "RESET_STORE(payment_store)"
+      },
+
+      {
+        "name": "refund_success",
+        "setup": {
+          "seed_data": {
+            "payment_store": [
+              {
+                "id": "pay-to-refund",
+                "order_id": "order-005",
+                "amount": 75.00,
+                "currency": "USD",
+                "payment_method": "credit_card",
+                "status": "completed",
+                "fraud_score": 0.1,
+                "gateway_ref": "gw-ref-005",
+                "created_at": "2026-04-14T00:00:00Z",
+                "completed_at": "2026-04-14T00:01:00Z"
+              }
+            ]
+          },
+          "mock_services": {
+            "payment_gateway": [
+              { "method": "POST", "path": "/refund",
+                "response": { "status": 200, "body": { "status": "refunded" }}}
+            ]
+          }
+        },
+        "run": [
+          { "action": "REQUEST", "method": "POST", "path": "/payments/pay-to-refund/refund", "auth": true },
+          { "assert": "status", "equals": 200 },
+          { "assert": "body.status", "equals": "refunded" }
+        ],
+        "clean": "RESET_STORE(payment_store)"
+      },
+
+      {
+        "name": "refund_non_completed_payment",
+        "setup": {
+          "seed_data": {
+            "payment_store": [
+              {
+                "id": "pay-pending",
+                "order_id": "order-006",
+                "amount": 25.00,
+                "currency": "USD",
+                "payment_method": "credit_card",
+                "status": "pending",
+                "created_at": "2026-04-14T00:00:00Z"
+              }
+            ]
+          }
+        },
+        "run": [
+          { "action": "REQUEST", "method": "POST", "path": "/payments/pay-pending/refund", "auth": true },
+          { "assert": "status", "equals": 422 },
+          { "assert": "body.error.type", "equals": "BUSINESS_RULE" }
+        ],
+        "clean": "RESET_STORE(payment_store)"
+      },
+
+      {
+        "name": "payment_unauthorized",
+        "run": [
+          { "action": "REQUEST", "method": "POST", "path": "/payments", "auth": false,
+            "body": {
+              "order_id": "order-007",
+              "amount": 10.00,
+              "currency": "USD",
+              "payment_method": "credit_card"
+            }
+          },
+          { "assert": "status", "equals": 401 }
+        ]
+      }
+    ]
+  }
+}

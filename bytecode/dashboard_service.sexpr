@@ -1,0 +1,545 @@
+;; ═══════════════════════════════════════════════════════════════
+;; AILang Bytecode — S-expression format
+;; Service: dashboard_service
+;; Version: 0.6
+;; Converted from: dashboard_service.json
+;; ═══════════════════════════════════════════════════════════════
+
+(service dashboard_service
+  (version "0.6")
+  (port 8084)
+  (on_fiber_crash RESTART_FIBER)
+  (on_service_crash NOTIFY_RESTART))
+
+;; ── Schemas ──
+(schema DashboardResponse
+  (field generated_at timestamp)
+  (field products object)
+  (field orders object)
+  (field payments object)
+  (field system_health object))
+
+;; ── Dependencies ──
+(dependencies
+  (product_service
+    (type SERVICE_REF)
+    (target product_service)
+    (base_url_ref ENV.PRODUCT_SERVICE_URL)
+    (default "http://localhost:8080")
+    (resilience fast_read_policy))
+  (order_service
+    (type SERVICE_REF)
+    (target order_service)
+    (base_url_ref ENV.ORDER_SERVICE_URL)
+    (default "http://localhost:8081")
+    (resilience fast_read_policy))
+  (payment_service
+    (type SERVICE_REF)
+    (target payment_service)
+    (base_url_ref ENV.PAYMENT_SERVICE_URL)
+    (default "http://localhost:8083")
+    (resilience fast_read_policy)))
+
+;; ── Auth ──
+(auth
+  (provider jwt)
+  (secret_ref jwt_secret))
+
+;; ── CORS ──
+(cors
+  (origins "*")
+  (methods GET)
+  (headers Content-Type Authorization)
+  (max_age 3600))
+
+;; ── Resilience (policies, events) ──
+(resilience
+  (policies
+    (fast_read_policy
+      (timeout
+        (duration_ms 2000)
+        (on_timeout ERR_TIMEOUT))
+      (circuit_breaker
+        (failure_threshold 3)
+        (success_threshold 2)
+        (half_open_max_calls 1)
+        (reset_timeout_ms 15000)
+        (on_open
+          (emit_event circuit_open)
+          (fallback ERR_UNAVAILABLE))
+        (on_half_open
+          (emit_event circuit_half_open))
+        (on_close
+          (emit_event circuit_closed)))
+      (retry
+        (max_attempts 2)
+        (backoff
+          (type fixed)
+          (initial_ms 100))
+        (retryable_errors ERR_TIMEOUT ERR_CONNECTION)
+        (non_retryable_errors ERR_NOT_FOUND)))))
+
+;; ── Routes ──
+(route GET    "/dashboard" handler_full_dashboard)
+(route GET    "/dashboard/health" handler_health_check)
+
+;; ── Handlers ──
+(handler handler_full_dashboard
+  (auth (requires authenticated))
+  (returns "RESULT(DashboardResponse, Error)")
+  (do
+    ;; ── Fetch all three services IN PARALLEL ──
+    (PARALLEL → parallel_results
+          (fiber fetch_products
+            (CALL_SERVICE product_service
+                      (method GET)
+                      (path "/products")
+                      (idempotent true)
+                    → products_response))
+          (fiber fetch_orders
+            (CALL_SERVICE order_service
+                      (method GET)
+                      (path "/orders")
+                      (idempotent true)
+                    → orders_response))
+          (fiber fetch_payments
+            (CALL_SERVICE payment_service
+                      (method GET)
+                      (path "/payments")
+                      (idempotent true)
+                    → payments_response)))
+    (AWAIT_ALL parallel_results (timeout_ms 5000))
+    ;; ── Process products (graceful degradation) ──
+    (DEFINE_VAR products_section object "{'total_count': 0, 'total_value': 0, 'low_stock': [], 'status': 'unavailable'}")
+    (MATCH parallel_results.fetch_products
+          (ERR
+            (LOG WARNING "product_service unavailable for dashboard"))
+          (OK
+            (DEFINE_VAR product_count int 0)
+            (DEFINE_VAR total_value decimal 0)
+            (DEFINE_VAR low_stock_items List<Product> (list))
+            (COMPUTE_FN length products_response → product_count)
+            (ITERATE products_response p
+                      (COMPUTE p.price * p.stock → item_value)
+                      (COMPUTE total_value + item_value → total_value)
+                      (BRANCH (< p.stock 10)
+                                    (TRUE
+                                      (APPEND low_stock_items p))
+                                    (FALSE)))
+            (SET_VAR products_section "{'total_count': 'product_count', 'total_value': 'total_value', 'low_stock': 'low_stock_items', 'status': 'ok'}")))
+    ;; ── Process orders (graceful degradation) ──
+    (DEFINE_VAR orders_section object "{'total_count': 0, 'pending_count': 0, 'total_revenue': 0, 'recent': [], 'status': 'unavailable'}")
+    (MATCH parallel_results.fetch_orders
+          (ERR
+            (LOG WARNING "order_service unavailable for dashboard"))
+          (OK
+            (DEFINE_VAR order_count int 0)
+            (DEFINE_VAR pending_count int 0)
+            (DEFINE_VAR revenue decimal 0)
+            (COMPUTE_FN length orders_response → order_count)
+            (ITERATE orders_response o
+                      (COMPUTE revenue + o.total → revenue)
+                      (BRANCH (== o.status "'pending'")
+                                    (TRUE
+                                      (COMPUTE pending_count + 1 → pending_count))
+                                    (FALSE)))
+            (COMPUTE_FN take_last orders_response 5 → recent_orders)
+            (SET_VAR orders_section "{'total_count': 'order_count', 'pending_count': 'pending_count', 'total_revenue': 'revenue', 'recent': 'recent_orders', 'status': 'ok'}")))
+    ;; ── Process payments (graceful degradation) ──
+    (DEFINE_VAR payments_section object "{'total_count': 0, 'completed_count': 0, 'failed_count': 0, 'total_processed': 0, 'status': 'unavailable'}")
+    (MATCH parallel_results.fetch_payments
+          (ERR
+            (LOG WARNING "payment_service unavailable for dashboard"))
+          (OK
+            (DEFINE_VAR pay_count int 0)
+            (DEFINE_VAR completed int 0)
+            (DEFINE_VAR failed int 0)
+            (DEFINE_VAR processed decimal 0)
+            (COMPUTE_FN length payments_response → pay_count)
+            (ITERATE payments_response pay
+                      (MATCH pay.status
+                                    (completed
+                                      (COMPUTE completed + 1 → completed)
+                                      (COMPUTE processed + pay.amount → processed))
+                                    (failed
+                                      (COMPUTE failed + 1 → failed))
+                                    (DEFAULT)))
+            (SET_VAR payments_section "{'total_count': 'pay_count', 'completed_count': 'completed', 'failed_count': 'failed', 'total_processed': 'processed', 'status': 'ok'}")))
+    ;; ── Calculate system health ──
+    (DEFINE_VAR services_up int 0)
+    (BRANCH (== products_section.status "'ok'")
+          (TRUE
+            (COMPUTE services_up + 1 → services_up))
+          (FALSE))
+    (BRANCH (== orders_section.status "'ok'")
+          (TRUE
+            (COMPUTE services_up + 1 → services_up))
+          (FALSE))
+    (BRANCH (== payments_section.status "'ok'")
+          (TRUE
+            (COMPUTE services_up + 1 → services_up))
+          (FALSE))
+    (DEFINE_VAR overall_status string critical)
+    (MATCH services_up
+          (3
+            (SET_VAR overall_status healthy))
+          (2
+            (SET_VAR overall_status degraded))
+          (1
+            (SET_VAR overall_status degraded))
+          (0
+            (SET_VAR overall_status critical)))
+    ;; ── Build and respond ──
+    (GET_CURRENT auth user → now)
+    (CONSTRUCT DashboardResponse
+          (generated_at now)
+          (products products_section)
+          (orders orders_section)
+          (payments payments_section)
+          (system_health
+              (services_up services_up)
+              (services_total 3)
+              (overall_status overall_status))
+        → dashboard)
+    (RESPOND 200 dashboard)))
+
+(handler handler_health_check
+  (auth PUBLIC)
+  (returns "RESULT(object, Error)")
+  (do
+    (PARALLEL → health_checks
+          (fiber check_products
+            (CALL_SERVICE product_service
+                      (method GET)
+                      (path "/products")
+                      (idempotent true)
+                    → products_health))
+          (fiber check_orders
+            (CALL_SERVICE order_service
+                      (method GET)
+                      (path "/orders")
+                      (idempotent true)
+                    → orders_health))
+          (fiber check_payments
+            (CALL_SERVICE payment_service
+                      (method GET)
+                      (path "/payments")
+                      (idempotent true)
+                    → payments_health)))
+    (AWAIT_ALL health_checks (timeout_ms 3000))
+    (CONSTRUCT object
+          (product_service
+              (op TERNARY)
+              (condition
+                (left health_checks.check_products)
+                (op IS_OK))
+              (true up)
+              (false down))
+          (order_service
+              (op TERNARY)
+              (condition
+                (left health_checks.check_orders)
+                (op IS_OK))
+              (true up)
+              (false down))
+          (payment_service
+              (op TERNARY)
+              (condition
+                (left health_checks.check_payments)
+                (op IS_OK))
+              (true up)
+              (false down))
+        → health)
+    (RESPOND 200 health)))
+
+;; ── Tests (legacy format — preserved as nested tree) ──
+(tests
+  (cases
+    (item
+      (name dashboard_all_services_healthy)
+      (setup
+        (mock_services
+          (product_service
+            (item
+              (method GET)
+              (path "/products")
+              (response
+                (status 200)
+                (body
+                  (item
+                    (id p1)
+                    (name Widget)
+                    (price 10)
+                    (stock 100))
+                  (item
+                    (id p2)
+                    (name "Low Stock Item")
+                    (price 5)
+                    (stock 3))))))
+          (order_service
+            (item
+              (method GET)
+              (path "/orders")
+              (response
+                (status 200)
+                (body
+                  (item
+                    (id o1)
+                    (total 50)
+                    (status pending))
+                  (item
+                    (id o2)
+                    (total 100)
+                    (status confirmed))))))
+          (payment_service
+            (item
+              (method GET)
+              (path "/payments")
+              (response
+                (status 200)
+                (body
+                  (item
+                    (id pay1)
+                    (amount 50)
+                    (status completed))
+                  (item
+                    (id pay2)
+                    (amount 100)
+                    (status failed))))))))
+      (run
+        (item
+          (action REQUEST)
+          (method GET)
+          (path "/dashboard")
+          (auth true))
+        (item
+          (assert status)
+          (equals 200))
+        (item
+          (assert body.products.status)
+          (equals ok))
+        (item
+          (assert body.products.total_count)
+          (equals 2))
+        (item
+          (assert body.products.low_stock.length)
+          (equals 1))
+        (item
+          (assert body.orders.status)
+          (equals ok))
+        (item
+          (assert body.orders.total_count)
+          (equals 2))
+        (item
+          (assert body.orders.pending_count)
+          (equals 1))
+        (item
+          (assert body.orders.total_revenue)
+          (equals 150))
+        (item
+          (assert body.payments.status)
+          (equals ok))
+        (item
+          (assert body.payments.completed_count)
+          (equals 1))
+        (item
+          (assert body.payments.failed_count)
+          (equals 1))
+        (item
+          (assert body.payments.total_processed)
+          (equals 50))
+        (item
+          (assert body.system_health.services_up)
+          (equals 3))
+        (item
+          (assert body.system_health.overall_status)
+          (equals healthy))))
+    (item
+      (name dashboard_one_service_down_graceful_degradation)
+      (setup
+        (mock_services
+          (product_service
+            (item
+              (method GET)
+              (path "/products")
+              (response
+                (status 200)
+                (body
+                  (item
+                    (id p1)
+                    (name Widget)
+                    (price 10)
+                    (stock 50))))))
+          (order_service
+            (item
+              (method GET)
+              (path "/orders")
+              (response
+                (status 500)
+                (body))
+              (_comment "Order service is down")))
+          (payment_service
+            (item
+              (method GET)
+              (path "/payments")
+              (response
+                (status 200)
+                (body ))))))
+      (run
+        (item
+          (action REQUEST)
+          (method GET)
+          (path "/dashboard")
+          (auth true))
+        (item
+          (assert status)
+          (equals 200))
+        (item
+          (assert body.products.status)
+          (equals ok))
+        (item
+          (assert body.orders.status)
+          (equals unavailable))
+        (item
+          (assert body.payments.status)
+          (equals ok))
+        (item
+          (assert body.system_health.services_up)
+          (equals 2))
+        (item
+          (assert body.system_health.overall_status)
+          (equals degraded)))
+      (_comment "Dashboard still responds 200 even with one service down — graceful degradation"))
+    (item
+      (name dashboard_all_services_down)
+      (setup
+        (mock_services
+          (product_service
+            (item
+              (method GET)
+              (path "/products")
+              (response
+                (status 500))))
+          (order_service
+            (item
+              (method GET)
+              (path "/orders")
+              (response
+                (status 500))))
+          (payment_service
+            (item
+              (method GET)
+              (path "/payments")
+              (response
+                (status 500))))))
+      (run
+        (item
+          (action REQUEST)
+          (method GET)
+          (path "/dashboard")
+          (auth true))
+        (item
+          (assert status)
+          (equals 200))
+        (item
+          (assert body.system_health.services_up)
+          (equals 0))
+        (item
+          (assert body.system_health.overall_status)
+          (equals critical)))
+      (_comment "Dashboard STILL responds 200 — it shows what it can, reports what's down"))
+    (item
+      (name dashboard_unauthorized)
+      (run
+        (item
+          (action REQUEST)
+          (method GET)
+          (path "/dashboard")
+          (auth false))
+        (item
+          (assert status)
+          (equals 401))))
+    (item
+      (name health_check_all_up)
+      (setup
+        (mock_services
+          (product_service
+            (item
+              (method GET)
+              (path "/products")
+              (response
+                (status 200)
+                (body ))))
+          (order_service
+            (item
+              (method GET)
+              (path "/orders")
+              (response
+                (status 200)
+                (body ))))
+          (payment_service
+            (item
+              (method GET)
+              (path "/payments")
+              (response
+                (status 200)
+                (body ))))))
+      (run
+        (item
+          (action REQUEST)
+          (method GET)
+          (path "/dashboard/health"))
+        (item
+          (assert status)
+          (equals 200))
+        (item
+          (assert body.product_service)
+          (equals up))
+        (item
+          (assert body.order_service)
+          (equals up))
+        (item
+          (assert body.payment_service)
+          (equals up))))
+    (item
+      (name health_check_partial)
+      (setup
+        (mock_services
+          (product_service
+            (item
+              (method GET)
+              (path "/products")
+              (response
+                (status 200)
+                (body ))))
+          (order_service
+            (item
+              (method GET)
+              (path "/orders")
+              (response
+                (delay_ms 5000))
+              (_comment "Timeout — exceeds 3000ms")))
+          (payment_service
+            (item
+              (method GET)
+              (path "/payments")
+              (response
+                (status 200)
+                (body ))))))
+      (run
+        (item
+          (action REQUEST)
+          (method GET)
+          (path "/dashboard/health"))
+        (item
+          (assert status)
+          (equals 200))
+        (item
+          (assert body.product_service)
+          (equals up))
+        (item
+          (assert body.order_service)
+          (equals down))
+        (item
+          (assert body.payment_service)
+          (equals up))))))

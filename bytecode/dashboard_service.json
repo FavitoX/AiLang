@@ -1,0 +1,547 @@
+{
+  "version": "0.6",
+  "service": {
+    "name": "dashboard_service",
+    "port": 8084,
+    "on_fiber_crash": "RESTART_FIBER",
+    "on_service_crash": "NOTIFY_RESTART"
+  },
+
+  "schemas": {
+    "DashboardResponse": {
+      "fields": {
+        "generated_at": { "type": "timestamp" },
+        "products": { "type": "object", "fields": {
+            "total_count": { "type": "int" },
+            "total_value": { "type": "decimal" },
+            "low_stock": { "type": "list", "of": "Product" },
+            "status": { "type": "enum", "values": ["ok", "degraded", "unavailable"] }
+          }
+        },
+        "orders": { "type": "object", "fields": {
+            "total_count": { "type": "int" },
+            "pending_count": { "type": "int" },
+            "total_revenue": { "type": "decimal" },
+            "recent": { "type": "list", "of": "Order" },
+            "status": { "type": "enum", "values": ["ok", "degraded", "unavailable"] }
+          }
+        },
+        "payments": { "type": "object", "fields": {
+            "total_count": { "type": "int" },
+            "completed_count": { "type": "int" },
+            "failed_count": { "type": "int" },
+            "total_processed": { "type": "decimal" },
+            "status": { "type": "enum", "values": ["ok", "degraded", "unavailable"] }
+          }
+        },
+        "system_health": { "type": "object", "fields": {
+            "services_up": { "type": "int" },
+            "services_total": { "type": "int" },
+            "overall_status": { "type": "enum", "values": ["healthy", "degraded", "critical"] }
+          }
+        }
+      }
+    }
+  },
+
+  "dependencies": {
+    "product_service": {
+      "type": "SERVICE_REF",
+      "target": "product_service",
+      "base_url_ref": "ENV.PRODUCT_SERVICE_URL",
+      "default": "http://localhost:8080",
+      "resilience": "fast_read_policy"
+    },
+    "order_service": {
+      "type": "SERVICE_REF",
+      "target": "order_service",
+      "base_url_ref": "ENV.ORDER_SERVICE_URL",
+      "default": "http://localhost:8081",
+      "resilience": "fast_read_policy"
+    },
+    "payment_service": {
+      "type": "SERVICE_REF",
+      "target": "payment_service",
+      "base_url_ref": "ENV.PAYMENT_SERVICE_URL",
+      "default": "http://localhost:8083",
+      "resilience": "fast_read_policy"
+    }
+  },
+
+  "resilience": {
+    "policies": {
+      "fast_read_policy": {
+        "timeout": { "duration_ms": 2000, "on_timeout": "ERR_TIMEOUT" },
+        "circuit_breaker": {
+          "failure_threshold": 3,
+          "success_threshold": 2,
+          "half_open_max_calls": 1,
+          "reset_timeout_ms": 15000,
+          "on_open": { "emit_event": "circuit_open", "fallback": "ERR_UNAVAILABLE" },
+          "on_half_open": { "emit_event": "circuit_half_open" },
+          "on_close": { "emit_event": "circuit_closed" }
+        },
+        "retry": {
+          "max_attempts": 2,
+          "backoff": { "type": "fixed", "initial_ms": 100 },
+          "retryable_errors": ["ERR_TIMEOUT", "ERR_CONNECTION"],
+          "non_retryable_errors": ["ERR_NOT_FOUND"]
+        }
+      }
+    }
+  },
+
+  "cors": {
+    "origins": ["*"],
+    "methods": ["GET"],
+    "headers": ["Content-Type", "Authorization"],
+    "max_age": 3600
+  },
+
+  "auth": {
+    "provider": "jwt",
+    "secret_ref": "ENV.JWT_SECRET"
+  },
+
+  "routes": [
+    { "method": "GET", "path": "/dashboard",         "handler": "handler_full_dashboard" },
+    { "method": "GET", "path": "/dashboard/health",   "handler": "handler_health_check" }
+  ],
+
+  "handlers": {
+    "handler_full_dashboard": {
+      "auth": { "requires": "authenticated" },
+      "returns": "RESULT(DashboardResponse, Error)",
+      "instructions": [
+        { "op": "COMMENT", "text": "── Fetch all three services IN PARALLEL ──" },
+
+        { "op": "PARALLEL", "assign": "parallel_results", "fibers": [
+            {
+              "name": "fetch_products",
+              "instructions": [
+                { "op": "CALL_SERVICE", "service": "product_service",
+                  "method": "GET", "path": "/products",
+                  "idempotent": true,
+                  "assign": "products_response" }
+              ]
+            },
+            {
+              "name": "fetch_orders",
+              "instructions": [
+                { "op": "CALL_SERVICE", "service": "order_service",
+                  "method": "GET", "path": "/orders",
+                  "idempotent": true,
+                  "assign": "orders_response" }
+              ]
+            },
+            {
+              "name": "fetch_payments",
+              "instructions": [
+                { "op": "CALL_SERVICE", "service": "payment_service",
+                  "method": "GET", "path": "/payments",
+                  "idempotent": true,
+                  "assign": "payments_response" }
+              ]
+            }
+          ]
+        },
+
+        { "op": "AWAIT_ALL", "source": "parallel_results", "timeout_ms": 5000 },
+
+        { "op": "COMMENT", "text": "── Process products (graceful degradation) ──" },
+        { "op": "DEFINE_VAR", "name": "products_section", "type": "object", "value": {
+            "total_count": 0, "total_value": 0, "low_stock": [], "status": "unavailable"
+          }
+        },
+        { "op": "MATCH", "value": "parallel_results.fetch_products", "cases": {
+            "ERR": [
+              { "op": "LOG", "level": "WARNING", "message": "product_service unavailable for dashboard" }
+            ],
+            "OK": [
+              { "op": "DEFINE_VAR", "name": "product_count", "type": "int", "value": 0 },
+              { "op": "DEFINE_VAR", "name": "total_value", "type": "decimal", "value": 0 },
+              { "op": "DEFINE_VAR", "name": "low_stock_items", "type": "List<Product>", "value": [] },
+
+              { "op": "COMPUTE_FN", "assign": "product_count",
+                "function": "length", "args": ["products_response"],
+                "result_type": "int" },
+
+              { "op": "ITERATE", "collection": "products_response", "item": "p", "body": [
+                { "op": "COMPUTE", "assign": "item_value",
+                  "left": "p.price", "operator": "*", "right": "p.stock",
+                  "result_type": "decimal" },
+                { "op": "COMPUTE", "assign": "total_value",
+                  "left": "total_value", "operator": "+", "right": "item_value",
+                  "result_type": "decimal" },
+                { "op": "BRANCH", "condition": { "left": "p.stock", "op": "<", "right": 10 }, "cases": {
+                    "TRUE": [
+                      { "op": "APPEND", "target": "low_stock_items", "value": "p" }
+                    ],
+                    "FALSE": []
+                  }
+                }
+              ]},
+
+              { "op": "SET_VAR", "name": "products_section", "value": {
+                  "total_count": "product_count",
+                  "total_value": "total_value",
+                  "low_stock": "low_stock_items",
+                  "status": "ok"
+                }
+              }
+            ]
+          }
+        },
+
+        { "op": "COMMENT", "text": "── Process orders (graceful degradation) ──" },
+        { "op": "DEFINE_VAR", "name": "orders_section", "type": "object", "value": {
+            "total_count": 0, "pending_count": 0, "total_revenue": 0, "recent": [], "status": "unavailable"
+          }
+        },
+        { "op": "MATCH", "value": "parallel_results.fetch_orders", "cases": {
+            "ERR": [
+              { "op": "LOG", "level": "WARNING", "message": "order_service unavailable for dashboard" }
+            ],
+            "OK": [
+              { "op": "DEFINE_VAR", "name": "order_count", "type": "int", "value": 0 },
+              { "op": "DEFINE_VAR", "name": "pending_count", "type": "int", "value": 0 },
+              { "op": "DEFINE_VAR", "name": "revenue", "type": "decimal", "value": 0 },
+
+              { "op": "COMPUTE_FN", "assign": "order_count",
+                "function": "length", "args": ["orders_response"],
+                "result_type": "int" },
+
+              { "op": "ITERATE", "collection": "orders_response", "item": "o", "body": [
+                { "op": "COMPUTE", "assign": "revenue",
+                  "left": "revenue", "operator": "+", "right": "o.total",
+                  "result_type": "decimal" },
+                { "op": "BRANCH", "condition": { "left": "o.status", "op": "==", "right": "'pending'" }, "cases": {
+                    "TRUE": [
+                      { "op": "COMPUTE", "assign": "pending_count",
+                        "left": "pending_count", "operator": "+", "right": 1,
+                        "result_type": "int" }
+                    ],
+                    "FALSE": []
+                  }
+                }
+              ]},
+
+              { "op": "COMPUTE_FN", "assign": "recent_orders",
+                "function": "take_last", "args": ["orders_response", 5],
+                "result_type": "List<Order>" },
+
+              { "op": "SET_VAR", "name": "orders_section", "value": {
+                  "total_count": "order_count",
+                  "pending_count": "pending_count",
+                  "total_revenue": "revenue",
+                  "recent": "recent_orders",
+                  "status": "ok"
+                }
+              }
+            ]
+          }
+        },
+
+        { "op": "COMMENT", "text": "── Process payments (graceful degradation) ──" },
+        { "op": "DEFINE_VAR", "name": "payments_section", "type": "object", "value": {
+            "total_count": 0, "completed_count": 0, "failed_count": 0, "total_processed": 0, "status": "unavailable"
+          }
+        },
+        { "op": "MATCH", "value": "parallel_results.fetch_payments", "cases": {
+            "ERR": [
+              { "op": "LOG", "level": "WARNING", "message": "payment_service unavailable for dashboard" }
+            ],
+            "OK": [
+              { "op": "DEFINE_VAR", "name": "pay_count", "type": "int", "value": 0 },
+              { "op": "DEFINE_VAR", "name": "completed", "type": "int", "value": 0 },
+              { "op": "DEFINE_VAR", "name": "failed", "type": "int", "value": 0 },
+              { "op": "DEFINE_VAR", "name": "processed", "type": "decimal", "value": 0 },
+
+              { "op": "COMPUTE_FN", "assign": "pay_count",
+                "function": "length", "args": ["payments_response"],
+                "result_type": "int" },
+
+              { "op": "ITERATE", "collection": "payments_response", "item": "pay", "body": [
+                { "op": "MATCH", "value": "pay.status", "cases": {
+                    "completed": [
+                      { "op": "COMPUTE", "assign": "completed",
+                        "left": "completed", "operator": "+", "right": 1, "result_type": "int" },
+                      { "op": "COMPUTE", "assign": "processed",
+                        "left": "processed", "operator": "+", "right": "pay.amount", "result_type": "decimal" }
+                    ],
+                    "failed": [
+                      { "op": "COMPUTE", "assign": "failed",
+                        "left": "failed", "operator": "+", "right": 1, "result_type": "int" }
+                    ],
+                    "DEFAULT": []
+                  }
+                }
+              ]},
+
+              { "op": "SET_VAR", "name": "payments_section", "value": {
+                  "total_count": "pay_count",
+                  "completed_count": "completed",
+                  "failed_count": "failed",
+                  "total_processed": "processed",
+                  "status": "ok"
+                }
+              }
+            ]
+          }
+        },
+
+        { "op": "COMMENT", "text": "── Calculate system health ──" },
+        { "op": "DEFINE_VAR", "name": "services_up", "type": "int", "value": 0 },
+        { "op": "BRANCH", "condition": { "left": "products_section.status", "op": "==", "right": "'ok'" }, "cases": {
+            "TRUE": [{ "op": "COMPUTE", "assign": "services_up", "left": "services_up", "operator": "+", "right": 1, "result_type": "int" }],
+            "FALSE": []
+          }
+        },
+        { "op": "BRANCH", "condition": { "left": "orders_section.status", "op": "==", "right": "'ok'" }, "cases": {
+            "TRUE": [{ "op": "COMPUTE", "assign": "services_up", "left": "services_up", "operator": "+", "right": 1, "result_type": "int" }],
+            "FALSE": []
+          }
+        },
+        { "op": "BRANCH", "condition": { "left": "payments_section.status", "op": "==", "right": "'ok'" }, "cases": {
+            "TRUE": [{ "op": "COMPUTE", "assign": "services_up", "left": "services_up", "operator": "+", "right": 1, "result_type": "int" }],
+            "FALSE": []
+          }
+        },
+
+        { "op": "DEFINE_VAR", "name": "overall_status", "type": "string", "value": "critical" },
+        { "op": "MATCH", "value": "services_up", "cases": {
+            "3": [{ "op": "SET_VAR", "name": "overall_status", "value": "healthy" }],
+            "2": [{ "op": "SET_VAR", "name": "overall_status", "value": "degraded" }],
+            "1": [{ "op": "SET_VAR", "name": "overall_status", "value": "degraded" }],
+            "0": [{ "op": "SET_VAR", "name": "overall_status", "value": "critical" }]
+          }
+        },
+
+        { "op": "COMMENT", "text": "── Build and respond ──" },
+        { "op": "GET_CURRENT", "what": "timestamp", "assign": "now" },
+        { "op": "CONSTRUCT", "schema": "DashboardResponse", "assign": "dashboard", "data": {
+            "generated_at": "now",
+            "products": "products_section",
+            "orders": "orders_section",
+            "payments": "payments_section",
+            "system_health": {
+              "services_up": "services_up",
+              "services_total": 3,
+              "overall_status": "overall_status"
+            }
+          }
+        },
+
+        { "op": "RESPOND", "status": 200, "body": "dashboard" }
+      ]
+    },
+
+    "handler_health_check": {
+      "auth": "PUBLIC",
+      "returns": "RESULT(object, Error)",
+      "instructions": [
+        { "op": "PARALLEL", "assign": "health_checks", "fibers": [
+            {
+              "name": "check_products",
+              "instructions": [
+                { "op": "CALL_SERVICE", "service": "product_service",
+                  "method": "GET", "path": "/products",
+                  "idempotent": true, "assign": "products_health" }
+              ]
+            },
+            {
+              "name": "check_orders",
+              "instructions": [
+                { "op": "CALL_SERVICE", "service": "order_service",
+                  "method": "GET", "path": "/orders",
+                  "idempotent": true, "assign": "orders_health" }
+              ]
+            },
+            {
+              "name": "check_payments",
+              "instructions": [
+                { "op": "CALL_SERVICE", "service": "payment_service",
+                  "method": "GET", "path": "/payments",
+                  "idempotent": true, "assign": "payments_health" }
+              ]
+            }
+          ]
+        },
+
+        { "op": "AWAIT_ALL", "source": "health_checks", "timeout_ms": 3000 },
+
+        { "op": "CONSTRUCT", "schema": "object", "assign": "health", "data": {
+            "product_service": { "op": "TERNARY", "condition": { "left": "health_checks.check_products", "op": "IS_OK" }, "true": "up", "false": "down" },
+            "order_service": { "op": "TERNARY", "condition": { "left": "health_checks.check_orders", "op": "IS_OK" }, "true": "up", "false": "down" },
+            "payment_service": { "op": "TERNARY", "condition": { "left": "health_checks.check_payments", "op": "IS_OK" }, "true": "up", "false": "down" }
+          }
+        },
+
+        { "op": "RESPOND", "status": 200, "body": "health" }
+      ]
+    }
+  },
+
+  "tests": {
+    "cases": [
+      {
+        "name": "dashboard_all_services_healthy",
+        "setup": {
+          "mock_services": {
+            "product_service": [
+              { "method": "GET", "path": "/products",
+                "response": { "status": 200, "body": [
+                  {"id": "p1", "name": "Widget", "price": 10, "stock": 100},
+                  {"id": "p2", "name": "Low Stock Item", "price": 5, "stock": 3}
+                ]}}
+            ],
+            "order_service": [
+              { "method": "GET", "path": "/orders",
+                "response": { "status": 200, "body": [
+                  {"id": "o1", "total": 50, "status": "pending"},
+                  {"id": "o2", "total": 100, "status": "confirmed"}
+                ]}}
+            ],
+            "payment_service": [
+              { "method": "GET", "path": "/payments",
+                "response": { "status": 200, "body": [
+                  {"id": "pay1", "amount": 50, "status": "completed"},
+                  {"id": "pay2", "amount": 100, "status": "failed"}
+                ]}}
+            ]
+          }
+        },
+        "run": [
+          { "action": "REQUEST", "method": "GET", "path": "/dashboard", "auth": true },
+          { "assert": "status", "equals": 200 },
+          { "assert": "body.products.status", "equals": "ok" },
+          { "assert": "body.products.total_count", "equals": 2 },
+          { "assert": "body.products.low_stock.length", "equals": 1 },
+          { "assert": "body.orders.status", "equals": "ok" },
+          { "assert": "body.orders.total_count", "equals": 2 },
+          { "assert": "body.orders.pending_count", "equals": 1 },
+          { "assert": "body.orders.total_revenue", "equals": 150 },
+          { "assert": "body.payments.status", "equals": "ok" },
+          { "assert": "body.payments.completed_count", "equals": 1 },
+          { "assert": "body.payments.failed_count", "equals": 1 },
+          { "assert": "body.payments.total_processed", "equals": 50 },
+          { "assert": "body.system_health.services_up", "equals": 3 },
+          { "assert": "body.system_health.overall_status", "equals": "healthy" }
+        ]
+      },
+
+      {
+        "name": "dashboard_one_service_down_graceful_degradation",
+        "setup": {
+          "mock_services": {
+            "product_service": [
+              { "method": "GET", "path": "/products",
+                "response": { "status": 200, "body": [{"id": "p1", "name": "Widget", "price": 10, "stock": 50}] }}
+            ],
+            "order_service": [
+              { "method": "GET", "path": "/orders",
+                "response": { "status": 500, "body": {} },
+                "_comment": "Order service is down"
+              }
+            ],
+            "payment_service": [
+              { "method": "GET", "path": "/payments",
+                "response": { "status": 200, "body": [] }}
+            ]
+          }
+        },
+        "run": [
+          { "action": "REQUEST", "method": "GET", "path": "/dashboard", "auth": true },
+          { "assert": "status", "equals": 200 },
+          { "assert": "body.products.status", "equals": "ok" },
+          { "assert": "body.orders.status", "equals": "unavailable" },
+          { "assert": "body.payments.status", "equals": "ok" },
+          { "assert": "body.system_health.services_up", "equals": 2 },
+          { "assert": "body.system_health.overall_status", "equals": "degraded" }
+        ],
+        "_comment": "Dashboard still responds 200 even with one service down — graceful degradation"
+      },
+
+      {
+        "name": "dashboard_all_services_down",
+        "setup": {
+          "mock_services": {
+            "product_service": [
+              { "method": "GET", "path": "/products", "response": { "status": 500 }}
+            ],
+            "order_service": [
+              { "method": "GET", "path": "/orders", "response": { "status": 500 }}
+            ],
+            "payment_service": [
+              { "method": "GET", "path": "/payments", "response": { "status": 500 }}
+            ]
+          }
+        },
+        "run": [
+          { "action": "REQUEST", "method": "GET", "path": "/dashboard", "auth": true },
+          { "assert": "status", "equals": 200 },
+          { "assert": "body.system_health.services_up", "equals": 0 },
+          { "assert": "body.system_health.overall_status", "equals": "critical" }
+        ],
+        "_comment": "Dashboard STILL responds 200 — it shows what it can, reports what's down"
+      },
+
+      {
+        "name": "dashboard_unauthorized",
+        "run": [
+          { "action": "REQUEST", "method": "GET", "path": "/dashboard", "auth": false },
+          { "assert": "status", "equals": 401 }
+        ]
+      },
+
+      {
+        "name": "health_check_all_up",
+        "setup": {
+          "mock_services": {
+            "product_service": [
+              { "method": "GET", "path": "/products", "response": { "status": 200, "body": [] }}
+            ],
+            "order_service": [
+              { "method": "GET", "path": "/orders", "response": { "status": 200, "body": [] }}
+            ],
+            "payment_service": [
+              { "method": "GET", "path": "/payments", "response": { "status": 200, "body": [] }}
+            ]
+          }
+        },
+        "run": [
+          { "action": "REQUEST", "method": "GET", "path": "/dashboard/health" },
+          { "assert": "status", "equals": 200 },
+          { "assert": "body.product_service", "equals": "up" },
+          { "assert": "body.order_service", "equals": "up" },
+          { "assert": "body.payment_service", "equals": "up" }
+        ]
+      },
+
+      {
+        "name": "health_check_partial",
+        "setup": {
+          "mock_services": {
+            "product_service": [
+              { "method": "GET", "path": "/products", "response": { "status": 200, "body": [] }}
+            ],
+            "order_service": [
+              { "method": "GET", "path": "/orders", "response": { "delay_ms": 5000 },
+                "_comment": "Timeout — exceeds 3000ms"}
+            ],
+            "payment_service": [
+              { "method": "GET", "path": "/payments", "response": { "status": 200, "body": [] }}
+            ]
+          }
+        },
+        "run": [
+          { "action": "REQUEST", "method": "GET", "path": "/dashboard/health" },
+          { "assert": "status", "equals": 200 },
+          { "assert": "body.product_service", "equals": "up" },
+          { "assert": "body.order_service", "equals": "down" },
+          { "assert": "body.payment_service", "equals": "up" }
+        ]
+      }
+    ]
+  }
+}

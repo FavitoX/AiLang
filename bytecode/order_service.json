@@ -1,0 +1,636 @@
+{
+  "version": "0.6",
+  "service": {
+    "name": "order_service",
+    "port": 8081,
+    "on_fiber_crash": "RESTART_FIBER",
+    "on_service_crash": "NOTIFY_RESTART"
+  },
+
+  "schemas": {
+    "OrderItem": {
+      "fields": {
+        "product_id": { "type": "uuid", "required": true },
+        "product_name": { "type": "string" },
+        "quantity": { "type": "int", "required": true, "gt": 0 },
+        "unit_price": { "type": "decimal" },
+        "subtotal": { "type": "decimal" }
+      }
+    },
+    "Order": {
+      "fields": {
+        "id": { "type": "uuid", "auto_gen": true },
+        "customer_name": { "type": "string", "required": true, "min": 1, "max": 200 },
+        "items": { "type": "list", "of": "OrderItem", "required": true, "min_items": 1 },
+        "total": { "type": "decimal" },
+        "status": { "type": "enum", "values": ["pending", "confirmed", "cancelled"], "default": "pending" },
+        "created_at": { "type": "timestamp", "auto_gen": true }
+      }
+    },
+    "CreateOrderRequest": {
+      "fields": {
+        "customer_name": { "type": "string", "required": true, "min": 1, "max": 200 },
+        "items": { "type": "list", "of": "CreateOrderItem", "required": true, "min_items": 1 }
+      }
+    },
+    "CreateOrderItem": {
+      "fields": {
+        "product_id": { "type": "uuid", "required": true },
+        "quantity": { "type": "int", "required": true, "gt": 0 }
+      }
+    }
+  },
+
+  "stores": {
+    "order_store": {
+      "type": "IN_MEMORY",
+      "schema": "Order",
+      "index": { "field": "id", "type": "PRIMARY" }
+    }
+  },
+
+  "dependencies": {
+    "order_store": "order_store",
+    "product_service": {
+      "type": "SERVICE_REF",
+      "target": "product_service",
+      "base_url_ref": "ENV.PRODUCT_SERVICE_URL",
+      "default": "http://localhost:8080",
+      "resilience": "product_service_policy"
+    }
+  },
+
+  "cors": {
+    "origins": ["*"],
+    "methods": ["GET", "POST", "PUT"],
+    "headers": ["Content-Type", "Authorization"],
+    "max_age": 3600
+  },
+
+  "auth": {
+    "provider": "jwt",
+    "secret_ref": "ENV.JWT_SECRET"
+  },
+
+  "resilience": {
+    "_comment": "Resilience is MANDATORY for every SERVICE_REF. If not defined, the bytecode does not compile.",
+    
+    "policies": {
+      "product_service_policy": {
+        "timeout": {
+          "duration_ms": 3000,
+          "on_timeout": "ERR_TIMEOUT"
+        },
+
+        "circuit_breaker": {
+          "failure_threshold": 5,
+          "success_threshold": 3,
+          "half_open_max_calls": 1,
+          "reset_timeout_ms": 30000,
+          "on_open": {
+            "emit_event": "circuit_open",
+            "fallback": "ERR_UNAVAILABLE"
+          },
+          "on_half_open": {
+            "emit_event": "circuit_half_open"
+          },
+          "on_close": {
+            "emit_event": "circuit_closed"
+          }
+        },
+
+        "retry": {
+          "max_attempts": 3,
+          "backoff": {
+            "type": "exponential",
+            "initial_ms": 100,
+            "max_ms": 2000
+          },
+          "retryable_errors": ["ERR_TIMEOUT", "ERR_CONNECTION"],
+          "non_retryable_errors": ["ERR_NOT_FOUND", "ERR_VALIDATION", "ERR_BUSINESS_RULE"],
+          "_comment": "IMPORTANT: retry is opt-in PER CALL via idempotent flag. Non-idempotent operations (payments, mutations) must set idempotent: false and will NOT be retried even if the error is retryable."
+        }
+      }
+    },
+
+    "events": {
+      "circuit_open": {
+        "data": { "service": "string", "failures": "int", "timestamp": "timestamp" },
+        "description": "Emitted when circuit breaker opens — other services can react"
+      },
+      "circuit_half_open": {
+        "data": { "service": "string", "timestamp": "timestamp" },
+        "description": "Emitted when circuit breaker allows test requests"
+      },
+      "circuit_closed": {
+        "data": { "service": "string", "timestamp": "timestamp" },
+        "description": "Emitted when circuit breaker fully recovers"
+      }
+    }
+  },
+
+  "expressions": {
+    "_comment": "Mini-language for COMPUTE operations. Typed, validated at compile time.",
+    "supported_operators": ["+", "-", "*", "/", "%"],
+    "supported_functions": ["round", "floor", "ceil", "min", "max", "abs"],
+    "type_rules": {
+      "decimal * int": "decimal",
+      "decimal + decimal": "decimal",
+      "int + int": "int",
+      "int - int": "int"
+    }
+  },
+
+  "custom_errors": {
+    "ERR_INSUFFICIENT_STOCK": {
+      "http_status": 422,
+      "params": ["product_id", "requested", "available"],
+      "message_template": "product {product_id} has {available} units but {requested} were requested"
+    },
+    "ERR_ORDER_NOT_CANCELLABLE": {
+      "http_status": 422,
+      "params": ["order_id", "current_status"],
+      "message_template": "order {order_id} cannot be cancelled (status: {current_status})"
+    }
+  },
+
+  "events": {
+    "definitions": {
+      "order_created": {
+        "schema": "Order",
+        "description": "Emitted when a new order is created"
+      },
+      "order_cancelled": {
+        "schema": "Order",
+        "description": "Emitted when an order is cancelled"
+      }
+    },
+    "subscriptions": [
+      {
+        "event": "order_created",
+        "handler": "on_order_created_update_stock"
+      },
+      {
+        "event": "order_cancelled",
+        "handler": "on_order_cancelled_restore_stock"
+      }
+    ]
+  },
+
+  "routes": [
+    { "method": "GET",  "path": "/orders",             "handler": "handler_list_orders" },
+    { "method": "GET",  "path": "/orders/:id",          "handler": "handler_get_order" },
+    { "method": "POST", "path": "/orders",              "handler": "handler_create_order" },
+    { "method": "PUT",  "path": "/orders/:id/cancel",   "handler": "handler_cancel_order" }
+  ],
+
+  "handlers": {
+    "handler_list_orders": {
+      "auth": "PUBLIC",
+      "returns": "RESULT(List<Order>, Error)",
+      "instructions": [
+        { "op": "STORE_LIST_ALL", "store": "order_store", "assign": "orders" },
+        { "op": "RESPOND", "status": 200, "body": "orders" }
+      ]
+    },
+
+    "handler_get_order": {
+      "auth": "PUBLIC",
+      "params": { "id": "uuid" },
+      "returns": "RESULT(Order, Error)",
+      "instructions": [
+        { "op": "READ_PARAM", "name": "id", "type": "uuid", "assign": "id" },
+        { "op": "STORE_FIND", "store": "order_store", "key": "id", "assign": "order" },
+        { "op": "MATCH", "value": "order", "cases": {
+            "OK": [{ "op": "RESPOND", "status": 200, "body": "order" }],
+            "NONE": [{ "op": "ERR_NOT_FOUND", "entity": "order", "id": "id" }]
+          }
+        }
+      ]
+    },
+
+    "handler_create_order": {
+      "auth": { "requires": "authenticated" },
+      "returns": "RESULT(Order, Error)",
+      "instructions": [
+        { "op": "READ_BODY", "schema": "CreateOrderRequest", "assign": "body" },
+        { "op": "MATCH", "value": "body", "cases": {
+            "ERR": [{ "op": "ERR_INVALID_BODY", "schema": "CreateOrderRequest" }],
+            "OK": [
+              { "op": "DEFINE_VAR", "name": "validated_items", "type": "List<OrderItem>", "value": [] },
+              { "op": "DEFINE_VAR", "name": "total", "type": "decimal", "value": 0 },
+
+              { "op": "ITERATE", "collection": "body.items", "item": "item", "body": [
+
+                { "op": "CALL_SERVICE", "service": "product_service",
+                  "method": "GET", "path": "/products/{item.product_id}",
+                  "idempotent": true,
+                  "assign": "product_result" },
+
+                { "op": "MATCH", "value": "product_result", "cases": {
+                    "ERR": [
+                      { "op": "ERR_NOT_FOUND", "entity": "product", "id": "item.product_id" }
+                    ],
+                    "OK": [
+                      { "op": "BRANCH", "condition": { "left": "product_result.stock", "op": "<", "right": "item.quantity" }, "cases": {
+                          "TRUE": [
+                            { "op": "ERR_CUSTOM", "type": "ERR_INSUFFICIENT_STOCK",
+                              "params": {
+                                "product_id": "item.product_id",
+                                "requested": "item.quantity",
+                                "available": "product_result.stock"
+                              }
+                            }
+                          ],
+                          "FALSE": [
+                            { "op": "COMPUTE", "assign": "subtotal",
+                              "left": "product_result.price", "operator": "*", "right": "item.quantity",
+                              "result_type": "decimal" },
+
+                            { "op": "APPEND", "target": "validated_items", "value": {
+                                "product_id": "item.product_id",
+                                "product_name": "product_result.name",
+                                "quantity": "item.quantity",
+                                "unit_price": "product_result.price",
+                                "subtotal": "subtotal"
+                              }
+                            },
+
+                            { "op": "COMPUTE", "assign": "total",
+                              "left": "total", "operator": "+", "right": "subtotal",
+                              "result_type": "decimal" }
+                          ]
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]},
+
+              { "op": "CONSTRUCT", "schema": "Order", "assign": "new_order", "data": {
+                  "customer_name": "body.customer_name",
+                  "items": "validated_items",
+                  "total": "total",
+                  "status": "pending"
+                }
+              },
+
+              { "op": "STORE_INSERT", "store": "order_store", "data": "new_order", "assign": "order" },
+              { "op": "EMIT_EVENT", "event": "order_created", "data": "order" },
+              { "op": "RESPOND", "status": 201, "body": "order" }
+            ]
+          }
+        }
+      ]
+    },
+
+    "handler_cancel_order": {
+      "auth": { "requires": "authenticated" },
+      "params": { "id": "uuid" },
+      "returns": "RESULT(Order, Error)",
+      "instructions": [
+        { "op": "READ_PARAM", "name": "id", "type": "uuid", "assign": "id" },
+        { "op": "STORE_FIND", "store": "order_store", "key": "id", "assign": "order" },
+        { "op": "MATCH", "value": "order", "cases": {
+            "NONE": [{ "op": "ERR_NOT_FOUND", "entity": "order", "id": "id" }],
+            "OK": [
+              { "op": "BRANCH", "condition": { "left": "order.status", "op": "!=", "right": "'pending'" }, "cases": {
+                  "TRUE": [
+                    { "op": "ERR_CUSTOM", "type": "ERR_ORDER_NOT_CANCELLABLE",
+                      "params": {
+                        "order_id": "id",
+                        "current_status": "order.status"
+                      }
+                    }
+                  ],
+                  "FALSE": [
+                    { "op": "STORE_UPDATE_FIELDS", "store": "order_store",
+                      "key": "id",
+                      "fields": { "status": "cancelled" },
+                      "assign": "cancelled_order" },
+
+                    { "op": "EMIT_EVENT", "event": "order_cancelled", "data": "cancelled_order" },
+                    { "op": "RESPOND", "status": 200, "body": "cancelled_order" }
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+
+    "on_order_created_update_stock": {
+      "type": "EVENT_HANDLER",
+      "event": "order_created",
+      "instructions": [
+        { "op": "ITERATE", "collection": "event.data.items", "item": "item", "body": [
+          { "op": "CALL_SERVICE", "service": "product_service",
+            "method": "GET", "path": "/products/{item.product_id}",
+            "idempotent": true,
+            "assign": "current_product" },
+          { "op": "MATCH", "value": "current_product", "cases": {
+              "ERR": [
+                { "op": "LOG", "level": "ERROR",
+                  "message": "Failed to get product {item.product_id} for stock update" }
+              ],
+              "OK": [
+                { "op": "COMPUTE", "assign": "new_stock",
+                  "left": "current_product.stock", "operator": "-", "right": "item.quantity",
+                  "result_type": "int" },
+                { "op": "CALL_SERVICE", "service": "product_service",
+                  "method": "PUT", "path": "/products/{item.product_id}",
+                  "idempotent": false,
+                  "body": {
+                    "name": "current_product.name",
+                    "price": "current_product.price",
+                    "stock": "new_stock"
+                  },
+                  "assign": "update_result" },
+                { "op": "MATCH", "value": "update_result", "cases": {
+                    "ERR": [
+                      { "op": "LOG", "level": "ERROR",
+                        "message": "Failed to update stock for product {item.product_id}" }
+                    ],
+                    "OK": [
+                      { "op": "LOG", "level": "INFO",
+                        "message": "Stock updated for product {item.product_id}: -{item.quantity}" }
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        ]}
+      ]
+    },
+
+    "on_order_cancelled_restore_stock": {
+      "type": "EVENT_HANDLER",
+      "event": "order_cancelled",
+      "instructions": [
+        { "op": "ITERATE", "collection": "event.data.items", "item": "item", "body": [
+          { "op": "CALL_SERVICE", "service": "product_service",
+            "method": "GET", "path": "/products/{item.product_id}",
+            "idempotent": true,
+            "assign": "current_product" },
+          { "op": "MATCH", "value": "current_product", "cases": {
+              "ERR": [
+                { "op": "LOG", "level": "ERROR",
+                  "message": "Failed to get product {item.product_id} for stock restore" }
+              ],
+              "OK": [
+                { "op": "COMPUTE", "assign": "restored_stock",
+                  "left": "current_product.stock", "operator": "+", "right": "item.quantity",
+                  "result_type": "int" },
+                { "op": "CALL_SERVICE", "service": "product_service",
+                  "method": "PUT", "path": "/products/{item.product_id}",
+                  "idempotent": false,
+                  "body": {
+                    "name": "current_product.name",
+                    "price": "current_product.price",
+                    "stock": "restored_stock"
+                  },
+                  "assign": "restore_result" },
+                { "op": "MATCH", "value": "restore_result", "cases": {
+                    "ERR": [
+                      { "op": "LOG", "level": "ERROR",
+                        "message": "Failed to restore stock for product {item.product_id}" }
+                    ],
+                    "OK": [
+                      { "op": "LOG", "level": "INFO",
+                        "message": "Stock restored for product {item.product_id}: +{item.quantity}" }
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        ]}
+      ]
+    }
+  },
+
+  "tests": {
+    "_comment": "Each test is INDEPENDENT: setup → run → clean. No test depends on another. Tests can run in parallel.",
+
+    "cases": [
+      {
+        "name": "create_order_success",
+        "setup": {
+          "mock_services": {
+            "product_service": [
+              { "method": "GET", "path": "/products/prod-001",
+                "response": { "status": 200, "body": {"id": "prod-001", "name": "Widget", "price": 9.99, "stock": 100} }},
+              { "method": "GET", "path": "/products/prod-002",
+                "response": { "status": 200, "body": {"id": "prod-002", "name": "Gadget", "price": 19.99, "stock": 50} }}
+            ]
+          }
+        },
+        "run": [
+          { "action": "REQUEST", "method": "POST", "path": "/orders", "auth": true,
+            "body": {
+              "customer_name": "John Doe",
+              "items": [
+                { "product_id": "prod-001", "quantity": 2 },
+                { "product_id": "prod-002", "quantity": 1 }
+              ]
+            }
+          },
+          { "assert": "status", "equals": 201 },
+          { "assert": "body.customer_name", "equals": "John Doe" },
+          { "assert": "body.items.length", "equals": 2 },
+          { "assert": "body.total", "equals": 39.97 },
+          { "assert": "body.status", "equals": "pending" },
+          { "assert": "body.id", "exists": true }
+        ],
+        "clean": "RESET_STORE(order_store)"
+      },
+
+      {
+        "name": "create_order_insufficient_stock",
+        "setup": {
+          "mock_services": {
+            "product_service": [
+              { "method": "GET", "path": "/products/prod-001",
+                "response": { "status": 200, "body": {"id": "prod-001", "name": "Widget", "price": 9.99, "stock": 2} }}
+            ]
+          }
+        },
+        "run": [
+          { "action": "REQUEST", "method": "POST", "path": "/orders", "auth": true,
+            "body": {
+              "customer_name": "Jane Doe",
+              "items": [{ "product_id": "prod-001", "quantity": 10 }]
+            }
+          },
+          { "assert": "status", "equals": 422 },
+          { "assert": "body.error.type", "equals": "INSUFFICIENT_STOCK" }
+        ],
+        "clean": "RESET_STORE(order_store)"
+      },
+
+      {
+        "name": "create_order_product_not_found",
+        "setup": {
+          "mock_services": {
+            "product_service": [
+              { "method": "GET", "path": "/products/nonexistent-id",
+                "response": { "status": 404, "body": {"error": {"type": "NOT_FOUND"}} }}
+            ]
+          }
+        },
+        "run": [
+          { "action": "REQUEST", "method": "POST", "path": "/orders", "auth": true,
+            "body": {
+              "customer_name": "Jane Doe",
+              "items": [{ "product_id": "nonexistent-id", "quantity": 1 }]
+            }
+          },
+          { "assert": "status", "equals": 404 },
+          { "assert": "body.error.type", "equals": "NOT_FOUND" }
+        ],
+        "clean": "RESET_STORE(order_store)"
+      },
+
+      {
+        "name": "cancel_order_success",
+        "setup": {
+          "seed_data": {
+            "order_store": [
+              {
+                "id": "order-to-cancel",
+                "customer_name": "Cancel Test",
+                "items": [{"product_id": "prod-001", "product_name": "Widget", "quantity": 1, "unit_price": 9.99, "subtotal": 9.99}],
+                "total": 9.99,
+                "status": "pending",
+                "created_at": "2026-04-14T00:00:00Z"
+              }
+            ]
+          }
+        },
+        "run": [
+          { "action": "REQUEST", "method": "PUT", "path": "/orders/order-to-cancel/cancel", "auth": true },
+          { "assert": "status", "equals": 200 },
+          { "assert": "body.status", "equals": "cancelled" }
+        ],
+        "clean": "RESET_STORE(order_store)"
+      },
+
+      {
+        "name": "cancel_already_cancelled_order",
+        "setup": {
+          "seed_data": {
+            "order_store": [
+              {
+                "id": "already-cancelled",
+                "customer_name": "Already Cancelled",
+                "items": [{"product_id": "prod-001", "product_name": "Widget", "quantity": 1, "unit_price": 9.99, "subtotal": 9.99}],
+                "total": 9.99,
+                "status": "cancelled",
+                "created_at": "2026-04-14T00:00:00Z"
+              }
+            ]
+          }
+        },
+        "run": [
+          { "action": "REQUEST", "method": "PUT", "path": "/orders/already-cancelled/cancel", "auth": true },
+          { "assert": "status", "equals": 422 },
+          { "assert": "body.error.type", "equals": "ORDER_NOT_CANCELLABLE" }
+        ],
+        "clean": "RESET_STORE(order_store)"
+      },
+
+      {
+        "name": "create_order_unauthorized",
+        "run": [
+          { "action": "REQUEST", "method": "POST", "path": "/orders", "auth": false,
+            "body": {
+              "customer_name": "No Auth",
+              "items": [{ "product_id": "prod-001", "quantity": 1 }]
+            }
+          },
+          { "assert": "status", "equals": 401 }
+        ],
+        "clean": "RESET_STORE(order_store)"
+      },
+
+      {
+        "name": "create_order_empty_items",
+        "run": [
+          { "action": "REQUEST", "method": "POST", "path": "/orders", "auth": true,
+            "body": {
+              "customer_name": "Empty Order",
+              "items": []
+            }
+          },
+          { "assert": "status", "equals": 400 }
+        ],
+        "clean": "RESET_STORE(order_store)"
+      },
+
+      {
+        "name": "create_order_product_service_timeout",
+        "setup": {
+          "mock_services": {
+            "product_service": [
+              { "method": "GET", "path": "/products/slow-product",
+                "response": { "delay_ms": 5000, "status": 200, "body": {} },
+                "_comment": "Simulates timeout — delay exceeds policy timeout of 3000ms"
+              }
+            ]
+          }
+        },
+        "run": [
+          { "action": "REQUEST", "method": "POST", "path": "/orders", "auth": true,
+            "body": {
+              "customer_name": "Timeout Test",
+              "items": [{ "product_id": "slow-product", "quantity": 1 }]
+            }
+          },
+          { "assert": "status", "equals": 504 },
+          { "assert": "body.error.type", "equals": "TIMEOUT" }
+        ],
+        "clean": "RESET_STORE(order_store)"
+      },
+
+      {
+        "name": "create_order_circuit_breaker_open",
+        "setup": {
+          "force_circuit_state": {
+            "product_service_policy": "OPEN"
+          }
+        },
+        "run": [
+          { "action": "REQUEST", "method": "POST", "path": "/orders", "auth": true,
+            "body": {
+              "customer_name": "Circuit Open Test",
+              "items": [{ "product_id": "any-product", "quantity": 1 }]
+            }
+          },
+          { "assert": "status", "equals": 503 },
+          { "assert": "body.error.type", "equals": "UNAVAILABLE" }
+        ],
+        "clean": ["RESET_STORE(order_store)", "RESET_CIRCUIT(product_service_policy)"]
+      },
+
+      {
+        "name": "get_order_not_found",
+        "run": [
+          { "action": "REQUEST", "method": "GET", "path": "/orders/00000000-0000-0000-0000-000000000000" },
+          { "assert": "status", "equals": 404 },
+          { "assert": "body.error.type", "equals": "NOT_FOUND" }
+        ]
+      },
+
+      {
+        "name": "list_orders_empty",
+        "run": [
+          { "action": "REQUEST", "method": "GET", "path": "/orders" },
+          { "assert": "status", "equals": 200 },
+          { "assert": "body.length", "equals": 0 }
+        ]
+      }
+    ]
+  }
+}

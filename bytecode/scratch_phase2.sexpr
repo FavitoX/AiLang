@@ -1,0 +1,76 @@
+;; Scratch service that exercises custom_errors + ERR_CUSTOM template substitution.
+;; Covers both: the "no matching condition" path (insufficient stock at /check) and
+;; a "state transition denied" path (order already cancelled at /cancel/:id).
+
+(service scratch_errors
+  (version "0.9-phase2")
+  (port 8091))
+
+(schema CheckRequest
+  (field product_id string (required))
+  (field requested  int    (required) (gt 0))
+  (field available  int    (required) (gte 0)))
+
+(schema CheckResponse
+  (field ok bool (required)))
+
+(auth
+  (provider jwt)
+  (secret_ref jwt_secret))
+
+(config
+  (jwt_secret secret "JWT_SECRET"))
+
+(cors
+  (origins "*")
+  (methods GET POST)
+  (headers "Content-Type" "Authorization")
+  (max_age 3600))
+
+;; ── Custom errors with typed params + message_template ──
+(custom_errors
+  (ERR_INSUFFICIENT_STOCK
+    (http_status 422)
+    (params product_id requested available)
+    (message_template "product {product_id} has {available} units but {requested} were requested"))
+  (ERR_ORDER_NOT_CANCELLABLE
+    (http_status 409)
+    (params order_id current_status)
+    (message_template "order {order_id} cannot be cancelled (status: {current_status})")))
+
+(route POST "/check" handler_check)
+(route POST "/cancel/:id" handler_cancel)
+
+(handler handler_check
+  (auth (requires authenticated))
+  (returns (RESULT CheckResponse Error))
+  (do
+    (READ_BODY CheckRequest → body)
+    (MATCH body
+      (ERR (ERR_INVALID_BODY "CheckRequest"))
+      (OK
+        (BRANCH (< body.available body.requested)
+          (TRUE
+            (ERR_CUSTOM ERR_INSUFFICIENT_STOCK
+              (product_id body.product_id)
+              (requested  body.requested)
+              (available  body.available)))
+          (FALSE
+            (CONSTRUCT CheckResponse (ok true) → resp)
+            (RESPOND 200 resp)))))))
+
+(handler handler_cancel
+  (auth (requires authenticated))
+  (params (id string))
+  (returns (RESULT CheckResponse Error))
+  (do
+    (READ_PARAM id string → id)
+    (DEFINE_VAR current_status string "cancelled")
+    (BRANCH (!= current_status "pending")
+      (TRUE
+        (ERR_CUSTOM ERR_ORDER_NOT_CANCELLABLE
+          (order_id id)
+          (current_status current_status)))
+      (FALSE
+        (CONSTRUCT CheckResponse (ok true) → resp)
+        (RESPOND 200 resp)))))

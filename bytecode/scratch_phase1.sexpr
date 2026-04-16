@@ -1,0 +1,75 @@
+;; Scratch service that exercises every Phase 1 op in isolation.
+;; No stores, no resilience, no CALL_SERVICE — just variables, expressions,
+;; collections, construct, iterate, ternary.
+
+(service scratch_service
+  (version "0.9-scratch")
+  (port 8090))
+
+(schema LineItem
+  (field sku string (required))
+  (field quantity int (required))
+  (field subtotal decimal (required)))
+
+(schema ReportSummary
+  (field item_count int (required))
+  (field grand_total decimal (required))
+  (field generated_by string (required))
+  (field generated_at timestamp (required)))
+
+(auth
+  (provider jwt)
+  (secret_ref jwt_secret))
+
+(config
+  (jwt_secret secret "JWT_SECRET"))
+
+(cors
+  (origins "*")
+  (methods GET)
+  (headers "Content-Type" "Authorization")
+  (max_age 3600))
+
+(route GET "/phase1/demo" handler_demo)
+
+(handler handler_demo
+  (auth (requires authenticated))
+  (returns (RESULT ReportSummary Error))
+  (do
+    ;; DEFINE_VAR — list and numeric
+    (DEFINE_VAR items List<LineItem> (list))
+    (DEFINE_VAR total decimal 0)
+    (DEFINE_VAR count int 0)
+
+    ;; GET_CURRENT — auth user + clock now
+    (GET_CURRENT auth user → user_id)
+    (GET_CURRENT clock now → generated_at)
+
+    ;; ITERATE over a static range-like slice is not trivial without a collection,
+    ;; so we simulate by appending two synthetic LineItems via CONSTRUCT + APPEND.
+    (CONSTRUCT LineItem (sku "A-1") (quantity 3) (subtotal 10) → first)
+    (APPEND items first)
+    (CONSTRUCT LineItem (sku "B-2") (quantity 1) (subtotal 25) → second)
+    (APPEND items second)
+
+    ;; ITERATE body exercises COMPUTE and SET_VAR
+    (ITERATE items row
+      (COMPUTE total + row.subtotal → total)
+      (COMPUTE count + 1 → count))
+
+    ;; COMPUTE_FN — length + round
+    (COMPUTE_FN length items → item_count_inferred)
+    (COMPUTE_FN round total → rounded_total)
+
+    ;; SET_VAR — overwrite count
+    (SET_VAR count item_count_inferred)
+
+    ;; Final CONSTRUCT into ReportSummary
+    (CONSTRUCT ReportSummary
+      (item_count count)
+      (grand_total rounded_total)
+      (generated_by user_id)
+      (generated_at generated_at)
+      → summary)
+
+    (RESPOND 200 summary)))

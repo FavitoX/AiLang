@@ -1,0 +1,546 @@
+;; ═══════════════════════════════════════════════════════════════
+;; AILang Bytecode — S-expression format
+;; Service: pricing_service
+;; Version: 0.6
+;; Converted from: pricing_service.json
+;; ═══════════════════════════════════════════════════════════════
+
+(service pricing_service
+  (version "0.6")
+  (port 8082)
+  (on_fiber_crash RESTART_FIBER)
+  (on_service_crash NOTIFY_RESTART))
+
+;; ── Schemas ──
+(schema PriceRequest
+  (field product_id uuid (required))
+  (field quantity int (required) (gt 0))
+  (field customer_type enum (required) (values regular premium wholesale))
+  (field coupon_code string))
+(schema PriceResponse
+  (field product_id uuid)
+  (field base_price decimal)
+  (field quantity int)
+  (field subtotal decimal)
+  (field discounts_applied (list DiscountDetail))
+  (field total_discount_pct decimal)
+  (field final_price decimal))
+(schema DiscountDetail
+  (field type string)
+  (field reason string)
+  (field percentage decimal))
+(schema Coupon
+  (field code string)
+  (field discount_pct decimal (gt 0) (lte 50))
+  (field min_quantity int (gte 0))
+  (field valid_until timestamp)
+  (field customer_types (list string))
+  (field active bool))
+
+;; ── Stores ──
+(store coupon_store
+  (provider IN_MEMORY)
+  (schema Coupon)
+  (index code PRIMARY))
+
+;; ── Dependencies ──
+(dependencies
+  (coupon_store coupon_store)
+  (product_service
+    (type SERVICE_REF)
+    (target product_service)
+    (base_url_ref ENV.PRODUCT_SERVICE_URL)
+    (default "http://localhost:8080")
+    (resilience product_service_policy)))
+
+;; ── Auth ──
+(auth
+  (provider jwt)
+  (secret_ref jwt_secret))
+
+;; ── CORS ──
+(cors
+  (origins "*")
+  (methods GET POST)
+  (headers Content-Type Authorization)
+  (max_age 3600))
+
+;; ── Resilience (policies, events) ──
+(resilience
+  (policies
+    (product_service_policy
+      (timeout
+        (duration_ms 2000)
+        (on_timeout ERR_TIMEOUT))
+      (circuit_breaker
+        (failure_threshold 5)
+        (success_threshold 3)
+        (half_open_max_calls 1)
+        (reset_timeout_ms 30000)
+        (on_open
+          (emit_event circuit_open)
+          (fallback ERR_UNAVAILABLE))
+        (on_half_open
+          (emit_event circuit_half_open))
+        (on_close
+          (emit_event circuit_closed)))
+      (retry
+        (max_attempts 2)
+        (backoff
+          (type exponential)
+          (initial_ms 50)
+          (max_ms 500))
+        (retryable_errors ERR_TIMEOUT ERR_CONNECTION)
+        (non_retryable_errors ERR_NOT_FOUND ERR_VALIDATION)))))
+
+;; ── Custom Errors ──
+(custom_errors
+  (ERR_COUPON_INVALID
+    (http_status 422)
+    (params code reason)
+    (message_template "coupon {code} is invalid: {reason}"))
+  (ERR_COUPON_EXPIRED
+    (http_status 422)
+    (params code)
+    (message_template "coupon {code} has expired"))
+  (ERR_COUPON_NOT_ELIGIBLE
+    (http_status 422)
+    (params code customer_type)
+    (message_template "coupon {code} is not available for {customer_type} customers"))
+  (ERR_COUPON_MIN_QUANTITY
+    (http_status 422)
+    (params code min_quantity actual_quantity)
+    (message_template "coupon {code} requires minimum quantity of {min_quantity} (got {actual_quantity})")))
+
+;; ── Discount Rules (pricing-specific) ──
+(discount_rules
+  (_comment "Business rules for discount calculation. Discounts stack additively up to max_total_discount_pct.")
+  (max_total_discount_pct 40)
+  (volume_discounts
+    (item
+      (min_quantity 100)
+      (discount_pct 15)
+      (reason "volume 100+"))
+    (item
+      (min_quantity 50)
+      (discount_pct 10)
+      (reason "volume 50+"))
+    (item
+      (min_quantity 20)
+      (discount_pct 5)
+      (reason "volume 20+")))
+  (customer_discounts
+    (premium
+      (discount_pct 10)
+      (reason "premium customer"))
+    (wholesale
+      (discount_pct 15)
+      (reason "wholesale customer"))
+    (regular
+      (discount_pct 0)
+      (reason nil)))
+  (day_of_week_discounts
+    (tuesday
+      (discount_pct 5)
+      (reason "Tuesday promo"))
+    (thursday
+      (discount_pct 3)
+      (reason "Thursday promo"))))
+
+;; ── Routes ──
+(route POST   "/pricing/calculate" handler_calculate_price)
+(route GET    "/pricing/coupons/:code" handler_get_coupon)
+
+;; ── Handlers ──
+(handler handler_calculate_price
+  (auth PUBLIC)
+  (returns "RESULT(PriceResponse, Error)")
+  (do
+    (READ_BODY PriceRequest → request)
+    (MATCH request
+          (ERR
+            (ERR_INVALID_BODY "PriceRequest"))
+          (OK
+            (CALL_SERVICE product_service
+                      (method GET)
+                      (path "/products/{request.product_id}")
+                      (idempotent true)
+                    → product_result)
+            (MATCH product_result
+                      (ERR
+                        (ERR_NOT_FOUND "product" request.product_id))
+                      (OK
+                        (COMPUTE product_result.price * request.quantity → subtotal)
+                        (DEFINE_VAR discounts List<DiscountDetail> (list))
+                        (DEFINE_VAR total_discount_pct decimal 0)
+                        ;; ── Rule 1: Volume discount (first match wins) ──
+                        (MATCH request.quantity
+                                      (GTE_100
+                                        (APPEND discounts
+                                                          (type volume)
+                                                          (reason "volume 100+")
+                                                          (percentage 15))
+                                        (COMPUTE total_discount_pct + 15 → total_discount_pct))
+                                      (GTE_50
+                                        (APPEND discounts
+                                                          (type volume)
+                                                          (reason "volume 50+")
+                                                          (percentage 10))
+                                        (COMPUTE total_discount_pct + 10 → total_discount_pct))
+                                      (GTE_20
+                                        (APPEND discounts
+                                                          (type volume)
+                                                          (reason "volume 20+")
+                                                          (percentage 5))
+                                        (COMPUTE total_discount_pct + 5 → total_discount_pct))
+                                      (DEFAULT))
+                        ;; ── Rule 2: Customer type discount ──
+                        (MATCH request.customer_type
+                                      (premium
+                                        (APPEND discounts
+                                                          (type customer)
+                                                          (reason "premium customer")
+                                                          (percentage 10))
+                                        (COMPUTE total_discount_pct + 10 → total_discount_pct))
+                                      (wholesale
+                                        (APPEND discounts
+                                                          (type customer)
+                                                          (reason "wholesale customer")
+                                                          (percentage 15))
+                                        (COMPUTE total_discount_pct + 15 → total_discount_pct))
+                                      (regular))
+                        ;; ── Rule 3: Day of week discount ──
+                        (GET_CURRENT auth user → today)
+                        (MATCH today
+                                      (tuesday
+                                        (APPEND discounts
+                                                          (type promo)
+                                                          (reason "Tuesday promo")
+                                                          (percentage 5))
+                                        (COMPUTE total_discount_pct + 5 → total_discount_pct))
+                                      (thursday
+                                        (APPEND discounts
+                                                          (type promo)
+                                                          (reason "Thursday promo")
+                                                          (percentage 3))
+                                        (COMPUTE total_discount_pct + 3 → total_discount_pct))
+                                      (DEFAULT))
+                        ;; ── Rule 4: Coupon (optional) ──
+                        (BRANCH (!= request.coupon_code null)
+                                      (TRUE
+                                        (STORE_FIND coupon_store request.coupon_code → coupon)
+                                        (MATCH coupon
+                                                          (NONE
+                                                            (ERR_CUSTOM ERR_COUPON_INVALID (code request.coupon_code) (reason "coupon not found")))
+                                                          (OK
+                                                            (BRANCH (== coupon.active false)
+                                                                                  (TRUE
+                                                                                    (ERR_CUSTOM ERR_COUPON_INVALID (code request.coupon_code) (reason "coupon is inactive")))
+                                                                                  (FALSE
+                                                                                    (GET_CURRENT auth user → now)
+                                                                                    (BRANCH (> now coupon.valid_until)
+                                                                                                              (TRUE
+                                                                                                                (ERR_CUSTOM ERR_COUPON_EXPIRED (code request.coupon_code)))
+                                                                                                              (FALSE
+                                                                                                                (BRANCH (NOT_IN request.customer_type coupon.customer_types)
+                                                                                                                                              (TRUE
+                                                                                                                                                (ERR_CUSTOM ERR_COUPON_NOT_ELIGIBLE (code request.coupon_code) (customer_type request.customer_type)))
+                                                                                                                                              (FALSE
+                                                                                                                                                (BRANCH (< request.quantity coupon.min_quantity)
+                                                                                                                                                                                  (TRUE
+                                                                                                                                                                                    (ERR_CUSTOM ERR_COUPON_MIN_QUANTITY (code request.coupon_code) (min_quantity coupon.min_quantity) (actual_quantity request.quantity)))
+                                                                                                                                                                                  (FALSE
+                                                                                                                                                                                    (APPEND discounts
+                                                                                                                                                                                                                          (type coupon)
+                                                                                                                                                                                                                          (reason request.coupon_code)
+                                                                                                                                                                                                                          (percentage coupon.discount_pct))
+                                                                                                                                                                                    (COMPUTE total_discount_pct + coupon.discount_pct → total_discount_pct))))))))))))
+                                      (FALSE))
+                        ;; ── Cap discount at max ──
+                        (COMPUTE_FN min total_discount_pct 40 → total_discount_pct)
+                        ;; ── Calculate final price ──
+                        (COMPUTE 1 - "{'op': '/', 'left': 'total_discount_pct', 'right': 100}" → discount_multiplier)
+                        (COMPUTE subtotal * discount_multiplier → final_price)
+                        (COMPUTE_FN round final_price 2 → final_price)
+                        (CONSTRUCT PriceResponse
+                                      (product_id request.product_id)
+                                      (base_price product_result.price)
+                                      (quantity request.quantity)
+                                      (subtotal subtotal)
+                                      (discounts_applied discounts)
+                                      (total_discount_pct total_discount_pct)
+                                      (final_price final_price)
+                                    → response)
+                        (RESPOND 200 response)))))))
+
+(handler handler_get_coupon
+  (auth (requires authenticated))
+  (params (code string))
+  (returns "RESULT(Coupon, Error)")
+  (do
+    (READ_PARAM code string → code)
+    (STORE_FIND coupon_store code → coupon)
+    (MATCH coupon
+          (OK
+            (RESPOND 200 coupon))
+          (NONE
+            (ERR_NOT_FOUND "coupon" code)))))
+
+;; ── Tests (legacy format — preserved as nested tree) ──
+(tests
+  (cases
+    (item
+      (name no_discounts_regular_customer)
+      (setup
+        (mock_services
+          (product_service
+            (item
+              (method GET)
+              (path "/products/prod-001")
+              (response
+                (status 200)
+                (body
+                  (id prod-001)
+                  (name Widget)
+                  (price 10.0)
+                  (stock 100))))))
+        (override_time
+          (day_of_week monday)))
+      (run
+        (item
+          (action REQUEST)
+          (method POST)
+          (path "/pricing/calculate")
+          (body
+            (product_id prod-001)
+            (quantity 5)
+            (customer_type regular)))
+        (item
+          (assert status)
+          (equals 200))
+        (item
+          (assert body.subtotal)
+          (equals 50.0))
+        (item
+          (assert body.total_discount_pct)
+          (equals 0))
+        (item
+          (assert body.final_price)
+          (equals 50.0))
+        (item
+          (assert body.discounts_applied.length)
+          (equals 0))))
+    (item
+      (name volume_discount_only)
+      (setup
+        (mock_services
+          (product_service
+            (item
+              (method GET)
+              (path "/products/prod-001")
+              (response
+                (status 200)
+                (body
+                  (id prod-001)
+                  (name Widget)
+                  (price 10.0)
+                  (stock 200))))))
+        (override_time
+          (day_of_week monday)))
+      (run
+        (item
+          (action REQUEST)
+          (method POST)
+          (path "/pricing/calculate")
+          (body
+            (product_id prod-001)
+            (quantity 50)
+            (customer_type regular)))
+        (item
+          (assert status)
+          (equals 200))
+        (item
+          (assert body.subtotal)
+          (equals 500.0))
+        (item
+          (assert body.total_discount_pct)
+          (equals 10))
+        (item
+          (assert body.final_price)
+          (equals 450.0))
+        (item
+          (assert body.discounts_applied.length)
+          (equals 1))
+        (item
+          (assert "body.discounts_applied[0].type")
+          (equals volume))))
+    (item
+      (name stacked_discounts_premium_volume_tuesday)
+      (setup
+        (mock_services
+          (product_service
+            (item
+              (method GET)
+              (path "/products/prod-001")
+              (response
+                (status 200)
+                (body
+                  (id prod-001)
+                  (name Widget)
+                  (price 10.0)
+                  (stock 500))))))
+        (override_time
+          (day_of_week tuesday)))
+      (run
+        (item
+          (action REQUEST)
+          (method POST)
+          (path "/pricing/calculate")
+          (body
+            (product_id prod-001)
+            (quantity 100)
+            (customer_type premium)))
+        (item
+          (assert status)
+          (equals 200))
+        (item
+          (assert body.subtotal)
+          (equals 1000.0))
+        (item
+          (assert body.total_discount_pct)
+          (equals 30))
+        (item
+          (assert body.final_price)
+          (equals 700.0))
+        (item
+          (assert body.discounts_applied.length)
+          (equals 3)))
+      (_comment "15% volume + 10% premium + 5% tuesday = 30%"))
+    (item
+      (name discount_cap_at_40_percent)
+      (setup
+        (mock_services
+          (product_service
+            (item
+              (method GET)
+              (path "/products/prod-001")
+              (response
+                (status 200)
+                (body
+                  (id prod-001)
+                  (name Widget)
+                  (price 10.0)
+                  (stock 500))))))
+        (seed_data
+          (coupon_store
+            (item
+              (code MEGA20)
+              (discount_pct 20)
+              (min_quantity 1)
+              (valid_until "2027-12-31T23:59:59Z")
+              (customer_types wholesale)
+              (active true))))
+        (override_time
+          (day_of_week tuesday)))
+      (run
+        (item
+          (action REQUEST)
+          (method POST)
+          (path "/pricing/calculate")
+          (body
+            (product_id prod-001)
+            (quantity 100)
+            (customer_type wholesale)
+            (coupon_code MEGA20)))
+        (item
+          (assert status)
+          (equals 200))
+        (item
+          (assert body.total_discount_pct)
+          (equals 40))
+        (item
+          (assert body.final_price)
+          (equals 600.0)))
+      (_comment "15% volume + 15% wholesale + 5% tuesday + 20% coupon = 55%, capped at 40%"))
+    (item
+      (name coupon_expired)
+      (setup
+        (seed_data
+          (coupon_store
+            (item
+              (code EXPIRED10)
+              (discount_pct 10)
+              (min_quantity 1)
+              (valid_until "2020-01-01T00:00:00Z")
+              (customer_types regular)
+              (active true))))
+        (mock_services
+          (product_service
+            (item
+              (method GET)
+              (path "/products/prod-001")
+              (response
+                (status 200)
+                (body
+                  (id prod-001)
+                  (name Widget)
+                  (price 10.0)
+                  (stock 100)))))))
+      (run
+        (item
+          (action REQUEST)
+          (method POST)
+          (path "/pricing/calculate")
+          (body
+            (product_id prod-001)
+            (quantity 5)
+            (customer_type regular)
+            (coupon_code EXPIRED10)))
+        (item
+          (assert status)
+          (equals 422))
+        (item
+          (assert body.error.type)
+          (equals COUPON_EXPIRED)))
+      (clean "RESET_STORE(coupon_store)"))
+    (item
+      (name coupon_wrong_customer_type)
+      (setup
+        (seed_data
+          (coupon_store
+            (item
+              (code WHOLESALE5)
+              (discount_pct 5)
+              (min_quantity 1)
+              (valid_until "2027-12-31T23:59:59Z")
+              (customer_types wholesale)
+              (active true))))
+        (mock_services
+          (product_service
+            (item
+              (method GET)
+              (path "/products/prod-001")
+              (response
+                (status 200)
+                (body
+                  (id prod-001)
+                  (name Widget)
+                  (price 10.0)
+                  (stock 100)))))))
+      (run
+        (item
+          (action REQUEST)
+          (method POST)
+          (path "/pricing/calculate")
+          (body
+            (product_id prod-001)
+            (quantity 5)
+            (customer_type regular)
+            (coupon_code WHOLESALE5)))
+        (item
+          (assert status)
+          (equals 422))
+        (item
+          (assert body.error.type)
+          (equals COUPON_NOT_ELIGIBLE)))
+      (clean "RESET_STORE(coupon_store)"))))

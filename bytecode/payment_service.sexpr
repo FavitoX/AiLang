@@ -1,0 +1,623 @@
+;; ═══════════════════════════════════════════════════════════════
+;; AILang Bytecode — S-expression format
+;; Service: payment_service
+;; Version: 0.6
+;; Converted from: payment_service.json
+;; ═══════════════════════════════════════════════════════════════
+
+(service payment_service
+  (version "0.6")
+  (port 8083)
+  (on_fiber_crash RESTART_FIBER)
+  (on_service_crash NOTIFY_RESTART))
+
+;; ── Schemas ──
+(schema PaymentRequest
+  (field order_id uuid (required))
+  (field amount decimal (required) (gt 0))
+  (field currency enum (required) (values USD EUR ARS))
+  (field payment_method enum (required) (values credit_card debit_card bank_transfer))
+  (field card_token string))
+(schema Payment
+  (field id uuid (auto_gen))
+  (field order_id uuid)
+  (field amount decimal)
+  (field currency string)
+  (field payment_method string)
+  (field status enum (default pending) (values pending fraud_check processing completed failed refunded))
+  (field fraud_score decimal)
+  (field gateway_ref string)
+  (field failure_reason string)
+  (field created_at timestamp (auto_gen))
+  (field completed_at timestamp))
+(schema FraudCheckResult
+  (field score decimal)
+  (field risk_level enum (values low medium high))
+  (field approved bool))
+(schema GatewayChargeResult
+  (field reference string)
+  (field status enum (values approved declined error))
+  (field decline_reason string))
+
+;; ── Stores ──
+(store payment_store
+  (provider IN_MEMORY)
+  (schema Payment)
+  (index id PRIMARY))
+
+;; ── Dependencies ──
+(dependencies
+  (payment_store payment_store)
+  (fraud_service
+    (type SERVICE_REF)
+    (target fraud_service)
+    (base_url_ref ENV.FRAUD_SERVICE_URL)
+    (default "http://localhost:8090")
+    (resilience fraud_service_policy))
+  (payment_gateway
+    (type SERVICE_REF)
+    (target payment_gateway)
+    (base_url_ref ENV.PAYMENT_GATEWAY_URL)
+    (default "http://localhost:8091")
+    (resilience gateway_policy))
+  (order_service
+    (type SERVICE_REF)
+    (target order_service)
+    (base_url_ref ENV.ORDER_SERVICE_URL)
+    (default "http://localhost:8081")
+    (resilience order_service_policy)))
+
+;; ── Auth ──
+(auth
+  (provider jwt)
+  (secret_ref jwt_secret))
+
+;; ── CORS ──
+(cors
+  (origins "*")
+  (methods GET POST)
+  (headers Content-Type Authorization)
+  (max_age 3600))
+
+;; ── Resilience (policies, events) ──
+(resilience
+  (policies
+    (fraud_service_policy
+      (timeout
+        (duration_ms 5000)
+        (on_timeout ERR_TIMEOUT))
+      (circuit_breaker
+        (failure_threshold 3)
+        (success_threshold 2)
+        (half_open_max_calls 1)
+        (reset_timeout_ms 60000)
+        (on_open
+          (emit_event circuit_open)
+          (fallback ERR_UNAVAILABLE))
+        (on_half_open
+          (emit_event circuit_half_open))
+        (on_close
+          (emit_event circuit_closed)))
+      (retry
+        (max_attempts 2)
+        (backoff
+          (type exponential)
+          (initial_ms 200)
+          (max_ms 1000))
+        (retryable_errors ERR_TIMEOUT ERR_CONNECTION)
+        (non_retryable_errors ERR_NOT_FOUND ERR_VALIDATION)))
+    (gateway_policy
+      (timeout
+        (duration_ms 10000)
+        (on_timeout ERR_TIMEOUT))
+      (circuit_breaker
+        (failure_threshold 3)
+        (success_threshold 2)
+        (half_open_max_calls 1)
+        (reset_timeout_ms 120000)
+        (on_open
+          (emit_event circuit_open)
+          (fallback ERR_UNAVAILABLE))
+        (on_half_open
+          (emit_event circuit_half_open))
+        (on_close
+          (emit_event circuit_closed)))
+      (retry
+        (_comment "Gateway charges are NOT idempotent. NEVER retry a charge. Only retry status checks.")
+        (max_attempts 1)
+        (retryable_errors )
+        (non_retryable_errors "*")))
+    (order_service_policy
+      (timeout
+        (duration_ms 3000)
+        (on_timeout ERR_TIMEOUT))
+      (circuit_breaker
+        (failure_threshold 5)
+        (success_threshold 3)
+        (half_open_max_calls 1)
+        (reset_timeout_ms 30000)
+        (on_open
+          (emit_event circuit_open)
+          (fallback ERR_UNAVAILABLE))
+        (on_half_open
+          (emit_event circuit_half_open))
+        (on_close
+          (emit_event circuit_closed)))
+      (retry
+        (max_attempts 3)
+        (backoff
+          (type exponential)
+          (initial_ms 100)
+          (max_ms 2000))
+        (retryable_errors ERR_TIMEOUT ERR_CONNECTION)
+        (non_retryable_errors ERR_NOT_FOUND)))))
+
+;; ── Custom Errors ──
+(custom_errors
+  (ERR_FRAUD_REJECTED
+    (http_status 422)
+    (params payment_id score risk_level)
+    (message_template "payment {payment_id} rejected by fraud check (score: {score}, risk: {risk_level})"))
+  (ERR_CHARGE_DECLINED
+    (http_status 422)
+    (params payment_id reason)
+    (message_template "payment {payment_id} was declined: {reason}"))
+  (ERR_PAYMENT_ALREADY_PROCESSED
+    (http_status 409)
+    (params order_id payment_status)
+    (message_template "order {order_id} already has a payment in status {payment_status}")))
+
+;; ── Events (definitions + subscriptions) ──
+(events
+  (definitions
+    (payment_initiated
+      (schema Payment))
+    (payment_fraud_checked
+      (schema Payment))
+    (payment_completed
+      (schema Payment))
+    (payment_failed
+      (schema Payment))
+    (payment_refunded
+      (schema Payment))))
+
+;; ── Sagas ──
+(sagas
+  (_comment "Sagas define multi-step workflows with compensation. If any step fails, previous steps are compensated in reverse order.")
+  (process_payment
+    (steps
+      (item
+        (name create_payment_record)
+        (action
+          (op STORE_INSERT)
+          (store payment_store))
+        (compensate
+          (op STORE_UPDATE_FIELDS)
+          (store payment_store)
+          (fields
+            (status failed))))
+      (item
+        (name fraud_check)
+        (action
+          (op CALL_SERVICE)
+          (service fraud_service)
+          (method POST)
+          (path "/check")
+          (idempotent true))
+        (compensate
+          (op LOG)
+          (level INFO)
+          (message "Fraud check compensated — no action needed")))
+      (item
+        (name charge_gateway)
+        (action
+          (op CALL_SERVICE)
+          (service payment_gateway)
+          (method POST)
+          (path "/charge")
+          (idempotent false))
+        (compensate
+          (op CALL_SERVICE)
+          (service payment_gateway)
+          (method POST)
+          (path "/refund")
+          (idempotent false)))
+      (item
+        (name confirm_order)
+        (action
+          (op CALL_SERVICE)
+          (service order_service)
+          (method PUT)
+          (path "/orders/{order_id}/confirm")
+          (idempotent true))
+        (compensate
+          (op CALL_SERVICE)
+          (service order_service)
+          (method PUT)
+          (path "/orders/{order_id}/cancel")
+          (idempotent true))))))
+
+;; ── Routes ──
+(route POST   "/payments" handler_process_payment)
+(route GET    "/payments/:id" handler_get_payment)
+(route POST   "/payments/:id/refund" handler_refund_payment)
+
+;; ── Handlers ──
+(handler handler_process_payment
+  (auth (requires authenticated))
+  (returns "RESULT(Payment, Error)")
+  (do
+    (READ_BODY PaymentRequest → request)
+    (MATCH request
+          (ERR
+            (ERR_INVALID_BODY "PaymentRequest"))
+          (OK
+            ;; ── Step 1: Create payment record (status: pending) ──
+            (CONSTRUCT Payment
+                      (order_id request.order_id)
+                      (amount request.amount)
+                      (currency request.currency)
+                      (payment_method request.payment_method)
+                      (status pending)
+                    → payment)
+            (STORE_INSERT payment_store payment → payment)
+            (EMIT_EVENT payment_initiated payment)
+            ;; ── Step 2: Fraud check ──
+            (STORE_UPDATE_FIELDS payment_store payment.id ((status fraud_check)) → payment)
+            (CALL_SERVICE fraud_service
+                      (method POST)
+                      (path "/check")
+                      (idempotent true)
+                      (body (payment_id payment.id) (amount request.amount) (currency request.currency) (payment_method request.payment_method))
+                    → fraud_result)
+            (MATCH fraud_result
+                      (ERR
+                        (SAGA_COMPENSATE process_payment)
+                        (ERR_UNAVAILABLE "fraud_service"))
+                      (OK
+                        (STORE_UPDATE_FIELDS payment_store payment.id ((fraud_score fraud_result.score)) → payment)
+                        (BRANCH (== fraud_result.approved false)
+                                      (TRUE
+                                        (STORE_UPDATE_FIELDS payment_store payment.id ((status failed) (failure_reason fraud_rejected)) → payment)
+                                        (EMIT_EVENT payment_failed payment)
+                                        (ERR_CUSTOM ERR_FRAUD_REJECTED (payment_id payment.id) (score fraud_result.score) (risk_level fraud_result.risk_level)))
+                                      (FALSE
+                                        (EMIT_EVENT payment_fraud_checked payment)
+                                        ;; ── Step 3: Charge via payment gateway (NOT idempotent!) ──
+                                        (STORE_UPDATE_FIELDS payment_store payment.id ((status processing)) → payment)
+                                        (CALL_SERVICE payment_gateway
+                                                          (method POST)
+                                                          (path "/charge")
+                                                          (idempotent false)
+                                                          (body (payment_id payment.id) (amount request.amount) (currency request.currency) (card_token request.card_token))
+                                                        → charge_result)
+                                        (MATCH charge_result
+                                                          (ERR
+                                                            (SAGA_COMPENSATE process_payment)
+                                                            (ERR_UNAVAILABLE "payment_gateway"))
+                                                          (OK
+                                                            (MATCH charge_result.status
+                                                                                  (declined
+                                                                                    (STORE_UPDATE_FIELDS payment_store payment.id ((status failed) (failure_reason charge_result.decline_reason)) → payment)
+                                                                                    (EMIT_EVENT payment_failed payment)
+                                                                                    (ERR_CUSTOM ERR_CHARGE_DECLINED (payment_id payment.id) (reason charge_result.decline_reason)))
+                                                                                  (error
+                                                                                    (SAGA_COMPENSATE process_payment)
+                                                                                    (STORE_UPDATE_FIELDS payment_store payment.id ((status failed) (failure_reason gateway_error)) → payment)
+                                                                                    (EMIT_EVENT payment_failed payment)
+                                                                                    (ERR_UNAVAILABLE "payment_gateway"))
+                                                                                  (approved
+                                                                                    ;; ── Step 4: Confirm order ──
+                                                                                    (STORE_UPDATE_FIELDS payment_store payment.id ((status completed) (gateway_ref charge_result.reference)) → payment)
+                                                                                    (GET_CURRENT auth user → now)
+                                                                                    (STORE_UPDATE_FIELDS payment_store payment.id ((completed_at now)) → payment)
+                                                                                    (CALL_SERVICE order_service
+                                                                                                              (method PUT)
+                                                                                                              (path "/orders/{request.order_id}/confirm")
+                                                                                                              (idempotent true)
+                                                                                                            → confirm_result)
+                                                                                    (MATCH confirm_result
+                                                                                                              (ERR
+                                                                                                                (LOG ERROR "Failed to confirm order {request.order_id} — payment {payment.id} completed but order not confirmed. Manual intervention required.")
+                                                                                                                (EMIT_EVENT payment_completed payment))
+                                                                                                              (OK
+                                                                                                                (EMIT_EVENT payment_completed payment)))
+                                                                                    (RESPOND 201 payment)))))))))))))
+
+(handler handler_get_payment
+  (auth PUBLIC)
+  (params (id uuid))
+  (returns "RESULT(Payment, Error)")
+  (do
+    (READ_PARAM id uuid → id)
+    (STORE_FIND payment_store id → payment)
+    (MATCH payment
+          (OK
+            (RESPOND 200 payment))
+          (NONE
+            (ERR_NOT_FOUND "payment" id)))))
+
+(handler handler_refund_payment
+  (auth (requires authenticated))
+  (params (id uuid))
+  (returns "RESULT(Payment, Error)")
+  (do
+    (READ_PARAM id uuid → id)
+    (STORE_FIND payment_store id → payment)
+    (MATCH payment
+          (NONE
+            (ERR_NOT_FOUND "payment" id))
+          (OK
+            (BRANCH (!= payment.status "'completed'")
+                      (TRUE
+                        (ERR_BUSINESS_RULE "cannot_refund" "only completed payments can be refunded"))
+                      (FALSE
+                        (CALL_SERVICE payment_gateway
+                                      (method POST)
+                                      (path "/refund")
+                                      (idempotent false)
+                                      (body (gateway_ref payment.gateway_ref) (amount payment.amount))
+                                    → refund_result)
+                        (MATCH refund_result
+                                      (ERR
+                                        (ERR_UNAVAILABLE "payment_gateway"))
+                                      (OK
+                                        (STORE_UPDATE_FIELDS payment_store id ((status refunded)) → payment)
+                                        (EMIT_EVENT payment_refunded payment)
+                                        (RESPOND 200 payment)))))))))
+
+;; ── Tests (legacy format — preserved as nested tree) ──
+(tests
+  (cases
+    (item
+      (name payment_full_success)
+      (setup
+        (mock_services
+          (fraud_service
+            (item
+              (method POST)
+              (path "/check")
+              (response
+                (status 200)
+                (body
+                  (score 0.1)
+                  (risk_level low)
+                  (approved true)))))
+          (payment_gateway
+            (item
+              (method POST)
+              (path "/charge")
+              (response
+                (status 200)
+                (body
+                  (reference gw-ref-001)
+                  (status approved)))))
+          (order_service
+            (item
+              (method PUT)
+              (path "/orders/order-001/confirm")
+              (response
+                (status 200)
+                (body
+                  (id order-001)
+                  (status confirmed)))))))
+      (run
+        (item
+          (action REQUEST)
+          (method POST)
+          (path "/payments")
+          (auth true)
+          (body
+            (order_id order-001)
+            (amount 99.99)
+            (currency USD)
+            (payment_method credit_card)
+            (card_token tok_test_123)))
+        (item
+          (assert status)
+          (equals 201))
+        (item
+          (assert body.status)
+          (equals completed))
+        (item
+          (assert body.gateway_ref)
+          (equals gw-ref-001))
+        (item
+          (assert body.fraud_score)
+          (equals 0.1)))
+      (clean "RESET_STORE(payment_store)"))
+    (item
+      (name payment_fraud_rejected)
+      (setup
+        (mock_services
+          (fraud_service
+            (item
+              (method POST)
+              (path "/check")
+              (response
+                (status 200)
+                (body
+                  (score 0.95)
+                  (risk_level high)
+                  (approved false)))))))
+      (run
+        (item
+          (action REQUEST)
+          (method POST)
+          (path "/payments")
+          (auth true)
+          (body
+            (order_id order-002)
+            (amount 5000.0)
+            (currency USD)
+            (payment_method credit_card)
+            (card_token tok_suspicious)))
+        (item
+          (assert status)
+          (equals 422))
+        (item
+          (assert body.error.type)
+          (equals FRAUD_REJECTED)))
+      (clean "RESET_STORE(payment_store)"))
+    (item
+      (name payment_charge_declined)
+      (setup
+        (mock_services
+          (fraud_service
+            (item
+              (method POST)
+              (path "/check")
+              (response
+                (status 200)
+                (body
+                  (score 0.2)
+                  (risk_level low)
+                  (approved true)))))
+          (payment_gateway
+            (item
+              (method POST)
+              (path "/charge")
+              (response
+                (status 200)
+                (body
+                  (reference "")
+                  (status declined)
+                  (decline_reason insufficient_funds)))))))
+      (run
+        (item
+          (action REQUEST)
+          (method POST)
+          (path "/payments")
+          (auth true)
+          (body
+            (order_id order-003)
+            (amount 99.99)
+            (currency USD)
+            (payment_method debit_card)
+            (card_token tok_no_funds)))
+        (item
+          (assert status)
+          (equals 422))
+        (item
+          (assert body.error.type)
+          (equals CHARGE_DECLINED)))
+      (clean "RESET_STORE(payment_store)"))
+    (item
+      (name payment_gateway_timeout_no_retry)
+      (setup
+        (mock_services
+          (fraud_service
+            (item
+              (method POST)
+              (path "/check")
+              (response
+                (status 200)
+                (body
+                  (score 0.1)
+                  (risk_level low)
+                  (approved true)))))
+          (payment_gateway
+            (item
+              (method POST)
+              (path "/charge")
+              (response
+                (delay_ms 15000)
+                (status 200)
+                (body))
+              (_comment "Gateway timeout. Because idempotent=false, NO retry happens. This is critical for payments.")))))
+      (run
+        (item
+          (action REQUEST)
+          (method POST)
+          (path "/payments")
+          (auth true)
+          (body
+            (order_id order-004)
+            (amount 50.0)
+            (currency USD)
+            (payment_method credit_card)
+            (card_token tok_slow)))
+        (item
+          (assert status)
+          (equals 503)))
+      (clean "RESET_STORE(payment_store)"))
+    (item
+      (name refund_success)
+      (setup
+        (seed_data
+          (payment_store
+            (item
+              (id pay-to-refund)
+              (order_id order-005)
+              (amount 75.0)
+              (currency USD)
+              (payment_method credit_card)
+              (status completed)
+              (fraud_score 0.1)
+              (gateway_ref gw-ref-005)
+              (created_at "2026-04-14T00:00:00Z")
+              (completed_at "2026-04-14T00:01:00Z"))))
+        (mock_services
+          (payment_gateway
+            (item
+              (method POST)
+              (path "/refund")
+              (response
+                (status 200)
+                (body
+                  (status refunded)))))))
+      (run
+        (item
+          (action REQUEST)
+          (method POST)
+          (path "/payments/pay-to-refund/refund")
+          (auth true))
+        (item
+          (assert status)
+          (equals 200))
+        (item
+          (assert body.status)
+          (equals refunded)))
+      (clean "RESET_STORE(payment_store)"))
+    (item
+      (name refund_non_completed_payment)
+      (setup
+        (seed_data
+          (payment_store
+            (item
+              (id pay-pending)
+              (order_id order-006)
+              (amount 25.0)
+              (currency USD)
+              (payment_method credit_card)
+              (status pending)
+              (created_at "2026-04-14T00:00:00Z")))))
+      (run
+        (item
+          (action REQUEST)
+          (method POST)
+          (path "/payments/pay-pending/refund")
+          (auth true))
+        (item
+          (assert status)
+          (equals 422))
+        (item
+          (assert body.error.type)
+          (equals BUSINESS_RULE)))
+      (clean "RESET_STORE(payment_store)"))
+    (item
+      (name payment_unauthorized)
+      (run
+        (item
+          (action REQUEST)
+          (method POST)
+          (path "/payments")
+          (auth false)
+          (body
+            (order_id order-007)
+            (amount 10.0)
+            (currency USD)
+            (payment_method credit_card)))
+        (item
+          (assert status)
+          (equals 401))))))
