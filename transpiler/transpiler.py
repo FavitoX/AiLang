@@ -635,8 +635,20 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
         if body:
             pairs = ", ".join(f'["{k}"] = {_cs_value(v)}' for k, v in body.items())
             body_expr = f'new System.Collections.Generic.Dictionary<string, object?> {{ {pairs} }}'
+
+        # Pick the resilience variant. When idempotent=false and the policy
+        # defines a retry strategy, route through the "_no_retry" sibling client
+        # so the retry is bypassed for mutations — per AILang contract.
+        idempotent = inst.get('idempotent', True)
+        svc_defs = ctx.get('service_refs') or {}
+        policies = ctx.get('resilience_policies') or {}
+        policy_name = (svc_defs.get(service) or {}).get('resilience')
+        policy = policies.get(policy_name) if policy_name else None
+        has_retry = bool(policy and policy.get('retry'))
+        client_name = f"{service}_no_retry" if (has_retry and not idempotent) else service
+
         lines.append(
-            f'{pad}System.Text.Json.Nodes.JsonNode? {assign} = await CallServiceAsync(httpClientFactory, "{service}", "{method}", {path_expr}, {body_expr});'
+            f'{pad}System.Text.Json.Nodes.JsonNode? {assign} = await CallServiceAsync(httpClientFactory, "{client_name}", "{method}", {path_expr}, {body_expr});'
         )
         ctx.setdefault('locals', {})[assign] = 'JsonNode'
 
@@ -1174,6 +1186,14 @@ def generate_csharp(bc, output_dir: str):
     lines.append("using System.Collections.Concurrent;")
     lines.append("using System.Text.Json;")
     lines.append("using System.Text.Json.Serialization;")
+    # Polly extension methods (.AddCircuitBreaker, .AddRetry, .AddTimeout) live
+    # in the root Polly namespace.
+    uses_resilience_cs = any(
+        svc.get('resilience') for svc in (bc.dependencies or {}).values()
+        if svc.get('type') == 'SERVICE_REF'
+    )
+    if uses_resilience_cs:
+        lines.append("using Polly;")
     lines.append("")
     lines.append("var builder = WebApplication.CreateBuilder(args);")
     lines.append("")
@@ -1219,16 +1239,36 @@ def generate_csharp(bc, output_dir: str):
         lines.append("")
 
     # HttpClient per SERVICE_REF dependency — base address from env (with default fallback).
+    # When a resilience policy is attached, emit two named clients per service:
+    #   - "{svc}"          : full pipeline (CB + retry + timeout) for idempotent calls
+    #   - "{svc}_no_retry" : pipeline without retry for non-idempotent calls
     service_refs = {n: d for n, d in (bc.dependencies or {}).items() if d.get('type') == 'SERVICE_REF'}
-    for svc_name, svc_def in service_refs.items():
+    policies = (bc.resilience or {}).get('policies', {}) or {}
+
+    def _emit_http_client(svc_name, svc_def, policy, include_retry):
         env_var = svc_def.get('base_url_ref', '').replace('ENV.', '') or 'UNSET'
         default_url = svc_def.get('default', 'http://localhost')
-        lines.append(f"// ── DI: HttpClient for service_ref {svc_name} ──")
-        lines.append(f'builder.Services.AddHttpClient("{svc_name}", c =>')
+        client_name = svc_name if include_retry else f"{svc_name}_no_retry"
+        lines.append(f"// ── DI: HttpClient '{client_name}' {'(with retry)' if include_retry else '(no retry — non-idempotent)'} ──")
+        lines.append(f'builder.Services.AddHttpClient("{client_name}", c =>')
         lines.append("{")
         lines.append(f'    var baseUrl = Environment.GetEnvironmentVariable("{env_var}") ?? "{default_url}";')
         lines.append("    c.BaseAddress = new Uri(baseUrl);")
-        lines.append("});")
+        lines.append("})")
+        if policy:
+            lines.extend(generate_resilience_handler_csharp(policy, include_retry=include_retry, indent=1))
+        # Terminator — last statement in the fluent chain gets ';'.
+        lines[-1] = lines[-1] + ";"
+
+    for svc_name, svc_def in service_refs.items():
+        policy_name = svc_def.get('resilience')
+        policy = policies.get(policy_name) if policy_name else None
+        # Primary client (with retry when policy defines it).
+        _emit_http_client(svc_name, svc_def, policy, include_retry=True)
+        # Only emit the no-retry sibling when the policy actually defines retry —
+        # otherwise it's identical to the primary and would just bloat DI.
+        if policy and policy.get('retry'):
+            _emit_http_client(svc_name, svc_def, policy, include_retry=False)
     if service_refs:
         lines.append("")
 
@@ -1372,6 +1412,8 @@ def generate_csharp(bc, output_dir: str):
             'store_def': primary_store_def,
             'returns': handler_def.get('returns'),
             'custom_errors': bc.custom_errors,
+            'service_refs': service_refs,
+            'resilience_policies': policies,
         }
         for inst in instructions:
             lines.extend(compile_instruction_csharp(inst, 1, ctx))
@@ -1442,13 +1484,20 @@ def generate_csharp(bc, output_dir: str):
     with open(os.path.join(output_dir, "Program.cs"), 'w') as f:
         f.write('\n'.join(lines))
 
-    # .csproj — include Npgsql when a PG store is present
+    # .csproj — include Npgsql when a PG store is present; resilience package
+    # when any service_ref has a policy attached.
     pkg_refs = [
         '    <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="10.0.0" />',
         '    <PackageReference Include="System.IdentityModel.Tokens.Jwt" Version="8.2.1" />',
     ]
     if is_pg:
         pkg_refs.append('    <PackageReference Include="Npgsql" Version="10.0.0" />')
+    needs_resilience = any(
+        svc.get('resilience') for svc in (bc.dependencies or {}).values()
+        if svc.get('type') == 'SERVICE_REF'
+    )
+    if needs_resilience:
+        pkg_refs.append('    <PackageReference Include="Microsoft.Extensions.Http.Resilience" Version="9.0.0" />')
 
     csproj = (
         '<Project Sdk="Microsoft.NET.Sdk.Web">\n'
@@ -1522,6 +1571,54 @@ def generate_schema_csharp(name: str, schema_def: dict) -> list[str]:
             lines.append(f"    public {modifier}{csharp_type}{nullable} {prop_name} {{ get; init; }}")
         lines.append("}")
 
+    return lines
+
+
+def generate_resilience_handler_csharp(policy: dict, include_retry: bool, indent: int = 1) -> list[str]:
+    """Emit the `.AddResilienceHandler("name", b => { ... })` body for a policy.
+
+    Order: CircuitBreaker (outer) → Retry → Timeout (innermost). Matches Polly v8
+    recommended composition for HTTP pipelines. `include_retry=False` omits the
+    retry strategy — used for the "no-retry" variant bound to non-idempotent
+    calls.
+    """
+    pad = "    " * indent
+    handler = f"{policy['name']}{'' if include_retry else '_no_retry'}"
+    lines = [f'{pad}.AddResilienceHandler("{handler}", b =>', f"{pad}{{"]
+    cb = policy.get('circuit_breaker')
+    if cb:
+        lines.append(f"{pad}    b.AddCircuitBreaker(new Polly.CircuitBreaker.CircuitBreakerStrategyOptions<HttpResponseMessage>")
+        lines.append(f"{pad}    {{")
+        lines.append(f"{pad}        FailureRatio = 1.0,  // open when all requests in-window fail")
+        lines.append(f"{pad}        MinimumThroughput = {cb['failure_threshold']},")
+        lines.append(f"{pad}        SamplingDuration = TimeSpan.FromSeconds(30),")
+        lines.append(f"{pad}        BreakDuration = TimeSpan.FromMilliseconds({cb['reset_timeout_ms']}),")
+        lines.append(f"{pad}        ShouldHandle = new Polly.PredicateBuilder<HttpResponseMessage>()")
+        lines.append(f"{pad}            .Handle<HttpRequestException>()")
+        lines.append(f"{pad}            .HandleResult(r => (int)r.StatusCode >= 500),")
+        lines.append(f"{pad}    }});")
+    retry = policy.get('retry')
+    if retry and include_retry:
+        bt = {
+            'exponential': 'Polly.DelayBackoffType.Exponential',
+            'linear': 'Polly.DelayBackoffType.Linear',
+            'constant': 'Polly.DelayBackoffType.Constant',
+        }.get(retry['backoff_type'], 'Polly.DelayBackoffType.Exponential')
+        lines.append(f"{pad}    b.AddRetry(new Polly.Retry.RetryStrategyOptions<HttpResponseMessage>")
+        lines.append(f"{pad}    {{")
+        lines.append(f"{pad}        MaxRetryAttempts = {retry['max_attempts']},")
+        lines.append(f"{pad}        Delay = TimeSpan.FromMilliseconds({retry['initial_ms']}),")
+        lines.append(f"{pad}        BackoffType = {bt},")
+        lines.append(f"{pad}        UseJitter = true,")
+        lines.append(f"{pad}        ShouldHandle = new Polly.PredicateBuilder<HttpResponseMessage>()")
+        lines.append(f"{pad}            .Handle<HttpRequestException>()")
+        lines.append(f"{pad}            .Handle<Polly.Timeout.TimeoutRejectedException>()")
+        lines.append(f"{pad}            .HandleResult(r => (int)r.StatusCode >= 500),")
+        lines.append(f"{pad}    }});")
+    timeout = policy.get('timeout')
+    if timeout:
+        lines.append(f"{pad}    b.AddTimeout(TimeSpan.FromMilliseconds({timeout['duration_ms']}));")
+    lines.append(f"{pad}}})")
     return lines
 
 
@@ -1996,6 +2093,7 @@ def generate_go(bc, output_dir: str):
     has_in_memory_store = any(s.get('provider') != 'PostgreSQL' for s in bc.stores.values())
     needs_math = 'COMPUTE_FN' in all_ops
     needs_http_client = 'CALL_SERVICE' in all_ops
+    needs_resilience_go = needs_http_client and bool((bc.resilience or {}).get('policies'))
 
     lines = []
     lines.append("// ═══════════════════════════════════════════════════════════════")
@@ -2026,11 +2124,13 @@ def generate_go(bc, output_dir: str):
         lines.append('\t"os"')
     lines.append('\t"strconv"')
     lines.append('\t"strings"')
-    if has_in_memory_store:
+    if has_in_memory_store or needs_resilience_go:
         lines.append('\t"sync"')
     lines.append('\t"time"')
     lines.append("")
     lines.append('\t"github.com/google/uuid"')
+    if needs_resilience_go:
+        lines.append('\t"github.com/sony/gobreaker/v2"')
     if is_pg:
         lines.append('\t"github.com/jackc/pgx/v5"')
         lines.append('\t"github.com/jackc/pgx/v5/pgxpool"')
@@ -2153,7 +2253,7 @@ def generate_go(bc, output_dir: str):
     lines.append("")
 
     if uses_call_service_anywhere:
-        lines.extend(generate_service_client_go())
+        lines.extend(generate_service_client_go(bc))
         lines.append("")
 
     # Handlers (generated before the mux so we can reference them)
@@ -2225,6 +2325,8 @@ def generate_go(bc, output_dir: str):
     requires = ['\tgithub.com/google/uuid v1.6.0']
     if is_pg:
         requires.append('\tgithub.com/jackc/pgx/v5 v5.7.5')
+    if needs_resilience_go:
+        requires.append('\tgithub.com/sony/gobreaker/v2 v2.0.0')
     go_mod = (
         f"module ailang-{service_name.replace('_', '-')}\n\n"
         f"go 1.25\n\n"
@@ -2277,41 +2379,201 @@ def generate_schema_go(name: str, schema_def: dict) -> list[str]:
     return lines
 
 
-def generate_service_client_go() -> list[str]:
-    """Global helper: callService(ctx, baseURL, method, path, body) → map[string]any.
+def generate_service_client_go(bc) -> list[str]:
+    """Global helper: callService(ctx, svcName, baseURL, method, path, body, idempotent) → map[string]any.
 
-    Returns the parsed JSON body on 2xx, or nil on transport error / non-2xx so
-    the MATCH OK/NONE idiom works with `== nil` (ERR) and `!= nil` (OK).
+    Two variants: policy-less (simple retry-free HTTP call with 10s default
+    timeout) and full (per-policy circuit breaker + retry loop + per-attempt
+    ctx timeout). The variant is chosen by whether the bytecode declares any
+    resilience policies. Returns nil on final failure so MATCH OK/NONE works
+    via `== nil`/`!= nil`.
     """
-    return [
+    policies = (bc.resilience or {}).get('policies', {}) or {}
+    service_refs = {n: d for n, d in (bc.dependencies or {}).items() if d.get('type') == 'SERVICE_REF'}
+
+    if not policies:
+        return [
+            "// ── INTER-SERVICE HTTP HELPER (no resilience policies) ──",
+            "var _httpClient = &http.Client{Timeout: 10 * time.Second}",
+            "",
+            "func callService(ctx context.Context, svcName, baseURL, method, path string, body any, _idempotent bool) map[string]any {",
+            "\tvar reqBody io.Reader",
+            "\tif body != nil {",
+            "\t\tb, err := json.Marshal(body)",
+            '\t\tif err != nil { slog.Error("call_service marshal", "err", err); return nil }',
+            "\t\treqBody = bytes.NewReader(b)",
+            "\t}",
+            "\treq, err := http.NewRequestWithContext(ctx, method, baseURL+path, reqBody)",
+            '\tif err != nil { slog.Error("call_service req", "err", err); return nil }',
+            '\tif body != nil { req.Header.Set("Content-Type", "application/json") }',
+            "\tresp, err := _httpClient.Do(req)",
+            '\tif err != nil { slog.Error("call_service do", "err", err, "svc", svcName); return nil }',
+            "\tdefer resp.Body.Close()",
+            "\tif resp.StatusCode >= 400 {",
+            '\t\tslog.Info("call_service non-2xx", "status", resp.StatusCode, "path", path)',
+            "\t\treturn nil",
+            "\t}",
+            "\tvar out map[string]any",
+            "\tif err := json.NewDecoder(resp.Body).Decode(&out); err != nil {",
+            '\t\tslog.Error("call_service decode", "err", err)',
+            "\t\treturn nil",
+            "\t}",
+            "\treturn out",
+            "}",
+        ]
+
+    # Full version with CB + retry when policies are declared.
+    # Map from svc_name → its policy (so the runtime can look up CB + retry).
+    svc_policy = {n: d.get('resilience') for n, d in service_refs.items() if d.get('resilience')}
+
+    lines = [
         "// ── INTER-SERVICE HTTP HELPER ──",
-        "var _httpClient = &http.Client{Timeout: 10 * time.Second}",
+        "var _httpClient = &http.Client{}  // per-attempt timeout handled via ctx.WithTimeout",
         "",
-        "func callService(ctx context.Context, baseURL, method, path string, body any) map[string]any {",
-        "\tvar reqBody io.Reader",
-        "\tif body != nil {",
-        "\t\tb, err := json.Marshal(body)",
-        "\t\tif err != nil { slog.Error(\"call_service marshal\", \"err\", err); return nil }",
-        "\t\treqBody = bytes.NewReader(b)",
+    ]
+
+    # Emit one sync.Once + CB-per-policy.
+    if policies:
+        lines.append("// Circuit breakers (one per resilience policy), lazily initialized.")
+        lines.append("var _cbs = map[string]*gobreaker.CircuitBreaker[[]byte]{}")
+        lines.append("var _cbsOnce sync.Once")
+        lines.append("")
+        lines.append("func _initCBs() {")
+        for pname, pol in policies.items():
+            cb = pol.get('circuit_breaker') or {}
+            ft = cb.get('failure_threshold', 5)
+            rt_ms = cb.get('reset_timeout_ms', 30000)
+            lines.append(f'\t_cbs["{pname}"] = gobreaker.NewCircuitBreaker[[]byte](gobreaker.Settings{{')
+            lines.append(f'\t\tName:        "{pname}",')
+            lines.append(f'\t\tMaxRequests: 1,  // half-open probes')
+            lines.append(f'\t\tInterval:    0,  // don\'t reset counts while closed')
+            lines.append(f'\t\tTimeout:     {rt_ms} * time.Millisecond,  // how long to stay open')
+            lines.append(f'\t\tReadyToTrip: func(c gobreaker.Counts) bool {{ return c.ConsecutiveFailures >= {ft} }},')
+            lines.append(f'\t\tOnStateChange: func(name string, from, to gobreaker.State) {{')
+            lines.append(f'\t\t\tslog.Info("circuit_breaker_state", "policy", name, "from", from.String(), "to", to.String())')
+            lines.append(f'\t\t}},')
+            lines.append("\t})")
+        lines.append("}")
+        lines.append("")
+
+    # Per-policy retry settings baked into a lookup — the helper reads them at call time.
+    if policies:
+        lines.append("// Retry settings indexed by policy name.")
+        lines.append("type _retryCfg struct { MaxAttempts int; InitialMs, MaxMs int; Exponential bool }")
+        lines.append("var _retrySettings = map[string]_retryCfg{")
+        for pname, pol in policies.items():
+            r = pol.get('retry') or {}
+            if not r:
+                continue
+            max_a = r.get('max_attempts', 3)
+            initial = r.get('initial_ms', 100)
+            max_ms = r.get('max_ms', 2000)
+            expo = 'true' if r.get('backoff_type') == 'exponential' else 'false'
+            lines.append(f'\t"{pname}": {{MaxAttempts: {max_a}, InitialMs: {initial}, MaxMs: {max_ms}, Exponential: {expo}}},')
+        lines.append("}")
+        lines.append("")
+
+    # Per-policy timeout settings.
+    if policies:
+        lines.append("var _timeouts = map[string]time.Duration{")
+        for pname, pol in policies.items():
+            t = (pol.get('timeout') or {}).get('duration_ms', 10000)
+            lines.append(f'\t"{pname}": {t} * time.Millisecond,')
+        lines.append("}")
+        lines.append("")
+
+    # Svc → policy lookup baked in so callService can map svc→policy without extra arg.
+    if svc_policy:
+        lines.append("var _svcPolicies = map[string]string{")
+        for svc, pol in svc_policy.items():
+            lines.append(f'\t"{svc}": "{pol}",')
+        lines.append("}")
+        lines.append("")
+
+    lines.extend([
+        "// callService performs a single HTTP call with (optional) circuit breaker,",
+        "// per-attempt timeout, and retry-with-backoff. Returns nil on final failure.",
+        "func callService(ctx context.Context, svcName, baseURL, method, path string, body any, idempotent bool) map[string]any {",
+        "\tif len(_cbs) > 0 { _cbsOnce.Do(_initCBs) }",
+        '\tpolicy := _svcPolicies[svcName]',
+        "\ttimeout := 10 * time.Second",
+        "\tif t, ok := _timeouts[policy]; ok { timeout = t }",
+        "\tmaxAttempts := 1",
+        "\tinitial := 0 * time.Millisecond",
+        "\tmaxBackoff := 0 * time.Millisecond",
+        "\texpo := false",
+        "\tif idempotent {",
+        "\t\tif cfg, ok := _retrySettings[policy]; ok {",
+        "\t\t\tmaxAttempts = cfg.MaxAttempts + 1  // +1 because the first try isn't a retry",
+        "\t\t\tinitial = time.Duration(cfg.InitialMs) * time.Millisecond",
+        "\t\t\tmaxBackoff = time.Duration(cfg.MaxMs) * time.Millisecond",
+        "\t\t\texpo = cfg.Exponential",
+        "\t\t}",
         "\t}",
-        "\treq, err := http.NewRequestWithContext(ctx, method, baseURL+path, reqBody)",
-        "\tif err != nil { slog.Error(\"call_service req\", \"err\", err); return nil }",
-        "\tif body != nil { req.Header.Set(\"Content-Type\", \"application/json\") }",
-        "\tresp, err := _httpClient.Do(req)",
-        "\tif err != nil { slog.Error(\"call_service do\", \"err\", err); return nil }",
-        "\tdefer resp.Body.Close()",
-        "\tif resp.StatusCode >= 400 {",
-        "\t\tslog.Info(\"call_service non-2xx\", \"status\", resp.StatusCode, \"path\", path)",
-        "\t\treturn nil",
+        "\tcb := _cbs[policy]",
+        "",
+        "\tvar lastBody []byte",
+        "\tfor attempt := 0; attempt < maxAttempts; attempt++ {",
+        "\t\tif attempt > 0 {",
+        "\t\t\tdelay := initial",
+        "\t\t\tif expo { delay = initial << (attempt - 1) }",
+        "\t\t\tif maxBackoff > 0 && delay > maxBackoff { delay = maxBackoff }",
+        "\t\t\tselect {",
+        "\t\t\tcase <-time.After(delay):",
+        "\t\t\tcase <-ctx.Done():",
+        "\t\t\t\treturn nil",
+        "\t\t\t}",
+        "\t\t}",
+        "\t\tattemptCtx, cancel := context.WithTimeout(ctx, timeout)",
+        "\t\tattemptFn := func() ([]byte, error) {",
+        "\t\t\treturn _doHTTP(attemptCtx, baseURL, method, path, body)",
+        "\t\t}",
+        "\t\tvar (b []byte; err error)",
+        "\t\tif cb != nil {",
+        "\t\t\tb, err = cb.Execute(attemptFn)",
+        "\t\t} else {",
+        "\t\t\tb, err = attemptFn()",
+        "\t\t}",
+        "\t\tcancel()",
+        "\t\tif err == nil {",
+        "\t\t\tlastBody = b",
+        "\t\t\tbreak  // success",
+        "\t\t}",
+        '\t\tslog.Info("call_service attempt failed", "svc", svcName, "attempt", attempt+1, "err", err.Error())',
         "\t}",
+        "\tif lastBody == nil { return nil }",
         "\tvar out map[string]any",
-        "\tif err := json.NewDecoder(resp.Body).Decode(&out); err != nil {",
-        "\t\tslog.Error(\"call_service decode\", \"err\", err)",
+        "\tif err := json.Unmarshal(lastBody, &out); err != nil {",
+        '\t\tslog.Error("call_service decode", "err", err)',
         "\t\treturn nil",
         "\t}",
         "\treturn out",
         "}",
-    ]
+        "",
+        "// _doHTTP is a single HTTP attempt, no retry/CB — those are wrapped by callService.",
+        "func _doHTTP(ctx context.Context, baseURL, method, path string, body any) ([]byte, error) {",
+        "\tvar reqBody io.Reader",
+        "\tif body != nil {",
+        "\t\tb, err := json.Marshal(body)",
+        "\t\tif err != nil { return nil, err }",
+        "\t\treqBody = bytes.NewReader(b)",
+        "\t}",
+        "\treq, err := http.NewRequestWithContext(ctx, method, baseURL+path, reqBody)",
+        "\tif err != nil { return nil, err }",
+        '\tif body != nil { req.Header.Set("Content-Type", "application/json") }',
+        "\tresp, err := _httpClient.Do(req)",
+        "\tif err != nil { return nil, err }",
+        "\tdefer resp.Body.Close()",
+        "\tif resp.StatusCode >= 500 {",
+        '\t\treturn nil, fmt.Errorf("upstream 5xx: %d", resp.StatusCode)',
+        "\t}",
+        "\tif resp.StatusCode >= 400 {",
+        "\t\treturn nil, nil  // 4xx is not retryable — return empty body, no error",
+        "\t}",
+        "\treturn io.ReadAll(resp.Body)",
+        "}",
+    ])
+    return lines
 
 
 def generate_paginated_go() -> list[str]:
@@ -2929,8 +3191,9 @@ def compile_instruction_go(inst: dict, indent: int, ctx: dict = None) -> list[st
             body_expr = f'map[string]any{{{pairs}}}'
         else:
             body_expr = 'nil'
+        idempotent = 'true' if inst.get('idempotent', True) else 'false'
         lines.append(
-            f'{pad}{assign} := callService(r.Context(), rt.serviceURLs["{service}"], "{method}", {path_expr}, {body_expr})'
+            f'{pad}{assign} := callService(r.Context(), "{service}", rt.serviceURLs["{service}"], "{method}", {path_expr}, {body_expr}, {idempotent})'
         )
         ctx.setdefault('locals', {})[assign] = 'map'
 

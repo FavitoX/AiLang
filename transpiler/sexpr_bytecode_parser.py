@@ -11,6 +11,27 @@ from sexpr_parser import (
 )
 
 
+def _dict_from_props(form) -> dict:
+    """Collapse `(form (k v) (k v) ...)` nested pairs into a flat dict.
+
+    For `(k v)` pairs with scalar values, stores `{k: v}`. For pairs that
+    themselves have nested sub-forms, stores the raw sub-list so callers can
+    drill down further.
+    """
+    out = {}
+    if not isinstance(form, list):
+        return out
+    for item in form[1:]:
+        if not (isinstance(item, list) and item):
+            continue
+        key = str(item[0])
+        if len(item) == 2:
+            out[key] = item[1]
+        elif len(item) > 2:
+            out[key] = item[1:]
+    return out
+
+
 class SExprBytecodeParser:
     """Parses AILang .sexpr bytecode and provides a uniform interface for code generators."""
 
@@ -438,10 +459,67 @@ class SExprBytecodeParser:
         return {n: d for n, d in self._dependencies.items() if d.get('type') == 'SERVICE_REF'}
 
     def _parse_resilience(self) -> dict:
+        """Parse (resilience (policies (POLICY_NAME (timeout ...) (circuit_breaker ...) (retry ...))))."""
         form = find_form(self.exprs, 'resilience')
         if not form:
-            return {}
-        return {'_raw': form}
+            return {'policies': {}}
+
+        policies = {}
+        policies_form = None
+        for item in form[1:]:
+            if isinstance(item, list) and item and item[0] == 'policies':
+                policies_form = item
+                break
+        if not policies_form:
+            return {'_raw': form, 'policies': {}}
+
+        for policy in policies_form[1:]:
+            if not (isinstance(policy, list) and policy):
+                continue
+            name = str(policy[0])
+            entry = {'name': name, 'timeout': None, 'circuit_breaker': None, 'retry': None}
+            for sub in policy[1:]:
+                if not (isinstance(sub, list) and sub):
+                    continue
+                key = sub[0]
+                if key == 'timeout':
+                    entry['timeout'] = {
+                        'duration_ms': _dict_from_props(sub).get('duration_ms', 3000),
+                        'on_timeout': _dict_from_props(sub).get('on_timeout', 'ERR_TIMEOUT'),
+                    }
+                elif key == 'circuit_breaker':
+                    props = _dict_from_props(sub)
+                    entry['circuit_breaker'] = {
+                        'failure_threshold': int(props.get('failure_threshold', 5)),
+                        'success_threshold': int(props.get('success_threshold', 3)),
+                        'half_open_max_calls': int(props.get('half_open_max_calls', 1)),
+                        'reset_timeout_ms': int(props.get('reset_timeout_ms', 30000)),
+                    }
+                elif key == 'retry':
+                    props = _dict_from_props(sub)
+                    backoff = props.get('backoff')
+                    if isinstance(backoff, list):
+                        backoff = _dict_from_props(['backoff'] + backoff)
+                    elif not isinstance(backoff, dict):
+                        backoff = {}
+                    retryable = []
+                    non_retryable = []
+                    for s in sub[1:]:
+                        if isinstance(s, list) and s:
+                            if s[0] == 'retryable_errors':
+                                retryable = [str(x) for x in s[1:]]
+                            elif s[0] == 'non_retryable_errors':
+                                non_retryable = [str(x) for x in s[1:]]
+                    entry['retry'] = {
+                        'max_attempts': int(props.get('max_attempts', 3)),
+                        'backoff_type': backoff.get('type', 'exponential'),
+                        'initial_ms': int(backoff.get('initial_ms', 100)),
+                        'max_ms': int(backoff.get('max_ms', 2000)),
+                        'retryable_errors': retryable,
+                        'non_retryable_errors': non_retryable,
+                    }
+            policies[name] = entry
+        return {'policies': policies, '_raw': form}
 
     def _parse_rate_limit(self) -> dict:
         form = find_form(self.exprs, 'rate_limit')

@@ -1,0 +1,98 @@
+;; Scratch service: CALL_SERVICE with a resilience policy.
+;; Exercises both idempotent=true (retry applies) and idempotent=false (retry
+;; skipped). Timeout + circuit breaker + exponential retry are all defined in
+;; (resilience (policies ...)) and attached via (dependencies SERVICE_REF).
+
+(service scratch_resilient
+  (version "0.9-phase4")
+  (port 8093))
+
+(schema ProxyRequest
+  (field product_id string (required)))
+
+(schema ProxyResponse
+  (field ok bool (required)))
+
+(config
+  (jwt_secret secret "JWT_SECRET"))
+
+(auth
+  (provider jwt)
+  (secret_ref jwt_secret))
+
+(cors
+  (origins "*")
+  (methods GET POST)
+  (headers "Content-Type" "Authorization")
+  (max_age 3600))
+
+;; ── Resilience policies ──
+(resilience
+  (policies
+    (product_policy
+      (timeout
+        (duration_ms 3000)
+        (on_timeout ERR_TIMEOUT))
+      (circuit_breaker
+        (failure_threshold 5)
+        (success_threshold 3)
+        (half_open_max_calls 1)
+        (reset_timeout_ms 30000))
+      (retry
+        (max_attempts 3)
+        (backoff (type exponential) (initial_ms 100) (max_ms 2000))
+        (retryable_errors ERR_TIMEOUT ERR_CONNECTION)
+        (non_retryable_errors ERR_NOT_FOUND ERR_VALIDATION ERR_BUSINESS_RULE)))))
+
+;; ── SERVICE_REF with policy attached ──
+(dependencies
+  (product_service
+    (type SERVICE_REF)
+    (target product_service)
+    (base_url_ref ENV.PRODUCT_SERVICE_URL)
+    (default "http://localhost:8080")
+    (resilience product_policy)))
+
+(route POST "/fetch" handler_fetch)
+(route POST "/write" handler_write)
+
+;; ── Idempotent GET → retries allowed ──
+(handler handler_fetch
+  (auth (requires authenticated))
+  (returns (RESULT ProxyResponse Error))
+  (do
+    (READ_BODY ProxyRequest → body)
+    (MATCH body
+      (ERR (ERR_INVALID_BODY "ProxyRequest"))
+      (OK
+        (CALL_SERVICE product_service
+          (method GET)
+          (path "/products/{body.product_id}")
+          (idempotent true)
+          → product_result)
+        (MATCH product_result
+          (NONE (ERR_NOT_FOUND "product" body.product_id))
+          (OK
+            (CONSTRUCT ProxyResponse (ok true) → resp)
+            (RESPOND 200 resp)))))))
+
+;; ── Non-idempotent POST → retry bypassed ──
+(handler handler_write
+  (auth (requires authenticated))
+  (returns (RESULT ProxyResponse Error))
+  (do
+    (READ_BODY ProxyRequest → body)
+    (MATCH body
+      (ERR (ERR_INVALID_BODY "ProxyRequest"))
+      (OK
+        (CALL_SERVICE product_service
+          (method POST)
+          (path "/products/{body.product_id}/mutation")
+          (idempotent false)
+          (body (timestamp "now"))
+          → write_result)
+        (MATCH write_result
+          (NONE (ERR_UNAVAILABLE "product_service"))
+          (OK
+            (CONSTRUCT ProxyResponse (ok true) → resp)
+            (RESPOND 200 resp)))))))
