@@ -659,7 +659,8 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
         lines.extend(compile_branch_csharp(inst, indent, ctx))
 
     elif op == 'EMIT_EVENT':
-        lines.append(f'{pad}Console.WriteLine($"[EVENT] {inst["event"]} | data={{{inst.get("data", "")}}}" );')
+        data_expr = _cs_value(inst.get('data')) if inst.get('data') not in (None, '') else 'null'
+        lines.append(f'{pad}eventBus.Publish("{inst["event"]}", {data_expr});')
 
     elif op == 'DEFINE_VAR':
         lines.extend(_compile_define_var_csharp(inst, pad, ctx))
@@ -1272,6 +1273,33 @@ def generate_csharp(bc, output_dir: str):
     if service_refs:
         lines.append("")
 
+    # Event bus (singleton) when any EMIT_EVENT or EVENT_HANDLER exists.
+    # EMIT_EVENT can be nested inside MATCH/BRANCH bodies — walk recursively.
+    def _walk_all_ops_in_handler(handler):
+        for inst in handler.get('instructions', []):
+            yield inst.get('op')
+            for case_insts in (inst.get('cases') or {}).values():
+                if isinstance(case_insts, list):
+                    for sub in case_insts:
+                        if isinstance(sub, dict):
+                            yield sub.get('op')
+            for sub in inst.get('body', []) or []:
+                if isinstance(sub, dict):
+                    yield sub.get('op')
+
+    event_handlers_cs = [
+        (n, h) for n, h in bc.handlers.items() if h.get('type') == 'EVENT_HANDLER'
+    ]
+    uses_events_cs = bool(event_handlers_cs) or any(
+        op == 'EMIT_EVENT'
+        for h in bc.handlers.values()
+        for op in _walk_all_ops_in_handler(h)
+    )
+    if uses_events_cs:
+        lines.append("// ── DI: in-process event bus ──")
+        lines.append("builder.Services.AddSingleton<IEventBus, InMemoryEventBus>();")
+        lines.append("")
+
     # CORS
     if bc.cors:
         origins = bc.cors.get('origins', ['*'])
@@ -1342,6 +1370,17 @@ def generate_csharp(bc, output_dir: str):
     if not base_path:
         base_path = '/' + service_name.replace('_service', 's')
 
+    # Wire up EVENT_HANDLER subscriptions before routing — so any request that
+    # emits an event right after `app.Run` already has listeners in place.
+    if event_handlers_cs:
+        lines.append("// ── Event subscriptions (startup) ──")
+        lines.append("var _bus = app.Services.GetRequiredService<IEventBus>();")
+        for h_name, h_def in event_handlers_cs:
+            evt = h_def.get('event') or h_name
+            method_name = pascal_case(h_name) if h_name.startswith('on_') else 'On' + pascal_case(h_name)
+            lines.append(f'_bus.Subscribe("{evt}", {method_name});')
+        lines.append("")
+
     lines.append(f'var api = app.MapGroup("{base_path}");')
     lines.append("")
 
@@ -1352,6 +1391,9 @@ def generate_csharp(bc, output_dir: str):
     for route in bc.routes:
         handler_name = route['handler']
         handler_def = bc.handlers[handler_name]
+        # EVENT_HANDLERs never map to an HTTP route — they're dispatched by the bus.
+        if handler_def.get('type') == 'EVENT_HANDLER':
+            continue
         method = route['method']
         path = route['path'].replace(base_path, '') or '/'
         auth = handler_def.get('auth')
@@ -1387,6 +1429,9 @@ def generate_csharp(bc, output_dir: str):
         uses_call_service = 'CALL_SERVICE' in all_ops
         if uses_call_service:
             lambda_params.append("IHttpClientFactory httpClientFactory")
+        uses_emit_event = 'EMIT_EVENT' in all_ops
+        if uses_emit_event:
+            lambda_params.append("IEventBus eventBus")
 
         param_str = ", ".join(lambda_params)
         is_async = is_pg or needs_body or uses_call_service or any(
@@ -1451,6 +1496,12 @@ def generate_csharp(bc, output_dir: str):
         lines.extend(generate_service_client_csharp())
         lines.append("")
 
+    # EVENT_HANDLER static local functions — emitted before app.Run so the
+    # Subscribe() calls above resolve the method group reference.
+    for h_name, h_def in event_handlers_cs:
+        lines.append("")
+        lines.extend(_emit_event_handler_csharp(h_name, h_def, bc))
+
     lines.append(f'app.Run("http://0.0.0.0:{port}");')
     lines.append("")
 
@@ -1480,6 +1531,11 @@ def generate_csharp(bc, output_dir: str):
 
     # Error model
     lines.extend(generate_error_model_csharp(bc.custom_errors))
+
+    # Event bus types (emitted AFTER app.Run since they are type declarations).
+    if uses_events_cs:
+        lines.append("")
+        lines.extend(generate_event_bus_csharp())
 
     with open(os.path.join(output_dir, "Program.cs"), 'w') as f:
         f.write('\n'.join(lines))
@@ -1572,6 +1628,74 @@ def generate_schema_csharp(name: str, schema_def: dict) -> list[str]:
         lines.append("}")
 
     return lines
+
+
+def _emit_event_handler_csharp(handler_name: str, handler_def: dict, bc) -> list[str]:
+    """Emit an EVENT_HANDLER as a `static async Task` local function.
+
+    Signature matches `Func<object?, IServiceProvider, Task>` so the bus can
+    invoke it directly. `eventData` is the object published; services resolved
+    via `sp.GetRequiredService<>()` when needed.
+    """
+    method_name = pascal_case(handler_name) if handler_name.startswith('on_') else 'On' + pascal_case(handler_name)
+    lines = [
+        f"static async Task {method_name}(object? eventData, IServiceProvider sp)",
+        "{",
+    ]
+    ctx = {
+        'is_pg': False,
+        'store_def': None,
+        'custom_errors': bc.custom_errors,
+        'service_refs': {},
+        'resilience_policies': {},
+        # eventData is available; body should read it via JsonNode-style access
+        # if the publisher passed a JsonNode, or cast if a typed object was emitted.
+        'locals': {'eventData': 'object'},
+    }
+    for inst in handler_def.get('instructions', []):
+        lines.extend(compile_instruction_csharp(inst, 1, ctx))
+    # Always end with an await so the method body is valid `async Task`.
+    lines.append("    await Task.CompletedTask;")
+    lines.append("}")
+    return lines
+
+
+def generate_event_bus_csharp() -> list[str]:
+    """Emit IEventBus + InMemoryEventBus (fire-and-forget, per-subscriber Task)."""
+    return [
+        "// ── EVENT BUS (in-process, fire-and-forget) ──",
+        "public interface IEventBus",
+        "{",
+        "    void Subscribe(string eventName, Func<object?, IServiceProvider, Task> handler);",
+        "    void Publish(string eventName, object? data);",
+        "}",
+        "",
+        "public class InMemoryEventBus : IEventBus",
+        "{",
+        "    private readonly IServiceProvider _sp;",
+        "    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, System.Collections.Generic.List<Func<object?, IServiceProvider, Task>>> _subs = new();",
+        "    public InMemoryEventBus(IServiceProvider sp) { _sp = sp; }",
+        "    public void Subscribe(string eventName, Func<object?, IServiceProvider, Task> handler)",
+        "    {",
+        "        var list = _subs.GetOrAdd(eventName, _ => new());",
+        "        lock (list) { list.Add(handler); }",
+        "    }",
+        "    public void Publish(string eventName, object? data)",
+        "    {",
+        "        if (!_subs.TryGetValue(eventName, out var handlers)) return;",
+        "        Func<object?, IServiceProvider, Task>[] snapshot;",
+        "        lock (handlers) { snapshot = handlers.ToArray(); }",
+        "        foreach (var h in snapshot)",
+        "        {",
+        "            _ = Task.Run(async () =>",
+        "            {",
+        "                try { await h(data, _sp); }",
+        '                catch (Exception ex) { Console.WriteLine($"[EVENT] handler failed for {eventName}: {ex.Message}"); }',
+        "            });",
+        "        }",
+        "    }",
+        "}",
+    ]
 
 
 def generate_resilience_handler_csharp(policy: dict, include_retry: bool, indent: int = 1) -> list[str]:
@@ -2094,6 +2218,9 @@ def generate_go(bc, output_dir: str):
     needs_math = 'COMPUTE_FN' in all_ops
     needs_http_client = 'CALL_SERVICE' in all_ops
     needs_resilience_go = needs_http_client and bool((bc.resilience or {}).get('policies'))
+    needs_events = ('EMIT_EVENT' in all_ops) or any(
+        h.get('type') == 'EVENT_HANDLER' for h in bc.handlers.values()
+    )
 
     lines = []
     lines.append("// ═══════════════════════════════════════════════════════════════")
@@ -2107,7 +2234,7 @@ def generate_go(bc, output_dir: str):
     lines.append("import (")
     if needs_http_client:
         lines.append('\t"bytes"')
-    if is_pg or needs_http_client:
+    if is_pg or needs_http_client or needs_events:
         lines.append('\t"context"')
     lines.append('\t"encoding/json"')
     lines.append('\t"fmt"')
@@ -2124,7 +2251,7 @@ def generate_go(bc, output_dir: str):
         lines.append('\t"os"')
     lines.append('\t"strconv"')
     lines.append('\t"strings"')
-    if has_in_memory_store or needs_resilience_go:
+    if has_in_memory_store or needs_resilience_go or needs_events:
         lines.append('\t"sync"')
     lines.append('\t"time"')
     lines.append("")
@@ -2237,6 +2364,27 @@ def generate_go(bc, output_dir: str):
         for inst in h.get('instructions', [])
     ) or bool(service_refs_go)
 
+    event_handlers_go = [
+        (n, h) for n, h in bc.handlers.items() if h.get('type') == 'EVENT_HANDLER'
+    ]
+    # EMIT_EVENT can be nested in MATCH/BRANCH bodies — mirror the recursive walker.
+    def _walk_all_ops_in_handler_go(handler):
+        for inst in handler.get('instructions', []):
+            yield inst.get('op')
+            for case_insts in (inst.get('cases') or {}).values():
+                if isinstance(case_insts, list):
+                    for sub in case_insts:
+                        if isinstance(sub, dict):
+                            yield sub.get('op')
+            for sub in inst.get('body', []) or []:
+                if isinstance(sub, dict):
+                    yield sub.get('op')
+    uses_events_go = bool(event_handlers_go) or any(
+        op == 'EMIT_EVENT'
+        for h in bc.handlers.values()
+        for op in _walk_all_ops_in_handler_go(h)
+    )
+
     # Router
     lines.append("// ROUTER (from bytecode routes)")
     lines.append("type Router struct {")
@@ -2249,15 +2397,29 @@ def generate_go(bc, output_dir: str):
             lines.append(f"\tstore *{store_def['schema']}Store")
     if uses_call_service_anywhere:
         lines.append("\tserviceURLs map[string]string")
+    if uses_events_go:
+        lines.append("\tbus *EventBus")
     lines.append("}")
     lines.append("")
+
+    if uses_events_go:
+        lines.extend(generate_event_bus_go())
+        lines.append("")
 
     if uses_call_service_anywhere:
         lines.extend(generate_service_client_go(bc))
         lines.append("")
 
-    # Handlers (generated before the mux so we can reference them)
+    # EVENT_HANDLER functions — standalone, take (ctx, data any), not methods on Router.
+    for h_name, h_def in event_handlers_go:
+        lines.extend(_emit_event_handler_go(h_name, h_def, bc))
+        lines.append("")
+
+    # Regular HTTP handlers on Router. Skip EVENT_HANDLERs — they're already emitted
+    # above as free functions and subscribed in main().
     for handler_name, handler_def in bc.handlers.items():
+        if handler_def.get('type') == 'EVENT_HANDLER':
+            continue
         lines.extend(generate_handler_go(handler_name, handler_def, bc, is_pg, primary_store_def))
         lines.append("")
 
@@ -2305,11 +2467,20 @@ def generate_go(bc, output_dir: str):
             lines.append(f'\t\t"{svc_name}": func() string {{ if v := os.Getenv("{env_var}"); v != "" {{ return v }}; return "{default_url}" }}(),')
         lines.append("\t}")
 
+    if uses_events_go:
+        lines.append("\tbus := NewEventBus()")
+        for h_name, h_def in event_handlers_go:
+            evt = h_def.get('event') or h_name
+            fn_name = pascal_case(h_name) if h_name.startswith('on_') else 'On' + pascal_case(h_name)
+            lines.append(f'\tbus.Subscribe("{evt}", {fn_name})')
+
     router_fields = []
     if bc.stores:
         router_fields.append("store: store")
     if uses_call_service_anywhere:
         router_fields.append("serviceURLs: serviceURLs")
+    if uses_events_go:
+        router_fields.append("bus: bus")
     lines.append(f"\trouter := &Router{{{', '.join(router_fields)}}}")
     lines.append("\thandler := corsMiddleware(tracingMiddleware(router.mux()))")
     lines.append("")
@@ -2377,6 +2548,68 @@ def generate_schema_go(name: str, schema_def: dict) -> list[str]:
     lines.append("}")
 
     return lines
+
+
+def _emit_event_handler_go(handler_name: str, handler_def: dict, bc) -> list[str]:
+    """Emit an EVENT_HANDLER as a free `func(ctx, data any)`.
+
+    Not a method on Router — keeps the Subscribe() registration straightforward
+    (`bus.Subscribe("X", OnX)`) and means the handler can't accidentally depend
+    on request-scoped state like `r` or `rt`.
+    """
+    fn_name = pascal_case(handler_name) if handler_name.startswith('on_') else 'On' + pascal_case(handler_name)
+    lines = [
+        f"// {handler_name} (EVENT_HANDLER for '{handler_def.get('event', '')}')",
+        f"func {fn_name}(ctx context.Context, data any) {{",
+    ]
+    ctx = {
+        'is_pg': False,
+        'store_def': None,
+        'custom_errors': bc.custom_errors,
+        'service_refs': {},
+        'resilience_policies': {},
+        'locals': {'data': 'any'},
+    }
+    for inst in handler_def.get('instructions', []):
+        lines.extend(compile_instruction_go(inst, 1, ctx))
+    lines.append("}")
+    return lines
+
+
+def generate_event_bus_go() -> list[str]:
+    """EventBus: subscriber registry + fire-and-forget Publish (goroutine per listener)."""
+    return [
+        "// ── EVENT BUS (in-process, fire-and-forget) ──",
+        "type EventHandler func(ctx context.Context, data any)",
+        "",
+        "type EventBus struct {",
+        "\tmu   sync.RWMutex",
+        "\tsubs map[string][]EventHandler",
+        "}",
+        "",
+        "func NewEventBus() *EventBus {",
+        "\treturn &EventBus{subs: map[string][]EventHandler{}}",
+        "}",
+        "",
+        "func (b *EventBus) Subscribe(name string, h EventHandler) {",
+        "\tb.mu.Lock(); defer b.mu.Unlock()",
+        "\tb.subs[name] = append(b.subs[name], h)",
+        "}",
+        "",
+        "func (b *EventBus) Publish(ctx context.Context, name string, data any) {",
+        "\tb.mu.RLock()",
+        "\thandlers := append([]EventHandler(nil), b.subs[name]...)  // snapshot",
+        "\tb.mu.RUnlock()",
+        "\tfor _, h := range handlers {",
+        "\t\tgo func(fn EventHandler) {",
+        "\t\t\tdefer func() {",
+        '\t\t\t\tif r := recover(); r != nil { slog.Error("event handler panic", "event", name, "err", r) }',
+        "\t\t\t}()",
+        "\t\t\tfn(ctx, data)",
+        "\t\t}(h)",
+        "\t}",
+        "}",
+    ]
 
 
 def generate_service_client_go(bc) -> list[str]:
@@ -3198,7 +3431,8 @@ def compile_instruction_go(inst: dict, indent: int, ctx: dict = None) -> list[st
         ctx.setdefault('locals', {})[assign] = 'map'
 
     elif op == 'EMIT_EVENT':
-        lines.append(f'{pad}slog.Info("event", "name", "{inst["event"]}", "data", {inst.get("data", "nil")})')
+        data_expr = _go_value(inst.get('data')) if inst.get('data') not in (None, '') else 'nil'
+        lines.append(f'{pad}rt.bus.Publish(r.Context(), "{inst["event"]}", {data_expr})')
 
     elif op == 'LOG':
         lines.append(f'{pad}log.Printf("[{inst.get("level", "INFO")}] {inst["message"]}")')

@@ -1,0 +1,56 @@
+;; Scratch service: in-process event bus.
+;; An HTTP handler EMITs an event; an EVENT_HANDLER logs it.
+;; Fire-and-forget dispatch — the HTTP response does not wait for subscribers.
+
+(service scratch_events
+  (version "0.9-phase5")
+  (port 8094))
+
+(schema Ping
+  (field message string (required)))
+
+(schema PingResponse
+  (field accepted bool (required)))
+
+(config
+  (jwt_secret secret "JWT_SECRET"))
+
+(auth
+  (provider jwt)
+  (secret_ref jwt_secret))
+
+(cors
+  (origins "*")
+  (methods GET POST)
+  (headers "Content-Type" "Authorization")
+  (max_age 3600))
+
+(events
+  (definitions
+    (ping_received
+      (schema Ping)
+      (description "Emitted whenever /ping accepts a request")))
+  (subscriptions
+    (item (event ping_received) (handler on_ping_log))))
+
+(route POST "/ping" handler_ping)
+
+(handler handler_ping
+  (auth (requires authenticated))
+  (returns (RESULT PingResponse Error))
+  (do
+    (READ_BODY Ping → body)
+    (MATCH body
+      (ERR (ERR_INVALID_BODY "Ping"))
+      (OK
+        (EMIT_EVENT ping_received body)
+        (CONSTRUCT PingResponse (accepted true) → resp)
+        (RESPOND 200 resp)))))
+
+;; ── EVENT_HANDLER: fires asynchronously when 'ping_received' is published. ──
+(handler on_ping_log
+  (type EVENT_HANDLER)
+  (event ping_received)
+  (auth PUBLIC)
+  (do
+    (LOG INFO "ping_received observed")))

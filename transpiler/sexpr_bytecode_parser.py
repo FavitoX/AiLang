@@ -58,6 +58,7 @@ class SExprBytecodeParser:
         self._dependencies = self._parse_dependencies()
         self._resilience = self._parse_resilience()
         self._rate_limit = self._parse_rate_limit()
+        self._events = self._parse_events()
 
     def validate(self):
         """Validate the bytecode."""
@@ -330,13 +331,19 @@ class SExprBytecodeParser:
             do_block = find_prop(form, 'do')
             instructions = extract_instructions(do_block) if do_block else []
             
+            # Event-handler metadata: `(type EVENT_HANDLER)` + `(event NAME)`.
+            handler_type = find_prop_value(form, 'type', 'HTTP')
+            event_name = find_prop_value(form, 'event', None)
+
             handlers[name] = {
                 'auth': auth,
                 'params': params,
                 'returns': returns,
                 'instructions': instructions,
+                'type': str(handler_type),
+                'event': str(event_name) if event_name else None,
             }
-        
+
         return handlers
 
     @staticmethod
@@ -521,6 +528,38 @@ class SExprBytecodeParser:
             policies[name] = entry
         return {'policies': policies, '_raw': form}
 
+    def _parse_events(self) -> dict:
+        """Parse (events (definitions (name (schema X) (description "...")) ...)
+                         (subscriptions (item (event X) (handler Y)) ...))."""
+        form = find_form(self.exprs, 'events')
+        if not form:
+            return {'definitions': {}, 'subscriptions': []}
+
+        definitions = {}
+        subscriptions = []
+        for item in form[1:]:
+            if not (isinstance(item, list) and item):
+                continue
+            if item[0] == 'definitions':
+                for evt in item[1:]:
+                    if isinstance(evt, list) and evt:
+                        name = str(evt[0])
+                        props = _dict_from_props(evt)
+                        definitions[name] = {
+                            'schema': str(props.get('schema', '')),
+                            'description': str(props.get('description', '')),
+                        }
+            elif item[0] == 'subscriptions':
+                for sub in item[1:]:
+                    if isinstance(sub, list) and sub:
+                        props = _dict_from_props(sub)
+                        if 'event' in props and 'handler' in props:
+                            subscriptions.append({
+                                'event': str(props['event']),
+                                'handler': str(props['handler']),
+                            })
+        return {'definitions': definitions, 'subscriptions': subscriptions}
+
     def _parse_rate_limit(self) -> dict:
         form = find_form(self.exprs, 'rate_limit')
         if not form:
@@ -580,6 +619,9 @@ class SExprBytecodeParser:
 
     @property
     def resilience(self): return self._resilience
+
+    @property
+    def events(self): return self._events
 
 
 # ── Test ──
