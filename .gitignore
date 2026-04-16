@@ -1,0 +1,52 @@
+# ── Generated transpiler outputs (regenerable from .sexpr bytecode) ──
+bytecode/generated-*/
+output/
+
+# ── Python (transpiler) ──
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── .NET ──
+**/bin/
+**/obj/
+*.user
+*.suo
+.vs/
+*.pfx
+# Keep committed appsettings.json; ignore env-specific overrides.
+appsettings.Development.json
+appsettings.Local.json
+
+# ── Go ──
+*.exe
+*.exe~
+*.dll
+*.test
+*.out
+*.prof
+vendor/
+
+# ── IDE / editors ──
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS ──
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Claude Code per-machine state ──
+.claude/settings.local.json
+.claude/.session/
+.claude/logs/
+.claude/memory/

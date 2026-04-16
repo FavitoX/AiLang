@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__plugin_engram_engram__mem_context",
+      "mcp__plugin_engram_engram__mem_search",
+      "mcp__plugin_engram_engram__mem_save",
+      "mcp__plugin_engram_engram__mem_session_summary",
+      "mcp__plugin_context7",
+      "Skill(update-config)",
+      "Skill(update-config:*)",
+      "Bash(python -c *)",
+      "Bash(dotnet build *)",
+      "Bash(go build *)",
+      "Bash(go mod *)",
+      "Bash(python transpiler/transpiler.py *)"
+    ]
+  }
+}
