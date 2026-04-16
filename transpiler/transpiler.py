@@ -624,6 +624,11 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
             tag = err_type_tag(err_type)
             lines.append(f'{pad}return Results.Json(AiLangError.BusinessRule("{tag}", ""), statusCode: 422);')
 
+    elif op == 'SAGA_COMPENSATE':
+        saga = inst.get('saga', '')
+        fn = 'Compensate' + pascal_case(saga) + 'Async'
+        lines.append(f"{pad}await {fn}();")
+
     elif op == 'CALL_SERVICE':
         # (CALL_SERVICE name (method X) (path "..") (idempotent b) (body {...}) → assign)
         service = inst['service']
@@ -1435,7 +1440,8 @@ def generate_csharp(bc, output_dir: str):
 
         param_str = ", ".join(lambda_params)
         is_async = is_pg or needs_body or uses_call_service or any(
-            op in ('SQL_QUERY', 'SQL_STREAM', 'SQL_EXEC', 'STORE_FIND_BY', 'STORE_FILTER', 'STREAM_RESPOND')
+            op in ('SQL_QUERY', 'SQL_STREAM', 'SQL_EXEC', 'STORE_FIND_BY', 'STORE_FILTER',
+                   'STREAM_RESPOND', 'SAGA_COMPENSATE')
             for op in all_ops
         )
 
@@ -1501,6 +1507,11 @@ def generate_csharp(bc, output_dir: str):
     for h_name, h_def in event_handlers_cs:
         lines.append("")
         lines.extend(_emit_event_handler_csharp(h_name, h_def, bc))
+
+    # Saga compensators — static local funcs, referenced by SAGA_COMPENSATE.
+    if bc.sagas:
+        lines.append("")
+        lines.extend(generate_saga_compensators_csharp(bc))
 
     lines.append(f'app.Run("http://0.0.0.0:{port}");')
     lines.append("")
@@ -1628,6 +1639,49 @@ def generate_schema_csharp(name: str, schema_def: dict) -> list[str]:
         lines.append("}")
 
     return lines
+
+
+def generate_saga_compensators_csharp(bc) -> list[str]:
+    """Emit a static local function per saga that logs the compensation plan.
+
+    Full saga orchestration (execute compensations in reverse order for steps
+    that actually completed) requires explicit step tracking in the bytecode —
+    scheduled for Phase 6b. For now the helper logs the plan so operators can
+    see what WOULD be compensated and intervene manually if needed.
+    """
+    lines = []
+    for saga_name, saga_def in (bc.sagas or {}).items():
+        fn = 'Compensate' + pascal_case(saga_name) + 'Async'
+        lines.append(f"// ── SAGA COMPENSATOR: {saga_name} ──")
+        lines.append(f"static async Task {fn}(ILogger? logger = null)")
+        lines.append("{")
+        lines.append(f'    Console.WriteLine("[SAGA] compensation triggered for \'{saga_name}\' — rolling back in reverse order");')
+        for step in reversed(saga_def.get('steps', [])):
+            step_name = step['name']
+            comp = step.get('compensate', {})
+            op = comp.get('op', 'LOG')
+            plan = _describe_compensate(op, comp)
+            lines.append(f'    Console.WriteLine("[SAGA]   ← {step_name}: {plan}");')
+        lines.append("    await Task.CompletedTask;")
+        lines.append("}")
+        lines.append("")
+    return lines
+
+
+def _describe_compensate(op: str, comp: dict) -> str:
+    """One-line human description of a compensate step for the log plan."""
+    if op == 'CALL_SERVICE':
+        svc = comp.get('service', '?')
+        method = comp.get('method', '?')
+        path = comp.get('path', '?')
+        return f"CALL_SERVICE {svc} {method} {path}".replace('"', '')
+    if op == 'STORE_UPDATE_FIELDS':
+        store = comp.get('store', '?')
+        return f"STORE_UPDATE_FIELDS {store}".replace('"', '')
+    if op == 'LOG':
+        msg = str(comp.get('message', '')).replace('"', "'")
+        return f"LOG {msg}"
+    return op
 
 
 def _emit_event_handler_csharp(handler_name: str, handler_def: dict, bc) -> list[str]:
@@ -2221,6 +2275,7 @@ def generate_go(bc, output_dir: str):
     needs_events = ('EMIT_EVENT' in all_ops) or any(
         h.get('type') == 'EVENT_HANDLER' for h in bc.handlers.values()
     )
+    needs_sagas = bool(bc.sagas) or 'SAGA_COMPENSATE' in all_ops
 
     lines = []
     lines.append("// ═══════════════════════════════════════════════════════════════")
@@ -2234,7 +2289,7 @@ def generate_go(bc, output_dir: str):
     lines.append("import (")
     if needs_http_client:
         lines.append('\t"bytes"')
-    if is_pg or needs_http_client or needs_events:
+    if is_pg or needs_http_client or needs_events or needs_sagas:
         lines.append('\t"context"')
     lines.append('\t"encoding/json"')
     lines.append('\t"fmt"')
@@ -2410,6 +2465,10 @@ def generate_go(bc, output_dir: str):
         lines.extend(generate_service_client_go(bc))
         lines.append("")
 
+    # Saga compensators — free functions referenced by SAGA_COMPENSATE.
+    if bc.sagas:
+        lines.extend(generate_saga_compensators_go(bc))
+
     # EVENT_HANDLER functions — standalone, take (ctx, data any), not methods on Router.
     for h_name, h_def in event_handlers_go:
         lines.extend(_emit_event_handler_go(h_name, h_def, bc))
@@ -2547,6 +2606,25 @@ def generate_schema_go(name: str, schema_def: dict) -> list[str]:
     lines.append("\treturn nil")
     lines.append("}")
 
+    return lines
+
+
+def generate_saga_compensators_go(bc) -> list[str]:
+    """Emit a free function per saga that logs the compensation plan (Go mirror of C#)."""
+    lines = []
+    for saga_name, saga_def in (bc.sagas or {}).items():
+        fn = 'compensate' + pascal_case(saga_name)
+        lines.append(f"// ── SAGA COMPENSATOR: {saga_name} ──")
+        lines.append(f"func {fn}(ctx context.Context) {{")
+        lines.append(f'\tslog.Warn("saga compensation triggered", "saga", "{saga_name}")')
+        for step in reversed(saga_def.get('steps', [])):
+            step_name = step['name']
+            comp = step.get('compensate', {})
+            op = comp.get('op', 'LOG')
+            plan = _describe_compensate(op, comp)
+            lines.append(f'\tslog.Info("saga step compensated", "saga", "{saga_name}", "step", "{step_name}", "plan", "{plan}")')
+        lines.append("}")
+        lines.append("")
     return lines
 
 
@@ -3408,6 +3486,11 @@ def compile_instruction_go(inst: dict, indent: int, ctx: dict = None) -> list[st
             tag = err_type_tag(err_type)
             lines.append(f'{pad}respondError(w, ErrBusinessRule("{tag}", ""))')
         lines.append(f"{pad}return")
+
+    elif op == 'SAGA_COMPENSATE':
+        saga = inst.get('saga', '')
+        fn = 'compensate' + pascal_case(saga)
+        lines.append(f"{pad}{fn}(r.Context())")
 
     elif op == 'CALL_SERVICE':
         service = inst['service']

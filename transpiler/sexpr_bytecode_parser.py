@@ -59,6 +59,7 @@ class SExprBytecodeParser:
         self._resilience = self._parse_resilience()
         self._rate_limit = self._parse_rate_limit()
         self._events = self._parse_events()
+        self._sagas = self._parse_sagas()
 
     def validate(self):
         """Validate the bytecode."""
@@ -528,6 +529,64 @@ class SExprBytecodeParser:
             policies[name] = entry
         return {'policies': policies, '_raw': form}
 
+    def _parse_sagas(self) -> dict:
+        """Parse (sagas (saga_name (steps (item (name X) (action ...) (compensate ...)) ...)) ...).
+
+        Returns {saga_name: {steps: [{name, action: {op, ...}, compensate: {op, ...}}, ...]}}.
+        Each action/compensate is captured as a dict of its fields so the
+        generator can describe the compensation plan without re-executing it
+        (compensation orchestration is Phase 6b — needs explicit step tracking).
+        """
+        form = find_form(self.exprs, 'sagas')
+        if not form:
+            return {}
+
+        def _action_from_form(f):
+            """Extract {op, key: value, ...} from (action (op X) (k v) ...) or (compensate ...)."""
+            if not (isinstance(f, list) and f):
+                return {}
+            out = {}
+            for sub in f[1:]:
+                if not (isinstance(sub, list) and sub):
+                    continue
+                key = str(sub[0])
+                if len(sub) == 2:
+                    out[key] = sub[1]
+                elif len(sub) > 2:
+                    out[key] = sub[1:]
+            return out
+
+        sagas = {}
+        for saga in form[1:]:
+            if not (isinstance(saga, list) and saga):
+                continue
+            if saga[0] == '_comment':
+                continue
+            saga_name = str(saga[0])
+            steps = []
+            for prop in saga[1:]:
+                if not (isinstance(prop, list) and prop and prop[0] == 'steps'):
+                    continue
+                for step in prop[1:]:
+                    if not (isinstance(step, list) and step and step[0] == 'item'):
+                        continue
+                    step_name = None
+                    action = {}
+                    compensate = {}
+                    for sub in step[1:]:
+                        if not (isinstance(sub, list) and sub):
+                            continue
+                        if sub[0] == 'name' and len(sub) > 1:
+                            step_name = str(sub[1])
+                        elif sub[0] == 'action':
+                            action = _action_from_form(sub)
+                        elif sub[0] == 'compensate':
+                            compensate = _action_from_form(sub)
+                    if step_name:
+                        steps.append({'name': step_name, 'action': action, 'compensate': compensate})
+            sagas[saga_name] = {'steps': steps}
+        return sagas
+
     def _parse_events(self) -> dict:
         """Parse (events (definitions (name (schema X) (description "...")) ...)
                          (subscriptions (item (event X) (handler Y)) ...))."""
@@ -622,6 +681,9 @@ class SExprBytecodeParser:
 
     @property
     def events(self): return self._events
+
+    @property
+    def sagas(self): return self._sagas
 
 
 # ── Test ──

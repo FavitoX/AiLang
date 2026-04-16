@@ -1,0 +1,67 @@
+;; Scratch service: saga with multi-step compensation.
+;; The handler executes steps sequentially; on step failure, SAGA_COMPENSATE
+;; triggers the rollback helper. Phase 6 MVP logs the compensation plan but
+;; does not yet actually re-run compensations (Phase 6b — needs explicit
+;; per-step completion tracking in the bytecode).
+
+(service scratch_saga
+  (version "0.9-phase6")
+  (port 8095))
+
+(schema PaymentRequest
+  (field order_id string (required))
+  (field amount   decimal (required) (gt 0)))
+
+(schema PaymentResponse
+  (field status string (required)))
+
+(config
+  (jwt_secret secret "JWT_SECRET"))
+
+(auth
+  (provider jwt)
+  (secret_ref jwt_secret))
+
+(cors
+  (origins "*")
+  (methods POST)
+  (headers "Content-Type" "Authorization")
+  (max_age 3600))
+
+;; ── Saga: three steps + compensations (reverse order on failure) ──
+(sagas
+  (process_payment
+    (steps
+      (item
+        (name record_payment)
+        (action      (op STORE_INSERT) (store payment_store))
+        (compensate  (op STORE_UPDATE_FIELDS) (store payment_store) (fields (status failed))))
+      (item
+        (name charge_gateway)
+        (action      (op CALL_SERVICE) (service gateway) (method POST) (path "/charge") (idempotent false))
+        (compensate  (op CALL_SERVICE) (service gateway) (method POST) (path "/refund") (idempotent false)))
+      (item
+        (name confirm_order)
+        (action      (op CALL_SERVICE) (service order_svc) (method PUT) (path "/orders/confirm") (idempotent true))
+        (compensate  (op CALL_SERVICE) (service order_svc) (method PUT) (path "/orders/cancel") (idempotent true))))))
+
+(route POST "/pay" handler_pay)
+
+(handler handler_pay
+  (auth (requires authenticated))
+  (returns (RESULT PaymentResponse Error))
+  (do
+    (READ_BODY PaymentRequest → request)
+    (MATCH request
+      (ERR (ERR_INVALID_BODY "PaymentRequest"))
+      (OK
+        ;; Step 1 would run the STORE_INSERT here (omitted — this scratch has no store).
+        ;; Simulate a late-stage failure that triggers compensation:
+        (BRANCH (< request.amount 10)
+          (TRUE
+            ;; Rollback all completed steps of the saga in reverse order.
+            (SAGA_COMPENSATE process_payment)
+            (ERR_BUSINESS_RULE "amount_too_low" "minimum charge is $10"))
+          (FALSE
+            (CONSTRUCT PaymentResponse (status "ok") → resp)
+            (RESPOND 200 resp)))))))

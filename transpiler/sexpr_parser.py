@@ -519,6 +519,10 @@ def sexpr_to_instruction(expr: list) -> dict:
         args, assign = _split_arrow(expr)
         return {'op': 'IS_OK', 'value': args[0] if args else None, 'assign': assign}
 
+    if op == 'SAGA_COMPENSATE':
+        # (SAGA_COMPENSATE saga_name)
+        return {'op': 'SAGA_COMPENSATE', 'saga': expr[1] if len(expr) > 1 else ''}
+
     if op == 'CALL_SERVICE':
         # (CALL_SERVICE service_name (method GET) (path "...") (idempotent true) (body ...)? → assign)
         args, assign = _split_arrow(expr)
