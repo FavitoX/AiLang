@@ -102,10 +102,24 @@ class SExprBytecodeParser:
             fields = {}
             for field_form in find_all_props(form, 'field'):
                 # (field name type (constraint) (constraint) ...)
+                # `type` may be a scalar ('string', 'decimal', ...) or a composite
+                # ('(list OrderItem)', '(enum OK BAD)') — flatten composites so the
+                # rest of the pipeline only ever sees {'type': str, 'of': str?}.
                 field_name = field_form[1]
-                field_type = field_form[2]
+                raw_type = field_form[2]
+                field_type = raw_type
+                list_of = None
+                if isinstance(raw_type, list) and raw_type:
+                    head = str(raw_type[0])
+                    if head == 'list' and len(raw_type) > 1:
+                        field_type = 'list'
+                        list_of = str(raw_type[1])
+                    else:
+                        field_type = head
                 constraints = {}
-                
+                if list_of:
+                    constraints['of'] = list_of
+
                 for c in field_form[3:]:
                     if isinstance(c, list):
                         if c[0] == 'auto_gen':
@@ -114,10 +128,14 @@ class SExprBytecodeParser:
                             constraints['required'] = True
                         elif c[0] in ('min', 'max', 'gt', 'gte', 'lt', 'lte', 'min_items'):
                             constraints[c[0]] = c[1]
+                        elif c[0] == 'default' and len(c) > 1:
+                            constraints['default'] = c[1]
+                        elif c[0] == 'values':
+                            constraints['values'] = [str(v) for v in c[1:]]
                     elif c == 'required':
                         constraints['required'] = True
-                
-                fields[field_name] = {'type': field_type, **constraints}
+
+                fields[field_name] = {'type': str(field_type), **constraints}
             
             # Parse validations (cross-field)
             validations = []
