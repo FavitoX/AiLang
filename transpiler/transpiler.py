@@ -779,9 +779,16 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
         assign = inst['assign']
         if schema == 'object':
             # Anonymous object — C# anonymous type (boxed as object).
+            # Bare atoms that aren't known locals are treated as string literals
+            # (the converter emits them unquoted from the JSON source).
+            known = (ctx.get('locals') or {})
             parts = []
             for k, v in fields.items():
-                parts.append(f"{pascal_case(k)} = {_cs_expr(v, ctx)}")
+                val = _cs_expr(v, ctx)
+                if isinstance(v, str) and v not in known and not v.startswith('"') and '.' not in v:
+                    try: float(v)  # keep numbers
+                    except ValueError: val = f'"{v}"'
+                parts.append(f"{pascal_case(k)} = {val}")
             body = ", ".join(parts)
             locals_dict = ctx.setdefault('locals', {})
             if assign in locals_dict:
@@ -794,8 +801,16 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
             schema_fields = schema_def.get('fields', {})
             parts = []
             for k, v in fields.items():
-                field_type = (schema_fields.get(k) or {}).get('type')
-                parts.append(f"{pascal_case(k)} = {_cs_expr(v, ctx, hint=field_type)}")
+                fdef = schema_fields.get(k) or {}
+                field_type = fdef.get('type')
+                val = _cs_expr(v, ctx, hint=field_type)
+                # Enum / string fields: if the value is a bare identifier that's
+                # not a known local, it's a literal value — quote it.
+                if field_type in ('enum', 'string') and isinstance(v, str):
+                    known = (ctx.get('locals') or {})
+                    if v not in known and not v.startswith('"') and '.' not in v:
+                        val = f'"{v}"'
+                parts.append(f"{pascal_case(k)} = {val}")
             body = ", ".join(parts)
             lines.append(f"{pad}var {assign} = new {schema} {{ {body} }};")
             ctx.setdefault('locals', {})[assign] = schema
@@ -928,7 +943,7 @@ def _compile_define_var_csharp(inst: dict, pad: str, ctx: dict) -> list[str]:
 
     if isinstance(value, dict) and value.get('__empty_list__'):
         return [f"{pad}{cs_type} {name} = [];"]
-    if value is None:
+    if value is None or str(value) == 'nil':
         return [f"{pad}{cs_type} {name} = default!;"]
     if isinstance(value, bool):
         return [f"{pad}{cs_type} {name} = {'true' if value else 'false'};"]
@@ -956,18 +971,30 @@ def _compile_define_var_csharp(inst: dict, pad: str, ctx: dict) -> list[str]:
 
 def _compile_compute_fn_csharp(inst: dict, pad: str, ctx: dict) -> list[str]:
     fn = inst['function']
-    args = [_cs_value(a) for a in inst.get('args', [])]
+    raw_args = inst.get('args', [])
+    args = [_cs_value(a) for a in raw_args]
     assign = inst['assign']
+    locals_dict = ctx.setdefault('locals', {})
+    # If the target was already declared (DEFINE_VAR), emit assignment; else `var`.
+    decl = assign if assign in locals_dict else f"var {assign}"
     fn_map = {
         'round': 'Math.Round', 'floor': 'Math.Floor', 'ceil': 'Math.Ceiling',
         'min': 'Math.Min', 'max': 'Math.Max', 'abs': 'Math.Abs',
     }
     if fn == 'length':
+        src_raw = raw_args[0] if raw_args else ''
         src = args[0] if args else 'default'
-        return [f"{pad}var {assign} = {src}.Count;"]
+        src_type = locals_dict.get(str(src_raw))
+        if src_type in ('JsonNode', 'any_json'):
+            return [f"{pad}{decl} = {src}!.AsArray().Count;"]
+        return [f"{pad}{decl} = {src}.Count;"]
+    if fn == 'take_last':
+        src = args[0] if args else 'default'
+        n = args[1] if len(args) > 1 else '5'
+        return [f"{pad}{decl} = {src}!.AsArray().Skip(Math.Max(0, {src}!.AsArray().Count - {n})).ToList();"]
     if fn in fn_map:
-        return [f"{pad}var {assign} = {fn_map[fn]}({', '.join(args)});"]
-    return [f"{pad}var {assign} = default!;  // COMPUTE_FN: unsupported function {fn}"]
+        return [f"{pad}{decl} = {fn_map[fn]}({', '.join(args)});"]
+    return [f"{pad}{decl} = default!;  // COMPUTE_FN: unsupported function {fn}"]
 
 
 def _pg_columns_ordered(store_def: dict) -> list[tuple[str, dict]]:
@@ -1314,17 +1341,25 @@ def compile_match_csharp(inst: dict, indent: int, ctx: dict = None) -> list[str]
                 lines.append(f"{pad}}}")
     else:
         # Value-dispatch MATCH (integer / string arms — not RESULT pattern).
-        # Emit as if/else-if chain: MATCH value (3 (…)) (2 (…)) (DEFAULT (…))
+        # Arm keys come from the parser as atoms — strings, ints. Quote string
+        # arms that aren't known locals (they're literal values, not variable refs).
+        known = (ctx.get('locals') or {})
         first = True
         for arm_key, arm_body in cases.items():
             arm_str = str(arm_key)
             if arm_str == 'DEFAULT':
                 lines.append(f"{pad}else")
-            elif first:
-                lines.append(f"{pad}if ({_cs_expr(value, ctx)} == {_cs_value(arm_key)})")
-                first = False
             else:
-                lines.append(f"{pad}else if ({_cs_expr(value, ctx)} == {_cs_value(arm_key)})")
+                arm_val = _cs_value(arm_key)
+                # If the arm key is a bare identifier not in locals, quote it.
+                if isinstance(arm_key, str) and arm_key not in known and not arm_key.startswith('"'):
+                    try: int(arm_key); # numeric → keep as-is
+                    except ValueError: arm_val = f'"{arm_key}"'
+                if first:
+                    lines.append(f"{pad}if ({_cs_expr(value, ctx)} == {arm_val})")
+                    first = False
+                else:
+                    lines.append(f"{pad}else if ({_cs_expr(value, ctx)} == {arm_val})")
             lines.append(f"{pad}{{")
             for sub in arm_body:
                 lines.extend(compile_instruction_csharp(sub, indent + 1, ctx))
@@ -1357,7 +1392,12 @@ def compile_branch_csharp(inst: dict, indent: int, ctx: dict = None) -> list[str
         left = _cs_expr(left_raw, ctx, hint=hint_left)
         op = condition.get('op', '==')
         right = _cs_expr(right_raw, ctx, hint=hint_right)
-        cond_str = f"{left} {op} {right}"
+        if op == 'NOT_IN':
+            cond_str = f"!{right}.Contains({left})"
+        elif op == 'IN':
+            cond_str = f"{right}.Contains({left})"
+        else:
+            cond_str = f"{left} {op} {right}"
     else:
         cond_str = str(condition)
 
@@ -2026,13 +2066,36 @@ def _emit_event_handler_csharp(handler_name: str, handler_def: dict, bc) -> list
         'custom_errors': bc.custom_errors,
         'service_refs': {},
         'resilience_policies': {},
-        # eventData is available; body should read it via JsonNode-style access
-        # if the publisher passed a JsonNode, or cast if a typed object was emitted.
-        'locals': {'eventData': 'object'},
+        'schemas': bc.schemas if bc else {},
+        'locals': {},
     }
+    # Cast eventData to JsonNode so `event.data.X` paths resolve via Phase 3b
+    # indexer access. AILang's `event.data` IS the full payload — the `.data`
+    # segment is stripped by registering the root as `event.data` → `_evtData`.
+    lines.append('    var _evtData = System.Text.Json.Nodes.JsonNode.Parse(')
+    lines.append('        System.Text.Json.JsonSerializer.Serialize(eventData));')
+    ctx['locals']['_evtData'] = 'JsonNode'
+
+    # Rewrite event.data.X references in instruction trees to _evtData.X
+    import copy
+    def _rewrite_event_refs(inst):
+        inst = copy.deepcopy(inst)
+        for key in ('collection', 'value', 'assign', 'name', 'target'):
+            v = inst.get(key)
+            if isinstance(v, str) and v.startswith('event.data.'):
+                inst[key] = '_evtData.' + v[len('event.data.'):]
+            elif isinstance(v, str) and v == 'event.data':
+                inst[key] = '_evtData'
+        # Recurse into body/cases
+        if 'body' in inst and isinstance(inst['body'], list):
+            inst['body'] = [_rewrite_event_refs(i) for i in inst['body'] if isinstance(i, dict)]
+        if 'cases' in inst and isinstance(inst['cases'], dict):
+            inst['cases'] = {k: [_rewrite_event_refs(i) for i in v if isinstance(i, dict)]
+                             for k, v in inst['cases'].items()}
+        return inst
+
     for inst in handler_def.get('instructions', []):
-        lines.extend(compile_instruction_csharp(inst, 1, ctx))
-    # Always end with an await so the method body is valid `async Task`.
+        lines.extend(compile_instruction_csharp(_rewrite_event_refs(inst), 1, ctx))
     lines.append("    await Task.CompletedTask;")
     lines.append("}")
     return lines
@@ -4006,9 +4069,14 @@ def compile_instruction_go(inst: dict, indent: int, ctx: dict = None) -> list[st
         fields = inst.get('fields', {})
         assign = inst['assign']
         if schema == 'object':
+            known = (ctx.get('locals') or {})
             parts = []
             for k, v in fields.items():
-                parts.append(f'"{k}": {_go_expr(v, ctx)}')
+                val = _go_expr(v, ctx)
+                if isinstance(v, str) and v not in known and not v.startswith('"') and '.' not in v:
+                    try: float(v)
+                    except ValueError: val = f'"{v}"'
+                parts.append(f'"{k}": {val}')
             body = ", ".join(parts)
             locals_dict = ctx.setdefault('locals', {})
             if assign in locals_dict:
@@ -4021,8 +4089,14 @@ def compile_instruction_go(inst: dict, indent: int, ctx: dict = None) -> list[st
             schema_fields = schema_def.get('fields', {})
             parts = []
             for k, v in fields.items():
-                field_type = (schema_fields.get(k) or {}).get('type')
-                parts.append(f"{pascal_case(k)}: {_go_expr(v, ctx, hint=field_type)}")
+                fdef = schema_fields.get(k) or {}
+                field_type = fdef.get('type')
+                val = _go_expr(v, ctx, hint=field_type)
+                if field_type in ('enum', 'string') and isinstance(v, str):
+                    known = (ctx.get('locals') or {})
+                    if v not in known and not v.startswith('"') and '.' not in v:
+                        val = f'"{v}"'
+                parts.append(f"{pascal_case(k)}: {val}")
             body = ", ".join(parts)
             lines.append(f"{pad}{assign} := {schema}{{{body}}}")
             ctx.setdefault('locals', {})[assign] = schema
@@ -4032,7 +4106,6 @@ def compile_instruction_go(inst: dict, indent: int, ctx: dict = None) -> list[st
         field = inst.get('field', 'user')
         assign = inst['assign']
         if from_ == 'auth' and field == 'user':
-            # Strip "Bearer " and call the token as the subject — placeholder
             lines.append(f'{pad}{assign} := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")')
         elif from_ == 'clock' and field == 'now':
             lines.append(f"{pad}{assign} := time.Now().UTC()")
@@ -4042,6 +4115,7 @@ def compile_instruction_go(inst: dict, indent: int, ctx: dict = None) -> list[st
             lines.append(f"{pad}{assign} := time.Now().UTC().Weekday()")
         else:
             lines.append(f'{pad}var {assign} any  // GET_CURRENT {from_}.{field} (unsupported)')
+        lines.append(f"{pad}_ = {assign}")
 
     elif op == 'MATCH':
         lines.extend(compile_match_go(inst, indent, ctx))
@@ -4180,17 +4254,32 @@ def _compile_define_var_go(inst: dict, pad: str, ctx: dict) -> list[str]:
 
 def _compile_compute_fn_go(inst: dict, pad: str, ctx: dict) -> list[str]:
     fn = inst['function']
-    args = [_go_value(a) for a in inst.get('args', [])]
+    raw_args = inst.get('args', [])
+    args = [_go_value(a) for a in raw_args]
     assign = inst['assign']
+    locals_dict = ctx.setdefault('locals', {})
+    decl = f"{assign} =" if assign in locals_dict else f"{assign} :="
     fn_map = {
         'round': 'math.Round', 'floor': 'math.Floor', 'ceil': 'math.Ceil',
         'min': 'min', 'max': 'max', 'abs': 'math.Abs',
     }
     if fn == 'length':
         src = args[0] if args else 'nil'
-        return [f"{pad}{assign} := len({src})"]
+        src_raw = str(raw_args[0]) if raw_args else ''
+        src_type = locals_dict.get(src_raw)
+        if src_type in ('any_json', 'map'):
+            return [f"{pad}{decl} len({src}.([]any))"]
+        return [f"{pad}{decl} len({src})"]
+    if fn == 'take_last':
+        src = args[0] if args else 'nil'
+        n = args[1] if len(args) > 1 else '5'
+        src_raw = str(raw_args[0]) if raw_args else ''
+        src_type = locals_dict.get(src_raw)
+        if src_type in ('any_json', 'map'):
+            return [f"{pad}_arr := {src}.([]any); _start := len(_arr) - {n}; if _start < 0 {{ _start = 0 }}; {decl} _arr[_start:]"]
+        return [f"{pad}_start := len({src}) - {n}; if _start < 0 {{ _start = 0 }}; {decl} {src}[_start:]"]
     if fn in fn_map:
-        return [f"{pad}{assign} := {fn_map[fn]}({', '.join(args)})"]
+        return [f"{pad}{decl} {fn_map[fn]}({', '.join(args)})"]
     return [f"{pad}var {assign} any  // COMPUTE_FN: unsupported function {fn}"]
 
 
@@ -4549,16 +4638,22 @@ def compile_match_go(inst: dict, indent: int, ctx: dict = None) -> list[str]:
             lines.extend(compile_instruction_go(sub, indent, ctx))
     else:
         # Value-dispatch MATCH (integer / string arms — not RESULT pattern).
+        known = (ctx.get('locals') or {})
         first = True
         for arm_key, arm_body in cases.items():
             arm_str = str(arm_key)
             if arm_str == 'DEFAULT':
                 lines.append(f"{pad}}} else {{")
-            elif first:
-                lines.append(f"{pad}if {_go_expr(raw_value, ctx)} == {_go_value(arm_key)} {{")
-                first = False
             else:
-                lines.append(f"{pad}}} else if {_go_expr(raw_value, ctx)} == {_go_value(arm_key)} {{")
+                arm_val = _go_value(arm_key)
+                if isinstance(arm_key, str) and arm_key not in known and not arm_key.startswith('"'):
+                    try: int(arm_key)
+                    except ValueError: arm_val = f'"{arm_key}"'
+                if first:
+                    lines.append(f"{pad}if {_go_expr(raw_value, ctx)} == {arm_val} {{")
+                    first = False
+                else:
+                    lines.append(f"{pad}}} else if {_go_expr(raw_value, ctx)} == {arm_val} {{")
             for sub in arm_body:
                 lines.extend(compile_instruction_go(sub, indent + 1, ctx))
         if cases:
@@ -4587,7 +4682,12 @@ def compile_branch_go(inst: dict, indent: int, ctx: dict = None) -> list[str]:
         left = _go_expr(left_raw, ctx, hint=hint_left)
         op = condition.get('op', '==')
         right = _go_expr(right_raw, ctx, hint=hint_right)
-        cond_str = f"{left} {op} {right}"
+        if op == 'NOT_IN':
+            cond_str = f"!_sliceContains({right}, {left})"
+        elif op == 'IN':
+            cond_str = f"_sliceContains({right}, {left})"
+        else:
+            cond_str = f"{left} {op} {right}"
     else:
         cond_str = str(condition)
 
