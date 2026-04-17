@@ -268,18 +268,25 @@ def path_to_csharp_interpolated(path: str) -> str:
     return f'$"{s}"'
 
 
-def path_to_go_sprintf(path: str):
+def path_to_go_sprintf(path: str, ctx: dict = None):
     """Convert '/products/{item.product_id}' to (fmt_string_with_%v, [arg_exprs]).
 
     Each {x.y.z} placeholder becomes %v; the corresponding arg is `x.Y.Z` (Go
-    idioms: first segment lowercase, subsequent PascalCased)."""
+    idioms: first segment lowercase, subsequent PascalCased). When ctx is
+    provided and the path root is a JsonNode-like local (map/any_json), resolve
+    via indexer access (x["y"]["z"]) instead of typed struct fields."""
     import re
     args = []
+    locals_map = (ctx or {}).get('locals', {}) or {}
     def repl(m):
         expr = m.group(1)
         if '.' in expr:
-            parts = expr.split('.')
-            expr = parts[0] + ''.join('.' + pascal_case(p) for p in parts[1:])
+            root = expr.split('.')[0]
+            if locals_map.get(root) in ('map', 'any_json', 'JsonNode'):
+                expr = _go_resolve_path(expr, ctx)
+            else:
+                parts = expr.split('.')
+                expr = parts[0] + ''.join('.' + pascal_case(p) for p in parts[1:])
         args.append(expr)
         return '%v'
     fmt = re.sub(r'\{([a-zA-Z_][\w.]*)\}', repl, path or '')
@@ -352,6 +359,8 @@ def ailang_type_to_go(t) -> str:
     m = {
         'int': 'int', 'decimal': 'float64', 'string': 'string', 'bool': 'bool',
         'object': 'any', 'uuid': 'string', 'timestamp': 'time.Time',
+        # Bare `list` (no element type) from DEFINE_VAR → heterogeneous slice.
+        'list': '[]any',
     }
     return m.get(t, t)
 
@@ -506,6 +515,11 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
             lines.append(f"{pad}var {inst['assign']} = await {store_var}.FindAsync({key});")
         else:
             lines.append(f"{pad}var {inst['assign']} = {store_var}.Find({key});")
+        # Register so downstream STORE_UPDATE_FIELDS doesn't re-declare the local
+        # and so field-access codegen can resolve typed properties.
+        store_schema = (ctx.get('store_def') or {}).get('schema', '')
+        if store_schema:
+            ctx.setdefault('locals', {})[inst['assign']] = store_schema
 
     elif op == 'STORE_FIND_BY':
         lines.extend(_compile_store_find_by_csharp(inst, indent, ctx))
@@ -517,14 +531,14 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
         assign = inst['assign']
         data = inst['data']
         locals_dict = ctx.setdefault('locals', {})
-        # If the data var holds a full schema type (from CONSTRUCT) instead of a
-        # DTO, the store's Insert(Dto) won't accept it. In that case skip the
-        # insert (the entity is already fully constructed) and just alias.
         data_type = locals_dict.get(data)
         store_schema = (ctx.get('store_def') or {}).get('schema', '')
         if data_type == store_schema and data_type:
-            # Already a full entity — just assign (re-use the constructed value).
-            if assign in locals_dict:
+            if assign == data:
+                # `STORE_INSERT store payment → payment` with no rename is a
+                # no-op — the constructed entity is already live under `assign`.
+                pass
+            elif assign in locals_dict:
                 lines.append(f"{pad}{assign} = {data};")
             else:
                 lines.append(f"{pad}var {assign} = {data};")
@@ -549,6 +563,8 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
         store_schema = (ctx.get('store_def') or {}).get('schema', 'object')
         schema_def = (ctx.get('schemas') or {}).get(store_schema, {})
         schema_fields = schema_def.get('fields', {})
+        # Dotted keys (e.g. payment.id) need PascalCased struct access.
+        key_expr = _cs_expr(key, ctx)
         update_parts = []
         for f, v in fields.items():
             ftype = (schema_fields.get(f) or {}).get('type')
@@ -559,17 +575,19 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
                     val = f'"{v}"'
             update_parts.append(f'{pascal_case(f)} = {val}')
         updates = ", ".join(update_parts)
-        # Find existing → clone with `with { }` → re-save.
-        if assign:
+        # Find existing → clone with `with { }` → re-save. Re-declare the local
+        # only when it doesn't exist yet — otherwise we'd shadow / double-declare
+        # (repeat STORE_UPDATE_FIELDS to the same assign are common in sagas).
+        locals_dict = ctx.setdefault('locals', {})
+        if assign and assign not in locals_dict:
             lines.append(f"{pad}{store_schema}? {assign} = null;")
-            ctx.setdefault('locals', {})[assign] = store_schema
+            locals_dict[assign] = store_schema
         lines.append(f"{pad}{{")
-        lines.append(f"{pad}    var _existing = {store_var}.Find({key});")
+        lines.append(f"{pad}    var _existing = {store_var}.Find({key_expr});")
         lines.append(f"{pad}    if (_existing != null)")
         lines.append(f"{pad}    {{")
         lines.append(f"{pad}        var _updated = _existing with {{ {updates} }};")
-        lines.append(f"{pad}        {store_var}.Delete({key});")
-        # Re-insert via the full entity — bypass DTO since we have all fields.
+        lines.append(f"{pad}        {store_var}.Delete({key_expr});")
         lines.append(f"{pad}        // TODO: proper update path; for now delete+re-insert with updated copy")
         if assign:
             lines.append(f"{pad}        {assign} = _updated;")
@@ -812,7 +830,18 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
             parts = []
             for k, v in fields.items():
                 ftype = (elem_fields.get(k) or {}).get('type')
-                parts.append(f"{pascal_case(k)} = {_cs_expr(v, ctx, hint=ftype)}")
+                val = _cs_expr(v, ctx, hint=ftype)
+                # AILang convention in APPEND: dotted values are variable refs,
+                # bare identifiers in a string/enum slot are atoms — even when
+                # the atom shadows a local var name (e.g. `(type coupon)` with
+                # `coupon` also being the current local var).
+                if ftype in ('enum', 'string') and isinstance(v, str) \
+                        and not v.startswith('"') and '.' not in v:
+                    try:
+                        float(v)
+                    except ValueError:
+                        val = f'"{v}"'
+                parts.append(f"{pascal_case(k)} = {val}")
             init = ", ".join(parts)
             lines.append(f"{pad}{target}.Add(new {elem_cs} {{ {init} }});")
 
@@ -2829,7 +2858,24 @@ def generate_go(bc, output_dir: str):
             all_ops.add(op)
             # Also walk nested COMPUTE_FN args for math detection downstream
     has_in_memory_store = any(s.get('provider') != 'PostgreSQL' for s in bc.stores.values())
-    needs_math = 'COMPUTE_FN' in all_ops
+    # `math` is only needed for round/floor/ceil/abs — not length/take_last
+    # which just use len() and slicing. Walk COMPUTE_FN args to check.
+    _math_fns = {'round', 'floor', 'ceil', 'abs'}
+    def _has_math_compute_fn(insts):
+        for i in insts:
+            if not isinstance(i, dict):
+                continue
+            if i.get('op') == 'COMPUTE_FN' and i.get('function') in _math_fns:
+                return True
+            for k in ('body',):
+                if isinstance(i.get(k), list) and _has_math_compute_fn(i[k]):
+                    return True
+            if isinstance(i.get('cases'), dict):
+                for v in i['cases'].values():
+                    if isinstance(v, list) and _has_math_compute_fn(v):
+                        return True
+        return False
+    needs_math = any(_has_math_compute_fn(h.get('instructions', []) or []) for h in bc.handlers.values())
     needs_http_client = 'CALL_SERVICE' in all_ops
     needs_resilience_go = needs_http_client and bool((bc.resilience or {}).get('policies'))
     needs_events = ('EMIT_EVENT' in all_ops) or any(
@@ -2910,7 +2956,7 @@ def generate_go(bc, output_dir: str):
         if store_def.get('provider') == 'PostgreSQL':
             lines.extend(generate_postgres_store_go(store_name, store_def, schema_def))
         else:
-            lines.extend(generate_store_go(schema, schema_def))
+            lines.extend(generate_store_go(schema, schema_def, store_def))
         lines.append("")
 
     # ReadRow<T> helpers for SQL_QUERY/SQL_STREAM
@@ -2935,6 +2981,20 @@ def generate_go(bc, output_dir: str):
     lines.append("")
     lines.append("func respondError(w http.ResponseWriter, err *AiLangError) {")
     lines.append("\trespondJSON(w, err.StatusCode(), err)")
+    lines.append("}")
+    lines.append("")
+    # _sliceContains — used by BRANCH IN/NOT_IN against slices. Emitted
+    # unconditionally (it's small and always Go-valid); callers that don't
+    # need it cost a dead func, which Go is happy to accept.
+    lines.append("func _sliceContains(haystack any, needle any) bool {")
+    lines.append("\tswitch h := haystack.(type) {")
+    lines.append("\tcase []string:")
+    lines.append("\t\ts, _ := needle.(string)")
+    lines.append("\t\tfor _, v := range h { if v == s { return true } }")
+    lines.append("\tcase []any:")
+    lines.append("\t\tfor _, v := range h { if v == needle { return true } }")
+    lines.append("\t}")
+    lines.append("\treturn false")
     lines.append("}")
     lines.append("")
 
@@ -3020,6 +3080,16 @@ def generate_go(bc, output_dir: str):
     lines.append("}")
     lines.append("")
 
+    # Package-level aliases so EVENT_HANDLERs (free funcs — no Router receiver)
+    # can reach the service URL map and event bus without smuggling Router in
+    # through the handler signature. Set in buildHandler / main after creation.
+    if uses_call_service_anywhere:
+        lines.append("var _serviceURLs map[string]string")
+    if uses_events_go:
+        lines.append("var _bus *EventBus")
+    if uses_call_service_anywhere or uses_events_go:
+        lines.append("")
+
     if uses_events_go:
         lines.extend(generate_event_bus_go())
         lines.append("")
@@ -3078,8 +3148,10 @@ def generate_go(bc, output_dir: str):
             default_url = svc_def.get('default', 'http://localhost')
             lines.append(f'\t\t"{svc_name}": func() string {{ if v := os.Getenv("{env_var}"); v != "" {{ return v }}; return "{default_url}" }}(),')
         lines.append("\t}")
+        lines.append("\t_serviceURLs = serviceURLs")
     if uses_events_go:
         lines.append("\tbus := NewEventBus()")
+        lines.append("\t_bus = bus")
         for h_name, h_def in event_handlers_go:
             evt = h_def.get('event') or h_name
             fn_name = pascal_case(h_name) if h_name.startswith('on_') else 'On' + pascal_case(h_name)
@@ -3119,8 +3191,10 @@ def generate_go(bc, output_dir: str):
                 default_url = svc_def.get('default', 'http://localhost')
                 lines.append(f'\t\t"{svc_name}": func() string {{ if v := os.Getenv("{env_var}"); v != "" {{ return v }}; return "{default_url}" }}(),')
             lines.append("\t}")
+            lines.append("\t_serviceURLs = serviceURLs")
         if uses_events_go:
             lines.append("\tbus := NewEventBus()")
+            lines.append("\t_bus = bus")
             for h_name, h_def in event_handlers_go:
                 evt = h_def.get('event') or h_name
                 fn_name = pascal_case(h_name) if h_name.startswith('on_') else 'On' + pascal_case(h_name)
@@ -3240,10 +3314,42 @@ def _emit_event_handler_go(handler_name: str, handler_def: dict, bc) -> list[str
         'custom_errors': bc.custom_errors,
         'service_refs': {},
         'resilience_policies': {},
-        'locals': {'data': 'any'},
+        # `data` is raw any (from event bus); register as 'any_json' so dotted
+        # paths like data.items get resolved as `data.(map[string]any)["items"]`
+        # by _go_resolve_path. Mirrors C#'s `_evtData` of type JsonNode.
+        'locals': {'data': 'any_json'},
+        # Tells CALL_SERVICE / EMIT_EVENT / SAGA_COMPENSATE codegen to use
+        # the package-level `_serviceURLs` / `_bus` and the `ctx` parameter,
+        # instead of `rt.serviceURLs` / `rt.bus` / `r.Context()` which only
+        # exist inside HTTP handlers with a Router receiver and *http.Request.
+        'in_event_handler': True,
     }
+
+    # Rewrite `event.data.X` → `data.X` in instruction trees (mirrors C# which
+    # does the same with `_evtData`). AILang's `event.data` IS the payload root,
+    # so stripping the `event.` prefix aligns it with our `data` parameter.
+    import copy
+    def _rewrite_event_refs(inst):
+        inst = copy.deepcopy(inst)
+        for key in ('collection', 'value', 'assign', 'name', 'target'):
+            v = inst.get(key)
+            if isinstance(v, str):
+                if v.startswith('event.data.'):
+                    inst[key] = 'data.' + v[len('event.data.'):]
+                elif v == 'event.data':
+                    inst[key] = 'data'
+        if 'body' in inst and isinstance(inst['body'], list):
+            inst['body'] = [_rewrite_event_refs(i) for i in inst['body'] if isinstance(i, dict)]
+        if 'body' in inst and isinstance(inst['body'], dict):
+            inst['body'] = {k: ('data.' + v[len('event.data.'):] if isinstance(v, str) and v.startswith('event.data.') else v)
+                            for k, v in inst['body'].items()}
+        if 'cases' in inst and isinstance(inst['cases'], dict):
+            inst['cases'] = {k: [_rewrite_event_refs(i) for i in v if isinstance(i, dict)]
+                             for k, v in inst['cases'].items()}
+        return inst
+
     for inst in handler_def.get('instructions', []):
-        lines.extend(compile_instruction_go(inst, 1, ctx))
+        lines.extend(compile_instruction_go(_rewrite_event_refs(inst), 1, ctx))
     lines.append("}")
     return lines
 
@@ -3722,18 +3828,32 @@ def generate_row_mappers_go(bc) -> list[str]:
     return lines
 
 
-def generate_store_go(schema: str, schema_def: dict) -> list[str]:
+def generate_store_go(schema: str, schema_def: dict, store_def: dict = None) -> list[str]:
     lines = []
-    dto_fields = {k: v for k, v in schema_def.get('fields', {}).items() if not v.get('auto_gen')}
+    fields = schema_def.get('fields', {})
+    # Custom primary key support: resolve from store.index, fallback to 'id'.
+    index = (store_def or {}).get('index') or {}
+    pk_field = index.get('field', 'id') if isinstance(index, dict) else 'id'
+    pk_fdef = fields.get(pk_field, {})
+    pk_type_ailang = pk_fdef.get('type', 'uuid')
+    pk_go_type = ailang_type_to_go(pk_type_ailang) if pk_type_ailang else 'string'
+    pk_prop = pascal_case(pk_field)
+    pk_is_auto = pk_fdef.get('auto_gen', False)
+    # Map-key type: stringifiable primitives only. int/decimal/bool/uuid/string
+    # all round-trip through string via fmt.Sprint; for others fall back to string.
+    pk_map_key = pk_go_type if pk_go_type in ('string', 'int', 'int64') else 'string'
+    # DTO fields exclude auto_gen ones. When pk is auto-gen, also exclude it
+    # from the DTO Insert/Update shape.
+    dto_fields = {k: v for k, v in fields.items() if not v.get('auto_gen')}
 
     lines.append(f"// STORE: {schema}Store (from bytecode)")
     lines.append(f"type {schema}Store struct {{")
     lines.append(f"\tmu   sync.RWMutex")
-    lines.append(f"\tdata map[string]{schema}")
+    lines.append(f"\tdata map[{pk_map_key}]{schema}")
     lines.append("}")
     lines.append("")
     lines.append(f"func New{schema}Store() *{schema}Store {{")
-    lines.append(f"\treturn &{schema}Store{{data: make(map[string]{schema})}}")
+    lines.append(f"\treturn &{schema}Store{{data: make(map[{pk_map_key}]{schema})}}")
     lines.append("}")
     lines.append("")
 
@@ -3747,47 +3867,86 @@ def generate_store_go(schema: str, schema_def: dict) -> list[str]:
     lines.append("")
 
     # Find
-    lines.append(f"func (s *{schema}Store) Find(id string) *{schema} {{")
+    lines.append(f"func (s *{schema}Store) Find({pk_field} {pk_map_key}) *{schema} {{")
     lines.append("\ts.mu.RLock(); defer s.mu.RUnlock()")
-    lines.append("\tp, ok := s.data[id]")
+    lines.append(f"\tp, ok := s.data[{pk_field}]")
     lines.append("\tif !ok { return nil }")
     lines.append("\treturn &p")
     lines.append("}")
     lines.append("")
 
-    # Insert
+    # Insert — when PK is auto_gen, generate a new uuid; otherwise use dto.<Pk>.
     lines.append(f"func (s *{schema}Store) Insert(dto {schema}CreateDTO) {schema} {{")
     lines.append("\ts.mu.Lock(); defer s.mu.Unlock()")
     lines.append(f"\tp := {schema}{{")
-    lines.append(f'\t\tId: uuid.New().String(),')
+    if pk_is_auto:
+        lines.append(f'\t\t{pk_prop}: uuid.New().String(),')
     for field_name in dto_fields:
         prop = pascal_case(field_name)
         lines.append(f"\t\t{prop}: dto.{prop},")
     lines.append("\t}")
-    lines.append("\ts.data[p.Id] = p")
+    lines.append(f"\ts.data[p.{pk_prop}] = p")
     lines.append("\treturn p")
     lines.append("}")
     lines.append("")
 
     # Update
-    lines.append(f"func (s *{schema}Store) Update(id string, dto {schema}CreateDTO) *{schema} {{")
+    lines.append(f"func (s *{schema}Store) Update({pk_field} {pk_map_key}, dto {schema}CreateDTO) *{schema} {{")
     lines.append("\ts.mu.Lock(); defer s.mu.Unlock()")
-    lines.append("\tif _, ok := s.data[id]; !ok { return nil }")
-    lines.append(f"\tp := {schema}{{Id: id,")
+    lines.append(f"\tif _, ok := s.data[{pk_field}]; !ok {{ return nil }}")
+    lines.append(f"\tp := {schema}{{{pk_prop}: {pk_field},")
     for field_name in dto_fields:
+        if field_name == pk_field:
+            continue
         prop = pascal_case(field_name)
         lines.append(f"\t\t{prop}: dto.{prop},")
     lines.append("\t}")
-    lines.append("\ts.data[id] = p")
+    lines.append(f"\ts.data[{pk_field}] = p")
     lines.append("\treturn &p")
     lines.append("}")
     lines.append("")
 
-    # Delete
-    lines.append(f"func (s *{schema}Store) Delete(id string) bool {{")
+    # UpdateFields — partial update via a map[string]any of field → new value.
+    # Handlers use this for STORE_UPDATE_FIELDS; mirrors C#'s `with { }` clone.
+    lines.append(f"func (s *{schema}Store) UpdateFields({pk_field} {pk_map_key}, fields map[string]any) *{schema} {{")
     lines.append("\ts.mu.Lock(); defer s.mu.Unlock()")
-    lines.append("\tif _, ok := s.data[id]; !ok { return false }")
-    lines.append("\tdelete(s.data, id)")
+    lines.append(f"\texisting, ok := s.data[{pk_field}]")
+    lines.append("\tif !ok { return nil }")
+    lines.append("\tupdated := existing")
+    for field_name, fdef in fields.items():
+        if field_name == pk_field:
+            continue
+        prop = pascal_case(field_name)
+        ftype = fdef.get('type')
+        if ftype == 'int':
+            cast = 'int(v.(float64))'
+        elif ftype == 'decimal':
+            cast = 'v.(float64)'
+        elif ftype == 'bool':
+            cast = 'v.(bool)'
+        elif ftype in ('uuid', 'string', 'enum'):
+            cast = 'v.(string)'
+        elif ftype == 'timestamp':
+            cast = 'v.(time.Time)'
+        elif ftype in ('date', 'time'):
+            cast = 'v.(string)'
+        elif ftype == 'list':
+            elem = fdef.get('of') or 'any'
+            cast = f'v.([]{ailang_type_to_go(elem)})'
+        else:
+            go_type = ailang_type_to_go(ftype) if ftype else 'any'
+            cast = f'v.({go_type})'
+        lines.append(f'\tif v, ok := fields["{field_name}"]; ok {{ updated.{prop} = {cast} }}')
+    lines.append(f"\ts.data[{pk_field}] = updated")
+    lines.append("\treturn &updated")
+    lines.append("}")
+    lines.append("")
+
+    # Delete
+    lines.append(f"func (s *{schema}Store) Delete({pk_field} {pk_map_key}) bool {{")
+    lines.append("\ts.mu.Lock(); defer s.mu.Unlock()")
+    lines.append(f"\tif _, ok := s.data[{pk_field}]; !ok {{ return false }}")
+    lines.append(f"\tdelete(s.data, {pk_field})")
     lines.append("\treturn true")
     lines.append("}")
     lines.append("")
@@ -3795,7 +3954,7 @@ def generate_store_go(schema: str, schema_def: dict) -> list[str]:
     # Reset — test seam for RESET_STORE in (tests ... (clean ...))
     lines.append(f"func (s *{schema}Store) Reset() {{")
     lines.append("\ts.mu.Lock(); defer s.mu.Unlock()")
-    lines.append(f"\ts.data = make(map[string]{schema})")
+    lines.append(f"\ts.data = make(map[{pk_map_key}]{schema})")
     lines.append("}")
 
     return lines
@@ -3988,6 +4147,9 @@ def compile_instruction_go(inst: dict, indent: int, ctx: dict = None) -> list[st
         lines.append(f"{pad}}}")
         # Enforce the AILang contract: schema validations run automatically after READ_BODY.
         lines.append(f"{pad}if _verr := {assign}.Validate(); _verr != nil {{ respondError(w, _verr); return }}")
+        # Register the body as the base schema so BRANCH field-type lookups hit
+        # `schemas[schema]` (DTO is a subset with the same-typed fields).
+        ctx.setdefault('locals', {})[assign] = schema
 
     elif op == 'STORE_LIST_ALL':
         assign = inst['assign']
@@ -4005,11 +4167,22 @@ def compile_instruction_go(inst: dict, indent: int, ctx: dict = None) -> list[st
             lines.append(f"{pad}{assign} := {store}.ListAll()")
 
     elif op == 'STORE_FIND':
+        assign = inst['assign']
+        store_schema = (ctx.get('store_def') or {}).get('schema', '')
+        # _go_expr resolves dotted keys (e.g. `request.coupon_code` → the
+        # PascalCased typed-struct access or indexer-access for JsonNode
+        # roots). Plain identifiers pass through unchanged.
+        key_expr = _go_expr(inst['key'], ctx)
         if is_pg:
-            lines.append(f"{pad}{inst['assign']}, err := {store}.Find(ctx, {inst['key']})")
+            lines.append(f"{pad}{assign}, err := {store}.Find(ctx, {key_expr})")
             lines.append(f"{pad}if err != nil {{ respondError(w, ErrInternal(err.Error())); return }}")
         else:
-            lines.append(f"{pad}{inst['assign']} := {store}.Find({inst['key']})")
+            lines.append(f"{pad}{assign} := {store}.Find({key_expr})")
+        # Find returns *Schema. Track the pointer-ness separately so downstream
+        # STORE_UPDATE_FIELDS assigns without deref (pointer→pointer) and
+        # _field_type_of still finds the underlying schema via lstrip('*').
+        if store_schema:
+            ctx.setdefault('locals', {})[assign] = '*' + store_schema
 
     elif op == 'STORE_FIND_BY':
         lines.extend(_compile_store_find_by_go(inst, indent, ctx))
@@ -4018,11 +4191,33 @@ def compile_instruction_go(inst: dict, indent: int, ctx: dict = None) -> list[st
         lines.extend(_compile_store_filter_go(inst, indent, ctx))
 
     elif op == 'STORE_INSERT':
-        if is_pg:
-            lines.append(f"{pad}{inst['assign']}, err := {store}.Insert(ctx, {inst['data']})")
+        assign = inst['assign']
+        data = inst['data']
+        locals_dict = ctx.setdefault('locals', {})
+        data_type = locals_dict.get(data)
+        store_schema = (ctx.get('store_def') or {}).get('schema', '')
+        # Mirrors the C# branch at L523: when `data` is already a full entity
+        # (from CONSTRUCT of the store's schema), Insert(Dto) won't accept it.
+        # Re-use the constructed value directly instead of calling Insert.
+        if data_type == store_schema and data_type:
+            if assign == data:
+                # `STORE_INSERT store payment → payment` with no rename is
+                # already-constructed → skip emission; `payment` is live.
+                pass
+            elif assign in locals_dict:
+                lines.append(f"{pad}{assign} = {data}")
+            else:
+                lines.append(f"{pad}{assign} := {data}")
+                locals_dict[assign] = data_type
+        elif is_pg:
+            decl = '=' if assign in locals_dict else ':='
+            lines.append(f"{pad}{assign}, err {decl} {store}.Insert(ctx, {data})")
             lines.append(f"{pad}if err != nil {{ respondError(w, ErrInternal(err.Error())); return }}")
+            locals_dict[assign] = store_schema
         else:
-            lines.append(f"{pad}{inst['assign']} := {store}.Insert({inst['data']})")
+            decl = '=' if assign in locals_dict else ':='
+            lines.append(f"{pad}{assign} {decl} {store}.Insert({data})")
+            locals_dict[assign] = store_schema
 
     elif op == 'STORE_UPDATE':
         if is_pg:
@@ -4030,6 +4225,48 @@ def compile_instruction_go(inst: dict, indent: int, ctx: dict = None) -> list[st
             lines.append(f"{pad}if err != nil {{ respondError(w, ErrInternal(err.Error())); return }}")
         else:
             lines.append(f"{pad}{inst['assign']} := {store}.Update({inst['key']}, {inst['data']})")
+
+    elif op == 'STORE_UPDATE_FIELDS':
+        key = inst.get('key', 'id')
+        assign = inst.get('assign')
+        fields = inst.get('fields', {})
+        store_schema = (ctx.get('store_def') or {}).get('schema', 'object')
+        schema_def = (ctx.get('schemas') or {}).get(store_schema, {})
+        schema_fields = schema_def.get('fields', {})
+        # Build a map[string]any literal of the per-field new values. Field
+        # values honor their schema type so callers can pass enum atoms as bare
+        # identifiers (e.g. `cancelled`) — we quote them here.
+        key_expr = _go_expr(key, ctx)
+        parts = []
+        for f, v in fields.items():
+            fdef = schema_fields.get(f) or {}
+            ftype = fdef.get('type')
+            val = _go_expr(v, ctx, hint=ftype)
+            if ftype in ('enum', 'string') and isinstance(v, str):
+                known = (ctx.get('locals') or {})
+                if v not in known and not v.startswith('"') and '.' not in v:
+                    val = f'"{v}"'
+            parts.append(f'"{f}": {val}')
+        map_lit = f'map[string]any{{{", ".join(parts)}}}'
+        locals_dict = ctx.setdefault('locals', {})
+        if assign:
+            # The store returns *{Schema}. Three cases for `assign`:
+            #   1) Prior value-type (from CONSTRUCT): deref and guard nil.
+            #   2) Prior pointer-type (from STORE_FIND / prior UpdateFields):
+            #      pointer → pointer, straight assign.
+            #   3) Not yet declared: fresh := with pointer type registered.
+            prior_type = locals_dict.get(assign)
+            if prior_type == store_schema:
+                lines.append(f"{pad}if _updated := {store}.UpdateFields({key_expr}, {map_lit}); _updated != nil {{ {assign} = *_updated }}")
+            elif prior_type == '*' + store_schema:
+                lines.append(f"{pad}{assign} = {store}.UpdateFields({key_expr}, {map_lit})")
+            elif assign in locals_dict:
+                lines.append(f"{pad}{assign} = {store}.UpdateFields({key_expr}, {map_lit})")
+            else:
+                lines.append(f"{pad}{assign} := {store}.UpdateFields({key_expr}, {map_lit})")
+                locals_dict[assign] = '*' + store_schema
+        else:
+            lines.append(f"{pad}{store}.UpdateFields({key_expr}, {map_lit})")
 
     elif op == 'STORE_DELETE':
         if is_pg:
@@ -4084,7 +4321,9 @@ def compile_instruction_go(inst: dict, indent: int, ctx: dict = None) -> list[st
         if entry:
             fname = 'Err' + err_name_to_factory(err_type)
             declared = entry.get('params', []) or []
-            args = [_go_value(params.get(p, "")) for p in declared]
+            # _go_expr so JsonNode dotted paths (e.g. product_result.stock)
+            # resolve to `product_result["stock"]` instead of `.Stock`.
+            args = [_go_expr(params.get(p, ""), ctx) for p in declared]
             lines.append(f'{pad}respondError(w, {fname}({", ".join(args)}))')
         else:
             tag = err_type_tag(err_type)
@@ -4094,7 +4333,8 @@ def compile_instruction_go(inst: dict, indent: int, ctx: dict = None) -> list[st
     elif op == 'SAGA_COMPENSATE':
         saga = inst.get('saga', '')
         fn = 'compensate' + pascal_case(saga)
-        lines.append(f"{pad}{fn}(r.Context())")
+        ctx_expr = 'ctx' if ctx.get('in_event_handler') else 'r.Context()'
+        lines.append(f"{pad}{fn}({ctx_expr})")
 
     elif op == 'PARALLEL':
         lines.extend(_compile_parallel_go(inst, indent, ctx))
@@ -4105,7 +4345,7 @@ def compile_instruction_go(inst: dict, indent: int, ctx: dict = None) -> list[st
     elif op == 'CALL_SERVICE':
         service = inst['service']
         method = inst.get('method', 'GET').upper()
-        fmt, args = path_to_go_sprintf(inst.get('path', ''))
+        fmt, args = path_to_go_sprintf(inst.get('path', ''), ctx)
         assign = inst['assign']
         if args:
             path_expr = f'fmt.Sprintf("{fmt}", {", ".join(args)})'
@@ -4113,13 +4353,22 @@ def compile_instruction_go(inst: dict, indent: int, ctx: dict = None) -> list[st
             path_expr = f'"{fmt}"'
         body = inst.get('body')
         if body:
-            pairs = ", ".join(f'"{k}": {_go_value(v)}' for k, v in body.items())
+            # Use _go_expr(..., ctx) so dotted paths on JsonNode/map roots
+            # (e.g. current_product.name after a prior CALL_SERVICE) resolve
+            # to `current_product["name"]` instead of `current_product.Name`.
+            pairs = ", ".join(f'"{k}": {_go_expr(v, ctx)}' for k, v in body.items())
             body_expr = f'map[string]any{{{pairs}}}'
         else:
             body_expr = 'nil'
         idempotent = 'true' if inst.get('idempotent', True) else 'false'
+        if ctx.get('in_event_handler'):
+            ctx_expr = 'ctx'
+            urls_expr = f'_serviceURLs["{service}"]'
+        else:
+            ctx_expr = 'r.Context()'
+            urls_expr = f'rt.serviceURLs["{service}"]'
         lines.append(
-            f'{pad}{assign} := callService(r.Context(), "{service}", rt.serviceURLs["{service}"], "{method}", {path_expr}, {body_expr}, {idempotent})'
+            f'{pad}{assign} := callService({ctx_expr}, "{service}", {urls_expr}, "{method}", {path_expr}, {body_expr}, {idempotent})'
         )
         # callService returns `any` — objects decode as map[string]any, arrays as
         # []any. Register as 'any_json' so downstream knows to assert per context.
@@ -4127,7 +4376,10 @@ def compile_instruction_go(inst: dict, indent: int, ctx: dict = None) -> list[st
 
     elif op == 'EMIT_EVENT':
         data_expr = _go_value(inst.get('data')) if inst.get('data') not in (None, '') else 'nil'
-        lines.append(f'{pad}rt.bus.Publish(r.Context(), "{inst["event"]}", {data_expr})')
+        if ctx.get('in_event_handler'):
+            lines.append(f'{pad}_bus.Publish(ctx, "{inst["event"]}", {data_expr})')
+        else:
+            lines.append(f'{pad}rt.bus.Publish(r.Context(), "{inst["event"]}", {data_expr})')
 
     elif op == 'LOG':
         lines.append(f'{pad}log.Printf("[{inst.get("level", "INFO")}] {inst["message"]}")')
@@ -4139,7 +4391,17 @@ def compile_instruction_go(inst: dict, indent: int, ctx: dict = None) -> list[st
     elif op == 'SET_VAR':
         name = inst['name']
         hint = (ctx.get('locals') or {}).get(name)
-        lines.append(f"{pad}{name} = {_go_expr(inst.get('value'), ctx, hint=hint)}")
+        val_raw = inst.get('value')
+        val = _go_expr(val_raw, ctx, hint=hint)
+        # String/enum vars: quote bare atoms that aren't known locals (mirrors
+        # the C# SET_VAR fix). Without this `overall_status = critical` emits
+        # `critical` as an identifier → undefined.
+        if hint in ('string', 'enum') and isinstance(val_raw, str):
+            known = (ctx.get('locals') or {})
+            if val_raw not in known and not val_raw.startswith('"') and '.' not in val_raw:
+                try: float(val_raw)
+                except ValueError: val = f'"{val_raw}"'
+        lines.append(f"{pad}{name} = {val}")
 
     elif op == 'COMPUTE':
         operator = inst.get('operator', '+')
@@ -4188,13 +4450,33 @@ def compile_instruction_go(inst: dict, indent: int, ctx: dict = None) -> list[st
     elif op == 'APPEND':
         target = inst['target']
         if 'value' in inst:
-            lines.append(f"{pad}{target} = append({target}, {_go_value(inst['value'])})")
+            lines.append(f"{pad}{target} = append({target}, {_go_expr(inst['value'], ctx)})")
         else:
             locals_dict = ctx.get('locals', {}) or {}
             ttype = locals_dict.get(target, 'List<object>')
             elem = extract_list_elem(ailang_type_to_go(ttype))
             fields = inst.get('object_fields', {})
-            init = ", ".join(f"{pascal_case(k)}: {_go_value(v)}" for k, v in fields.items())
+            # Look up the elem schema to get per-field types, so `_go_expr`
+            # can cast JsonNode paths correctly (product_result.name → string).
+            elem_schema = (ctx.get('schemas') or {}).get(elem, {})
+            elem_fields = elem_schema.get('fields', {}) if elem_schema else {}
+            def _append_val(k, v):
+                fdef = elem_fields.get(k) or {}
+                ftype = fdef.get('type')
+                # AILang convention in APPEND: dotted values are variable refs,
+                # bare identifiers in a string/enum slot are atoms (string
+                # literals) — even when the atom shadows a local variable name.
+                # Pricing's `(type coupon)` has `coupon` as both the local var
+                # AND the desired literal; APPEND field position disambiguates.
+                if ftype in ('enum', 'string') and isinstance(v, str) \
+                        and not v.startswith('"') and '.' not in v:
+                    try:
+                        float(v)
+                        return _go_expr(v, ctx, hint=ftype)
+                    except ValueError:
+                        return f'"{v}"'
+                return _go_expr(v, ctx, hint=ftype)
+            init = ", ".join(f"{pascal_case(k)}: {_append_val(k, v)}" for k, v in fields.items())
             lines.append(f"{pad}{target} = append({target}, {elem}{{{init}}})")
 
     elif op == 'ITERATE':
@@ -4204,15 +4486,36 @@ def compile_instruction_go(inst: dict, indent: int, ctx: dict = None) -> list[st
         # map[string]any. To iterate as a list, cast the raw slice first. The
         # emitted `_<coll>_arr` is a temporary []any slice; `item` inside the
         # body becomes one element, registered as `map` so Phase 3b kicks in.
-        coll_type = (ctx.get('locals') or {}).get(collection) if ctx else None
-        if coll_type in ('map', 'any_json'):
+        locals_map = (ctx.get('locals') or {}) if ctx else {}
+        coll_root = collection.split('.')[0] if isinstance(collection, str) else collection
+        coll_type = locals_map.get(collection) or locals_map.get(coll_root)
+        # For dotted paths on JsonNode-like roots (e.g. `data.items` inside an
+        # EVENT_HANDLER), resolve via _go_resolve_path so the expression becomes
+        # `data.(map[string]any)["items"]`. Sanitize for the temp var name so we
+        # don't emit identifiers with dots.
+        if isinstance(collection, str) and '.' in collection and coll_type in ('map', 'any_json'):
+            coll_expr = _go_resolve_path(collection, ctx)
+            arr_var = f"_{collection.replace('.', '_')}_arr"
+            lines.append(f'{pad}{arr_var}, _ := ({coll_expr}).([]any)')
+            lines.append(f"{pad}for _, _elem := range {arr_var} {{")
+            lines.append(f'{pad}\t{item}, _ := _elem.(map[string]any)')
+            # `item` is ALREADY typed as map[string]any via the assertion above,
+            # so register as 'map' (no further initial assert needed). 'any_json'
+            # would re-emit `.(map[string]any)` on every access — invalid on a
+            # concrete type.
+            item_type = 'map'
+        elif coll_type in ('map', 'any_json'):
             arr_var = f"_{collection}_arr"
             lines.append(f'{pad}{arr_var}, _ := {collection}.([]any)')
             lines.append(f"{pad}for _, _elem := range {arr_var} {{")
             lines.append(f'{pad}\t{item}, _ := _elem.(map[string]any)')
-            item_type = 'any_json'
+            item_type = 'map'
         else:
-            lines.append(f"{pad}for _, {item} := range {collection} {{")
+            # Typed-struct collection: resolve dotted paths to PascalCase
+            # (e.g. body.items → body.Items). `_go_resolve_path` does this
+            # when the root is NOT any_json/map (falls through to typed access).
+            coll_expr = _go_resolve_path(collection, ctx) if isinstance(collection, str) else collection
+            lines.append(f"{pad}for _, {item} := range {coll_expr} {{")
             item_type = 'object'
         inner_ctx = dict(ctx)
         inner_ctx['locals'] = dict(ctx.get('locals', {}))
@@ -4240,7 +4543,11 @@ def compile_instruction_go(inst: dict, indent: int, ctx: dict = None) -> list[st
                 lines.append(f"{pad}{assign} = map[string]any{{{body}}}")
             else:
                 lines.append(f"{pad}{assign} := map[string]any{{{body}}}")
-                locals_dict[assign] = 'object'
+            # Register as 'any_json' so later dotted access (e.g.
+            # products_section.status) goes through `.(map[string]any)["status"]`
+            # instead of trying a typed struct field. The declared Go type may
+            # be `any` (DEFINE_VAR) or `map[string]any` (fresh :=) — both work.
+            locals_dict[assign] = 'any_json'
         else:
             schema_def = (ctx.get('schemas') or {}).get(schema, {})
             schema_fields = schema_def.get('fields', {})
@@ -4267,14 +4574,21 @@ def compile_instruction_go(inst: dict, indent: int, ctx: dict = None) -> list[st
         from_ = inst.get('from', 'auth')
         field = inst.get('field', 'user')
         assign = inst['assign']
+        locals_dict = ctx.setdefault('locals', {})
         if from_ == 'auth' and field == 'user':
             lines.append(f'{pad}{assign} := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")')
+            locals_dict[assign] = 'string'
         elif from_ == 'clock' and field == 'now':
             lines.append(f"{pad}{assign} := time.Now().UTC()")
+            locals_dict[assign] = 'timestamp'
         elif from_ == 'clock' and field == 'today':
             lines.append(f"{pad}{assign} := time.Now().UTC().Truncate(24 * time.Hour)")
+            locals_dict[assign] = 'timestamp'
         elif from_ == 'clock' and field == 'day_of_week':
             lines.append(f"{pad}{assign} := time.Now().UTC().Weekday()")
+            # Track the Weekday pseudo-type so BRANCH on bare `tuesday` etc.
+            # resolves to `time.Tuesday` via _maybe_quote below.
+            locals_dict[assign] = 'day_of_week'
         else:
             lines.append(f'{pad}var {assign} any  // GET_CURRENT {from_}.{field} (unsupported)')
         lines.append(f"{pad}_ = {assign}")
@@ -4346,17 +4660,21 @@ def _go_expr(v, ctx: dict = None, hint: str = None) -> str:
         s = v
         if s and (s[0].isalpha() or s[0] == '_') and all(c.isalnum() or c in '_.' for c in s):
             return _go_resolve_path(s, ctx, hint)
-    base = _go_value(v)
-    # Widen plain identifiers whose known type is int when used in a decimal
-    # context (Go has no implicit numeric conversions).
-    if hint == 'decimal' and ctx and isinstance(v, str):
+    base = _go_value(v, ctx)
+    if ctx and isinstance(v, str):
         known_type = (ctx.get('locals') or {}).get(v)
-        if known_type == 'int':
+        # Widen plain identifiers whose known type is int when used in a decimal
+        # context (Go has no implicit numeric conversions).
+        if hint == 'decimal' and known_type == 'int':
             return f'float64({base})'
+        # When passing an any-typed local into a struct field whose declared
+        # type is object/map, emit the type assertion so Go accepts the value.
+        if hint == 'object' and known_type == 'any_json':
+            return f'{base}.(map[string]any)'
     return base
 
 
-def _go_value(v) -> str:
+def _go_value(v, ctx: dict = None) -> str:
     from sexpr_parser import StringLiteral
     if v is None:
         return 'nil'
@@ -4368,6 +4686,20 @@ def _go_value(v) -> str:
     if isinstance(v, (int, float)):
         return str(v)
     if isinstance(v, list):
+        # Pair-list → nested map literal. Every sub-element must be a 2-tuple
+        # `[key, value]`; otherwise fall through to the opaque TODO sentinel.
+        if all(isinstance(item, list) and len(item) == 2 for item in v):
+            parts = []
+            for k, inner in v:
+                key = str(k)
+                # Recursively format the value; identifiers resolve via ctx
+                # when available, else pass through _go_value.
+                if ctx is not None and isinstance(inner, str):
+                    val_str = _go_expr(inner, ctx)
+                else:
+                    val_str = _go_value(inner, ctx)
+                parts.append(f'"{key}": {val_str}')
+            return f'map[string]any{{{", ".join(parts)}}}'
         return f'/* TODO nested: {v} */ nil'
     s = str(v)
     if s.startswith('"'):
@@ -4408,6 +4740,13 @@ def _compile_define_var_go(inst: dict, pad: str, ctx: dict) -> list[str]:
     if s.startswith('"'):
         return [f"{pad}var {name} {go_type} = {s}"]
     if vtype == 'string':
+        # Bare identifier default for a string-typed var is a string atom.
+        known = ctx.get('locals') or {}
+        if isinstance(value, str) and value not in known and not value.startswith('"') and '.' not in value:
+            try:
+                float(value)
+            except ValueError:
+                return [f'{pad}var {name} {go_type} = "{value}"']
         return [f"{pad}var {name} {go_type} = {_go_value(value)}"]
     if vtype == 'object' and s.startswith('{'):
         return [f"{pad}var {name} {go_type}  // TODO: object initializer {s}"]
@@ -4420,7 +4759,12 @@ def _compile_compute_fn_go(inst: dict, pad: str, ctx: dict) -> list[str]:
     args = [_go_value(a) for a in raw_args]
     assign = inst['assign']
     locals_dict = ctx.setdefault('locals', {})
-    decl = f"{assign} =" if assign in locals_dict else f"{assign} :="
+    was_declared = assign in locals_dict
+    decl = f"{assign} =" if was_declared else f"{assign} :="
+    # Register the new local so downstream refs (e.g. CONSTRUCT "recent":
+    # recent_orders) resolve as identifiers instead of being quoted as atoms.
+    if not was_declared:
+        locals_dict[assign] = 'object'
     fn_map = {
         'round': 'math.Round', 'floor': 'math.Floor', 'ceil': 'math.Ceil',
         'min': 'min', 'max': 'max', 'abs': 'math.Abs',
@@ -4440,6 +4784,10 @@ def _compile_compute_fn_go(inst: dict, pad: str, ctx: dict) -> list[str]:
         if src_type in ('any_json', 'map'):
             return [f"{pad}_arr := {src}.([]any); _start := len(_arr) - {n}; if _start < 0 {{ _start = 0 }}; {decl} _arr[_start:]"]
         return [f"{pad}_start := len({src}) - {n}; if _start < 0 {{ _start = 0 }}; {decl} {src}[_start:]"]
+    # round(x, n) → math.Round(x*10^n) / 10^n. Go's math.Round is arity-1.
+    if fn == 'round' and len(args) == 2:
+        factor = f"math.Pow(10, {args[1]})"
+        return [f"{pad}{decl} math.Round({args[0]}*{factor}) / {factor}"]
     if fn in fn_map:
         return [f"{pad}{decl} {fn_map[fn]}({', '.join(args)})"]
     return [f"{pad}var {assign} any  // COMPUTE_FN: unsupported function {fn}"]
@@ -4789,15 +5137,46 @@ def compile_match_go(inst: dict, indent: int, ctx: dict = None) -> list[str]:
                 lines.extend(compile_instruction_go(sub, indent + 1, ctx))
             lines.append(f"{pad}}}")
     elif 'OK' in cases and 'ERR' in cases:
-        # OK + ERR → value-type MATCH after READ_BODY. Decode errors were already
-        # handled by READ_BODY, so the ERR branch is dead code in Go (structs
-        # can't be compared to nil). Emit the OK branch inline only.
-        if rebind_stmt:
-            lines.append(f"{pad}{rebind_stmt}")
-            lines.append(f"{pad}_ = {rebind_var}")
-            ctx.setdefault('locals', {})[rebind_var] = 'any_json'
-        for sub in cases['OK']:
-            lines.extend(compile_instruction_go(sub, indent, ctx))
+        # OK + ERR: two interpretations depending on the value's type.
+        #   - If value is any_json / map / JsonNode (typical CALL_SERVICE result),
+        #     ERR means the call failed → the value is nil. Emit a nil-check with
+        #     both branches, same shape as OK+NONE.
+        #   - If value is a typed struct (READ_BODY result), decode errors were
+        #     already handled by READ_BODY, so ERR is dead code — emit OK inline.
+        raw_root = raw_value.split('.')[0] if isinstance(raw_value, str) else None
+        root_type = (ctx.get('locals') or {}).get(raw_root) if raw_root else None
+        is_nullable_value = root_type in ('any_json', 'map', 'JsonNode')
+        if is_nullable_value:
+            err_lines = []
+            for sub in cases['ERR']:
+                err_lines.extend(compile_instruction_go(sub, indent + 1, ctx))
+            err_returns = any(l.strip().startswith('return') for l in err_lines)
+            lines.append(f"{pad}if {value} == nil {{")
+            lines.extend(err_lines)
+            if err_returns:
+                lines.append(f"{pad}}}")
+                if rebind_stmt:
+                    lines.append(f"{pad}{rebind_stmt}")
+                    lines.append(f"{pad}_ = {rebind_var}")
+                    ctx.setdefault('locals', {})[rebind_var] = 'any_json'
+                for sub in cases['OK']:
+                    lines.extend(compile_instruction_go(sub, indent, ctx))
+            else:
+                lines.append(f"{pad}}} else {{")
+                if rebind_stmt:
+                    lines.append(f"{pad}\t{rebind_stmt}")
+                    lines.append(f"{pad}\t_ = {rebind_var}")
+                    ctx.setdefault('locals', {})[rebind_var] = 'any_json'
+                for sub in cases['OK']:
+                    lines.extend(compile_instruction_go(sub, indent + 1, ctx))
+                lines.append(f"{pad}}}")
+        else:
+            if rebind_stmt:
+                lines.append(f"{pad}{rebind_stmt}")
+                lines.append(f"{pad}_ = {rebind_var}")
+                ctx.setdefault('locals', {})[rebind_var] = 'any_json'
+            for sub in cases['OK']:
+                lines.extend(compile_instruction_go(sub, indent, ctx))
     else:
         # Value-dispatch MATCH (integer / string arms — not RESULT pattern).
         known = (ctx.get('locals') or {})
@@ -4837,13 +5216,93 @@ def compile_branch_go(inst: dict, indent: int, ctx: dict = None) -> list[str]:
         right_raw = condition.get('right', '')
         hint_left = _scalar_type_hint(right_raw)
         hint_right = _scalar_type_hint(left_raw)
-        left = _go_expr(left_raw, ctx, hint=hint_left)
+        # When a side is a JsonNode-rooted path (any_json/map/JsonNode), it's
+        # `any` in Go and needs a type assertion to compare/compute. Default to
+        # 'decimal' for ordered ops so both sides end up as float64, matching
+        # how encoding/json decodes numbers.
+        locals_map = (ctx.get('locals') or {}) if ctx else {}
+        def _is_json_path(v):
+            if not (isinstance(v, str) and '.' in v):
+                return False
+            root = v.split('.')[0]
+            return locals_map.get(root) in ('any_json', 'map', 'JsonNode')
+        op_lookup = condition.get('op', '==')
+        if op_lookup in ('<', '<=', '>', '>=', '+', '-', '*', '/'):
+            # If one side is a JsonNode path, both sides end up as float64.
+            # Hint the JsonNode side so its `.(float64)` assertion is emitted,
+            # and hint the other side too so a typed int gets `float64(...)`
+            # widening (Go has no implicit numeric conversion).
+            if _is_json_path(left_raw) or _is_json_path(right_raw):
+                if hint_left is None:
+                    hint_left = 'decimal'
+                if hint_right is None:
+                    hint_right = 'decimal'
+        # Typed-struct field or typed local on one side + bare identifier on
+        # the other (not a local) → the identifier is a string/enum atom. Map
+        # to a Go literal.
+        def _field_type_of(path):
+            if not isinstance(path, str):
+                return None
+            if '.' not in path:
+                # Plain local identifier — look up its registered type.
+                return locals_map.get(path)
+            root = path.split('.')[0]
+            root_type = locals_map.get(root)
+            if not root_type or root_type in ('any_json', 'map', 'JsonNode'):
+                return None
+            # `*Schema` (from STORE_FIND) → Schema for the schemas lookup.
+            schema_name = root_type.lstrip('*')
+            schema = (ctx.get('schemas') or {}).get(schema_name, {})
+            fields = schema.get('fields', {})
+            leaf = path.split('.')[-1]
+            fdef = fields.get(leaf) or {}
+            return fdef.get('type')
+        def _maybe_quote(side_raw, other_field_type, other_is_json):
+            if not isinstance(side_raw, str):
+                return None
+            if side_raw.startswith('"') or '.' in side_raw:
+                return None
+            if side_raw in locals_map:
+                return None
+            if side_raw in ('true', 'false'):
+                return None  # bool literal, not a string atom
+            try:
+                float(side_raw)
+                return None
+            except ValueError:
+                pass
+            if other_field_type == 'day_of_week':
+                return f'time.{side_raw.capitalize()}'
+            if side_raw == 'null' and (other_field_type in ('string', 'enum') or other_is_json):
+                return '""'
+            if other_field_type in ('string', 'enum'):
+                return f'"{side_raw}"'
+            # JsonNode accessor on the other side: assume the decoded value is
+            # a string (equality check against a bare atom is the idiomatic
+            # shape for status/type checks). Quote defensively.
+            if other_is_json:
+                return f'"{side_raw}"'
+            return None
+        l_ftype = _field_type_of(left_raw)
+        r_ftype = _field_type_of(right_raw)
+        right_quoted = _maybe_quote(right_raw, l_ftype, _is_json_path(left_raw))
+        left_quoted = _maybe_quote(left_raw, r_ftype, _is_json_path(right_raw))
+        left = left_quoted if left_quoted is not None else _go_expr(left_raw, ctx, hint=hint_left)
         op = condition.get('op', '==')
-        right = _go_expr(right_raw, ctx, hint=hint_right)
+        right = right_quoted if right_quoted is not None else _go_expr(right_raw, ctx, hint=hint_right)
         if op == 'NOT_IN':
             cond_str = f"!_sliceContains({right}, {left})"
         elif op == 'IN':
             cond_str = f"_sliceContains({right}, {left})"
+        elif op in ('<', '<=', '>', '>=') and (l_ftype == 'timestamp' or r_ftype == 'timestamp'):
+            # time.Time doesn't support Go's ordering operators; use methods.
+            method = {'>': 'After', '<': 'Before', '>=': 'After', '<=': 'Before'}[op]
+            cond_str = f"{left}.{method}({right})"
+            # For `>=` / `<=` emit `!Before(...)` / `!After(...)` to flip.
+            if op == '>=':
+                cond_str = f"!{left}.Before({right})"
+            elif op == '<=':
+                cond_str = f"!{left}.After({right})"
         else:
             cond_str = f"{left} {op} {right}"
     else:
