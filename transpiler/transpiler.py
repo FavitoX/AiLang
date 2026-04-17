@@ -511,10 +511,27 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
         lines.extend(_compile_store_filter_csharp(inst, indent, ctx))
 
     elif op == 'STORE_INSERT':
-        if is_pg:
-            lines.append(f"{pad}var {inst['assign']} = await {store_var}.InsertAsync({inst['data']});")
+        assign = inst['assign']
+        data = inst['data']
+        locals_dict = ctx.setdefault('locals', {})
+        # If the data var holds a full schema type (from CONSTRUCT) instead of a
+        # DTO, the store's Insert(Dto) won't accept it. In that case skip the
+        # insert (the entity is already fully constructed) and just alias.
+        data_type = locals_dict.get(data)
+        store_schema = (ctx.get('store_def') or {}).get('schema', '')
+        if data_type == store_schema and data_type:
+            # Already a full entity — just assign (re-use the constructed value).
+            if assign in locals_dict:
+                lines.append(f"{pad}{assign} = {data};")
+            else:
+                lines.append(f"{pad}var {assign} = {data};")
+                locals_dict[assign] = data_type
+        elif is_pg:
+            lines.append(f"{pad}var {assign} = await {store_var}.InsertAsync({data});")
         else:
-            lines.append(f"{pad}var {inst['assign']} = {store_var}.Insert({inst['data']});")
+            decl = assign if assign in locals_dict else f"var {assign}"
+            lines.append(f"{pad}{decl} = {store_var}.Insert({data});")
+            locals_dict[assign] = store_schema
 
     elif op == 'STORE_UPDATE':
         if is_pg:
@@ -706,17 +723,9 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
             if _is_json_path_cs(left_raw) or _is_json_path_cs(right_raw):
                 hint_left = hint_right = 'decimal'
         elif operator in cmp_ops:
-            # Simple inference: if one side is a scalar literal, use its type for the other.
             left_raw, right_raw = inst.get('left'), inst.get('right')
-            def _scalar_hint(x):
-                if isinstance(x, bool): return 'bool'
-                if isinstance(x, int):  return 'int'
-                if isinstance(x, float): return 'decimal'
-                from sexpr_parser import StringLiteral
-                if isinstance(x, StringLiteral): return 'string'
-                return None
-            hint_left = _scalar_hint(right_raw)
-            hint_right = _scalar_hint(left_raw)
+            hint_left = _scalar_type_hint(right_raw)
+            hint_right = _scalar_type_hint(left_raw)
         left = _cs_expr(inst.get('left'), ctx, hint=hint_left)
         right = _cs_expr(inst.get('right'), ctx, hint=hint_right)
         locals_dict = ctx.setdefault('locals', {})
@@ -836,6 +845,26 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
         lines.append(f'{pad}Console.WriteLine($"[{level}] {inst["message"]}");')
 
     return [l for l in lines if l != ""]
+
+
+def _scalar_type_hint(x):
+    """Infer the AILang type of a scalar value for Phase 3b cast hinting.
+
+    Returns 'bool', 'int', 'decimal', 'string', or None when the value is
+    an identifier or complex form. Used by COMPUTE, BRANCH, and MATCH to
+    decide the GetValue<T>() cast on JsonNode leaves."""
+    from sexpr_parser import StringLiteral
+    if isinstance(x, bool):
+        return 'bool'
+    if isinstance(x, int):
+        return 'int'
+    if isinstance(x, float):
+        return 'decimal'
+    if isinstance(x, StringLiteral):
+        return 'string'
+    if isinstance(x, str) and x.lower() in ('true', 'false'):
+        return 'bool'
+    return None
 
 
 def _cs_json_cast(expr: str, hint: str) -> str:
@@ -1343,9 +1372,11 @@ def compile_match_csharp(inst: dict, indent: int, ctx: dict = None) -> list[str]
                 lines.append(f"{pad}}}")
     else:
         # Value-dispatch MATCH (integer / string arms — not RESULT pattern).
-        # Arm keys come from the parser as atoms — strings, ints. Quote string
-        # arms that aren't known locals (they're literal values, not variable refs).
         known = (ctx.get('locals') or {})
+        # Infer value hint from arm key types: all-int → int, else string.
+        all_int = all(isinstance(k, int) or (isinstance(k, str) and k.isdigit()) for k in cases if str(k) != 'DEFAULT')
+        value_hint = 'int' if all_int else 'string'
+        value_expr = _cs_expr(value, ctx, hint=value_hint)
         first = True
         for arm_key, arm_body in cases.items():
             arm_str = str(arm_key)
@@ -1353,15 +1384,14 @@ def compile_match_csharp(inst: dict, indent: int, ctx: dict = None) -> list[str]
                 lines.append(f"{pad}else")
             else:
                 arm_val = _cs_value(arm_key)
-                # If the arm key is a bare identifier not in locals, quote it.
                 if isinstance(arm_key, str) and arm_key not in known and not arm_key.startswith('"'):
-                    try: int(arm_key); # numeric → keep as-is
+                    try: int(arm_key)
                     except ValueError: arm_val = f'"{arm_key}"'
                 if first:
-                    lines.append(f"{pad}if ({_cs_expr(value, ctx)} == {arm_val})")
+                    lines.append(f"{pad}if ({value_expr} == {arm_val})")
                     first = False
                 else:
-                    lines.append(f"{pad}else if ({_cs_expr(value, ctx)} == {arm_val})")
+                    lines.append(f"{pad}else if ({value_expr} == {arm_val})")
             lines.append(f"{pad}{{")
             for sub in arm_body:
                 lines.extend(compile_instruction_csharp(sub, indent + 1, ctx))
@@ -1382,18 +1412,28 @@ def compile_branch_csharp(inst: dict, indent: int, ctx: dict = None) -> list[str
         # (root["k"]!.GetValue<T>()). Type hint inferred from the scalar operand.
         left_raw = condition.get('left', '')
         right_raw = condition.get('right', '')
-        def _scalar_hint(x):
-            from sexpr_parser import StringLiteral
-            if isinstance(x, bool): return 'bool'
-            if isinstance(x, int): return 'int'
-            if isinstance(x, float): return 'decimal'
-            if isinstance(x, StringLiteral): return 'string'
-            return None
-        hint_left = _scalar_hint(right_raw)
-        hint_right = _scalar_hint(left_raw)
+        hint_left = _scalar_type_hint(right_raw)
+        hint_right = _scalar_type_hint(left_raw)
+        # When comparing a JsonNode path against a bare atom with no explicit type,
+        # default to string (the most common case for MATCH-like dispatches).
+        def _is_json_root(v):
+            if isinstance(v, str) and '.' in v:
+                root = v.split('.')[0]
+                return (ctx.get('locals') or {}).get(root) in ('JsonNode', 'any_json')
+            return False
+        if hint_left is None and _is_json_root(left_raw) and isinstance(right_raw, str):
+            hint_left = 'string'
+        if hint_right is None and _is_json_root(right_raw) and isinstance(left_raw, str):
+            hint_right = 'string'
         left = _cs_expr(left_raw, ctx, hint=hint_left)
         op = condition.get('op', '==')
         right = _cs_expr(right_raw, ctx, hint=hint_right)
+        # Quote bare-atom rhs that isn't a known local — it's a literal value.
+        if isinstance(right_raw, str) and right_raw not in ((ctx.get('locals') or {})) and not right_raw.startswith('"') and '.' not in right_raw:
+            try: float(right_raw)
+            except ValueError:
+                if right_raw.lower() not in ('true', 'false'):
+                    right = f'"{right_raw}"'
         if op == 'NOT_IN':
             cond_str = f"!{right}.Contains({left})"
         elif op == 'IN':
@@ -3998,15 +4038,8 @@ def compile_instruction_go(inst: dict, indent: int, ctx: dict = None) -> list[st
             if _is_json_path(left_raw) or _is_json_path(right_raw):
                 hint_left = hint_right = 'decimal'
         elif operator in cmp_ops:
-            def _scalar_hint(x):
-                from sexpr_parser import StringLiteral
-                if isinstance(x, bool): return 'bool'
-                if isinstance(x, int): return 'int'
-                if isinstance(x, float): return 'decimal'
-                if isinstance(x, StringLiteral): return 'string'
-                return None
-            hint_left = _scalar_hint(inst.get('right'))
-            hint_right = _scalar_hint(inst.get('left'))
+            hint_left = _scalar_type_hint(inst.get('right'))
+            hint_right = _scalar_type_hint(inst.get('left'))
         left = _go_expr(inst.get('left'), ctx, hint=hint_left)
         right = _go_expr(inst.get('right'), ctx, hint=hint_right)
         locals_dict = ctx.setdefault('locals', {})
@@ -4646,6 +4679,9 @@ def compile_match_go(inst: dict, indent: int, ctx: dict = None) -> list[str]:
     else:
         # Value-dispatch MATCH (integer / string arms — not RESULT pattern).
         known = (ctx.get('locals') or {})
+        all_int = all(isinstance(k, int) or (isinstance(k, str) and k.isdigit()) for k in cases if str(k) != 'DEFAULT')
+        value_hint = 'int' if all_int else 'string'
+        value_expr = _go_expr(raw_value, ctx, hint=value_hint)
         first = True
         for arm_key, arm_body in cases.items():
             arm_str = str(arm_key)
@@ -4657,10 +4693,10 @@ def compile_match_go(inst: dict, indent: int, ctx: dict = None) -> list[str]:
                     try: int(arm_key)
                     except ValueError: arm_val = f'"{arm_key}"'
                 if first:
-                    lines.append(f"{pad}if {_go_expr(raw_value, ctx)} == {arm_val} {{")
+                    lines.append(f"{pad}if {value_expr} == {arm_val} {{")
                     first = False
                 else:
-                    lines.append(f"{pad}}} else if {_go_expr(raw_value, ctx)} == {arm_val} {{")
+                    lines.append(f"{pad}}} else if {value_expr} == {arm_val} {{")
             for sub in arm_body:
                 lines.extend(compile_instruction_go(sub, indent + 1, ctx))
         if cases:
@@ -4677,15 +4713,8 @@ def compile_branch_go(inst: dict, indent: int, ctx: dict = None) -> list[str]:
     if isinstance(condition, dict):
         left_raw = condition.get('left', '')
         right_raw = condition.get('right', '')
-        def _scalar_hint(x):
-            from sexpr_parser import StringLiteral
-            if isinstance(x, bool): return 'bool'
-            if isinstance(x, int): return 'int'
-            if isinstance(x, float): return 'decimal'
-            if isinstance(x, StringLiteral): return 'string'
-            return None
-        hint_left = _scalar_hint(right_raw)
-        hint_right = _scalar_hint(left_raw)
+        hint_left = _scalar_type_hint(right_raw)
+        hint_right = _scalar_type_hint(left_raw)
         left = _go_expr(left_raw, ctx, hint=hint_left)
         op = condition.get('op', '==')
         right = _go_expr(right_raw, ctx, hint=hint_right)
