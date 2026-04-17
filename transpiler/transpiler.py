@@ -684,13 +684,34 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
         lines.extend(_compile_define_var_csharp(inst, pad, ctx))
 
     elif op == 'SET_VAR':
-        lines.append(f"{pad}{inst['name']} = {_cs_value(inst.get('value'))};")
+        name = inst['name']
+        hint = (ctx.get('locals') or {}).get(name)
+        lines.append(f"{pad}{name} = {_cs_expr(inst.get('value'), ctx, hint=hint)};")
 
     elif op == 'COMPUTE':
-        left = _cs_value(inst.get('left'))
-        right = _cs_value(inst.get('right'))
         operator = inst.get('operator', '+')
         assign = inst['assign']
+        # For arithmetic, hint operands as decimal by default (AILang's money default).
+        # For comparisons, pull the type from the non-dotted operand when possible.
+        arith_ops = {'+', '-', '*', '/', '%'}
+        cmp_ops = {'==', '!=', '<', '<=', '>', '>=' }
+        hint_left = hint_right = None
+        if operator in arith_ops:
+            hint_left = hint_right = 'decimal'
+        elif operator in cmp_ops:
+            # Simple inference: if one side is a scalar literal, use its type for the other.
+            left_raw, right_raw = inst.get('left'), inst.get('right')
+            def _scalar_hint(x):
+                if isinstance(x, bool): return 'bool'
+                if isinstance(x, int):  return 'int'
+                if isinstance(x, float): return 'decimal'
+                from sexpr_parser import StringLiteral
+                if isinstance(x, StringLiteral): return 'string'
+                return None
+            hint_left = _scalar_hint(right_raw)
+            hint_right = _scalar_hint(left_raw)
+        left = _cs_expr(inst.get('left'), ctx, hint=hint_left)
+        right = _cs_expr(inst.get('right'), ctx, hint=hint_right)
         locals_dict = ctx.setdefault('locals', {})
         if assign in locals_dict:
             lines.append(f"{pad}{assign} = {left} {operator} {right};")
@@ -740,9 +761,12 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
     elif op == 'CONSTRUCT':
         schema = inst['schema']
         fields = inst.get('fields', {})
+        schema_def = (ctx.get('schemas') or {}).get(schema, {})
+        schema_fields = schema_def.get('fields', {})
         parts = []
         for k, v in fields.items():
-            parts.append(f"{pascal_case(k)} = {_cs_value(v)}")
+            field_type = (schema_fields.get(k) or {}).get('type')
+            parts.append(f"{pascal_case(k)} = {_cs_expr(v, ctx, hint=field_type)}")
         body = ", ".join(parts)
         lines.append(f"{pad}var {inst['assign']} = new {schema} {{ {body} }};")
         ctx.setdefault('locals', {})[inst['assign']] = schema
@@ -766,6 +790,68 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
         lines.append(f'{pad}Console.WriteLine($"[{level}] {inst["message"]}");')
 
     return [l for l in lines if l != ""]
+
+
+def _cs_json_cast(expr: str, hint: str) -> str:
+    """Wrap a JsonNode expression with GetValue<T>() for the requested C# type.
+
+    Returns the untouched expression when hint is None or unknown — useful when
+    passing a JsonNode? through to another generic sink (e.g. nested JsonNode
+    access or a helper that already takes JsonNode)."""
+    if not hint:
+        return expr
+    # Hint comes from AILang field type; map to a CLR type the JsonNode API knows.
+    cs_type = {
+        'uuid': 'string',
+        'string': 'string',
+        'int': 'int',
+        'decimal': 'decimal',
+        'bool': 'bool',
+        'timestamp': 'DateTime',
+    }.get(hint)
+    if not cs_type:
+        return expr  # list / object / unknown — leave as JsonNode
+    return f'({expr})!.GetValue<{cs_type}>()'
+
+
+def _cs_resolve_path(expr: str, ctx: dict, hint: str = None) -> str:
+    """Resolve a dotted identifier (`root.a.b`) to the appropriate C# expression.
+
+    - If the root is a JsonNode (set by CALL_SERVICE), emit indexer access
+      (`root["a"]!["b"]!`) and cap with `GetValue<T>()` when a hint is given.
+    - Otherwise fall back to member access with PascalCased segments
+      (the existing typed-record behavior).
+    """
+    if not isinstance(expr, str) or '.' not in expr:
+        return expr
+    parts = expr.split('.')
+    if not parts or not (parts[0] and (parts[0][0].isalpha() or parts[0][0] == '_')):
+        return expr
+    root_type = (ctx.get('locals') or {}).get(parts[0]) if ctx else None
+    if root_type == 'JsonNode':
+        inner = parts[0]
+        for seg in parts[1:]:
+            inner += f'["{seg}"]'
+        # Cap trailing `!` only when reading a leaf value — the hint cast already dereferences.
+        if hint and hint not in ('list', 'object'):
+            return _cs_json_cast(inner, hint)
+        # No hint: caller wants a JsonNode? — stay null-safe, no trailing `!`.
+        return inner
+    # Typed access — same rule as before.
+    return parts[0] + ''.join('.' + pascal_case(p) for p in parts[1:])
+
+
+def _cs_expr(v, ctx: dict = None, hint: str = None) -> str:
+    """Context-aware value formatter. Delegates to _cs_value for scalars/literals
+    but routes dotted identifiers through _cs_resolve_path so JsonNode-typed
+    roots get indexer access instead of pascalized member access."""
+    from sexpr_parser import StringLiteral
+    if ctx and isinstance(v, str) and not isinstance(v, StringLiteral) and '.' in v:
+        # Only treat as identifier if the chars look like one (no quoting etc).
+        s = v
+        if s and (s[0].isalpha() or s[0] == '_') and all(c.isalnum() or c in '_.' for c in s):
+            return _cs_resolve_path(s, ctx, hint)
+    return _cs_value(v)
 
 
 def _cs_value(v) -> str:
@@ -1187,11 +1273,22 @@ def compile_branch_csharp(inst: dict, indent: int, ctx: dict = None) -> list[str
     cases = inst.get('cases', {})
 
     if isinstance(condition, dict):
-        # Both operands go through _cs_value: member access gets PascalCased, string
-        # literals (StringLiteral) get quoted, identifiers pass through.
-        left = _cs_value(condition.get('left', ''))
+        # Phase 3b: dotted identifiers on JsonNode roots become indexer access
+        # (root["k"]!.GetValue<T>()). Type hint inferred from the scalar operand.
+        left_raw = condition.get('left', '')
+        right_raw = condition.get('right', '')
+        def _scalar_hint(x):
+            from sexpr_parser import StringLiteral
+            if isinstance(x, bool): return 'bool'
+            if isinstance(x, int): return 'int'
+            if isinstance(x, float): return 'decimal'
+            if isinstance(x, StringLiteral): return 'string'
+            return None
+        hint_left = _scalar_hint(right_raw)
+        hint_right = _scalar_hint(left_raw)
+        left = _cs_expr(left_raw, ctx, hint=hint_left)
         op = condition.get('op', '==')
-        right = _cs_value(condition.get('right', ''))
+        right = _cs_expr(right_raw, ctx, hint=hint_right)
         cond_str = f"{left} {op} {right}"
     else:
         cond_str = str(condition)
@@ -1572,6 +1669,7 @@ def generate_csharp(bc, output_dir: str):
             'custom_errors': bc.custom_errors,
             'service_refs': service_refs,
             'resilience_policies': policies,
+            'schemas': bc.schemas,  # For Phase 3b — CONSTRUCT uses field types as JsonNode-cast hints.
         }
         for inst in instructions:
             lines.extend(compile_instruction_csharp(inst, 1, ctx))
@@ -3513,6 +3611,7 @@ def generate_handler_go(name: str, handler_def: dict, bc, is_pg: bool = False, p
         'returns': handler_def.get('returns'),
         'store_accessor': 'rt.store',
         'custom_errors': bc.custom_errors if bc else {},
+        'schemas': bc.schemas if bc else {},  # For Phase 3b CONSTRUCT hints
     }
     for inst in instructions:
         lines.extend(compile_instruction_go(inst, 1, ctx))
@@ -3741,13 +3840,30 @@ def compile_instruction_go(inst: dict, indent: int, ctx: dict = None) -> list[st
         lines.extend(_compile_define_var_go(inst, pad, ctx))
 
     elif op == 'SET_VAR':
-        lines.append(f"{pad}{inst['name']} = {_go_value(inst.get('value'))}")
+        name = inst['name']
+        hint = (ctx.get('locals') or {}).get(name)
+        lines.append(f"{pad}{name} = {_go_expr(inst.get('value'), ctx, hint=hint)}")
 
     elif op == 'COMPUTE':
-        left = _go_value(inst.get('left'))
-        right = _go_value(inst.get('right'))
         operator = inst.get('operator', '+')
         assign = inst['assign']
+        arith_ops = {'+', '-', '*', '/', '%'}
+        cmp_ops = {'==', '!=', '<', '<=', '>', '>='}
+        hint_left = hint_right = None
+        if operator in arith_ops:
+            hint_left = hint_right = 'decimal'
+        elif operator in cmp_ops:
+            def _scalar_hint(x):
+                from sexpr_parser import StringLiteral
+                if isinstance(x, bool): return 'bool'
+                if isinstance(x, int): return 'int'
+                if isinstance(x, float): return 'decimal'
+                if isinstance(x, StringLiteral): return 'string'
+                return None
+            hint_left = _scalar_hint(inst.get('right'))
+            hint_right = _scalar_hint(inst.get('left'))
+        left = _go_expr(inst.get('left'), ctx, hint=hint_left)
+        right = _go_expr(inst.get('right'), ctx, hint=hint_right)
         locals_dict = ctx.setdefault('locals', {})
         if assign in locals_dict:
             lines.append(f"{pad}{assign} = {left} {operator} {right}")
@@ -3795,7 +3911,12 @@ def compile_instruction_go(inst: dict, indent: int, ctx: dict = None) -> list[st
     elif op == 'CONSTRUCT':
         schema = inst['schema']
         fields = inst.get('fields', {})
-        parts = [f"{pascal_case(k)}: {_go_value(v)}" for k, v in fields.items()]
+        schema_def = (ctx.get('schemas') or {}).get(schema, {})
+        schema_fields = schema_def.get('fields', {})
+        parts = []
+        for k, v in fields.items():
+            field_type = (schema_fields.get(k) or {}).get('type')
+            parts.append(f"{pascal_case(k)}: {_go_expr(v, ctx, hint=field_type)}")
         body = ", ".join(parts)
         lines.append(f"{pad}{inst['assign']} := {schema}{{{body}}}")
         ctx.setdefault('locals', {})[inst['assign']] = schema
@@ -3823,6 +3944,58 @@ def compile_instruction_go(inst: dict, indent: int, ctx: dict = None) -> list[st
         lines.extend(compile_branch_go(inst, indent, ctx))
 
     return lines
+
+
+def _go_json_cast(expr: str, hint: str) -> str:
+    """Wrap a map-indexer expression with the Go type assertion that matches `hint`.
+
+    JSON decoding via encoding/json produces float64 for all numbers, so int/decimal
+    both start as float64; we just downcast ints with int(). Missing or wrong-type
+    fields produce the zero value of the asserted type — loose, but consistent with
+    how untyped inter-service payloads already behave in idiomatic Go."""
+    if not hint:
+        return expr
+    if hint in ('string', 'uuid'):
+        return f'({expr}).(string)'
+    if hint == 'bool':
+        return f'({expr}).(bool)'
+    if hint == 'int':
+        return f'int(({expr}).(float64))'
+    if hint == 'decimal':
+        return f'({expr}).(float64)'
+    if hint == 'timestamp':
+        return f'({expr}).(string)'  # ISO-8601 string; caller reparses if needed
+    return expr
+
+
+def _go_resolve_path(expr: str, ctx: dict, hint: str = None) -> str:
+    if not isinstance(expr, str) or '.' not in expr:
+        return expr
+    parts = expr.split('.')
+    if not parts or not (parts[0] and (parts[0][0].isalpha() or parts[0][0] == '_')):
+        return expr
+    root_type = (ctx.get('locals') or {}).get(parts[0]) if ctx else None
+    if root_type == 'map':
+        # Nested maps: intermediate segments must assert map[string]any to keep indexing.
+        inner = parts[0]
+        for i, seg in enumerate(parts[1:], start=1):
+            if i < len(parts) - 1:
+                inner = f'{inner}["{seg}"].(map[string]any)'
+            else:
+                inner = f'{inner}["{seg}"]'
+        if hint and hint not in ('list', 'object'):
+            return _go_json_cast(inner, hint)
+        return inner
+    # Typed struct field access
+    return parts[0] + ''.join('.' + pascal_case(p) for p in parts[1:])
+
+
+def _go_expr(v, ctx: dict = None, hint: str = None) -> str:
+    if ctx and isinstance(v, str) and '.' in v:
+        s = v
+        if s and (s[0].isalpha() or s[0] == '_') and all(c.isalnum() or c in '_.' for c in s):
+            return _go_resolve_path(s, ctx, hint)
+    return _go_value(v)
 
 
 def _go_value(v) -> str:
@@ -4219,9 +4392,20 @@ def compile_branch_go(inst: dict, indent: int, ctx: dict = None) -> list[str]:
     condition = inst.get('condition', '')
 
     if isinstance(condition, dict):
-        left = _go_value(condition.get('left', ''))
+        left_raw = condition.get('left', '')
+        right_raw = condition.get('right', '')
+        def _scalar_hint(x):
+            from sexpr_parser import StringLiteral
+            if isinstance(x, bool): return 'bool'
+            if isinstance(x, int): return 'int'
+            if isinstance(x, float): return 'decimal'
+            if isinstance(x, StringLiteral): return 'string'
+            return None
+        hint_left = _scalar_hint(right_raw)
+        hint_right = _scalar_hint(left_raw)
+        left = _go_expr(left_raw, ctx, hint=hint_left)
         op = condition.get('op', '==')
-        right = _go_value(condition.get('right', ''))
+        right = _go_expr(right_raw, ctx, hint=hint_right)
         cond_str = f"{left} {op} {right}"
     else:
         cond_str = str(condition)

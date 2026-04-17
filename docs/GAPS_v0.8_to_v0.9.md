@@ -137,7 +137,9 @@ pero no transpilan a código compilable en C# .NET 10 / Go 1.25.
 | `JsonElement?` | ✅ | ✅ | Bajo | Read-only; requiere `.HasValue` |
 | DTO tipado | ✅✅ | ✅ | Mínimo | Futuro: cuando CALL_SERVICE declare schema en bytecode |
 
-**Patrón de acceso post-OK** (Phase 3b — pendiente):
+**Phase 3b (2026-04-16 — ✅ implementado)**: el codegen ahora trackea vars CALL_SERVICE-asignadas como `JsonNode`/`map[string]any` en `ctx['locals']`. Los call sites de COMPUTE / BRANCH / CONSTRUCT / SET_VAR / MATCH delegan en `_cs_expr` / `_go_expr`, que detectan raíces JsonNode-typed y emiten indexer access (`root["k"]!.GetValue<T>()` en C#, `root["k"].(T)` en Go). El tipo T se infiere del operando escalar (en comparaciones), de la constante numérica por default en aritmética (`decimal`), o del tipo de campo del schema en CONSTRUCT. Validado con `scratch_phase3b.sexpr` — mock HTTP server devuelve `{"id","price","active"}`, el handler computa `price * quantity`, y la respuesta tipada sale con los valores correctos (smoke test en Go).
+
+**Patrón de acceso post-OK** (ejemplo real):
 ```csharp
 JsonNode? product_result = await CallServiceAsync(...);
 if (product_result is null) return ERR;
@@ -148,7 +150,24 @@ var dto = product_result.Deserialize<ProductDto>();
 ```
 
 En Go se mantiene `map[string]any` (idiom estándar, no hay alternativa cleaner).
-El rewrite de `result.field` → `result["field"]` en codegen queda para Phase 3b.
+
+---
+
+## 3. Pendientes conocidos post-Phase 3b
+
+### dashboard_service (parse-only, no builda)
+El parse-time está desbloqueado (commit dc1a4e0), pero construir el service requiere varios gaps de instrucción aparte de Phase 3b:
+- **PARALLEL result plumbing**: los locals dentro de un fiber (p.ej. `products_response`) no fluyen al scope externo tras `AWAIT_ALL`. El acceso correcto es `parallel_results.fetch_products` — requiere reescribir los usos siguientes.
+- **ITERATE sobre JsonNode/map**: `(ITERATE products_response p (COMPUTE p.price * p.stock → …))` necesita que el iterador `p` herede el tipo JsonNode del collection (ahora queda como `object`), y que el wrapper emita `.AsArray()!` en C# / `.([]any)` en Go.
+- **SET_VAR con object literal**: `(SET_VAR products_section "{'total_count': …}")` emite el Python dict repr como string literal — hace falta soportar `(SET_VAR name (object (k v) …))` o similar.
+- **DEFINE_VAR con default object**: mismo problema — el default viene como string.
+- **MATCH con arms enteros**: `(MATCH services_up (3 …) (2 …) …)` no genera un switch; cae en el camino RESULT-style.
+- **COMPUTE widening int↔decimal**: `decimal_field * int_field` falla en Go (`mismatched types float64 and int`). C# lo tolera gracias a conversiones implícitas.
+- **GET_CURRENT dispatch**: hoy `(GET_CURRENT auth user → now)` + `(CONSTRUCT … (generated_at now) …)` emite `now = ctx.User.FindFirst("sub")?.Value`, aunque la intención era `CLOCK.NOW`. Hay que mapear el par `(from field)` a las operaciones correctas.
+
+### pricing_service, payment_service, order_service
+Gaps propios documentados en memoria (topic_key `legacy/per-service-codegen-gaps`); ninguno bloqueado solamente por Phase 3b.
+
 
 ## 3. Orden de prioridad recomendado para v0.9
 
