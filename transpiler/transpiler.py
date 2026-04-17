@@ -867,7 +867,21 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
             item_type = 'JsonNode'
         else:
             lines.append(f"{pad}foreach (var {item} in {coll_expr})")
-            item_type = 'object'
+            # Infer the element type from the collection's schema field.
+            # `body.items` where body is CreateOrderRequest → items is
+            # (list CreateOrderItem) → item is CreateOrderItem (typed record).
+            # Falls back to 'record' (typed but unknown schema) so dotted
+            # access PascalCases instead of dict-indexing.
+            item_type = 'record'
+            if isinstance(collection, str) and '.' in collection:
+                root, _, leaf = collection.rpartition('.')
+                root_first = root.split('.')[0]
+                root_type_name = (ctx.get('locals') or {}).get(root_first)
+                if root_type_name:
+                    schema_def = (ctx.get('schemas') or {}).get(root_type_name, {})
+                    fdef = schema_def.get('fields', {}).get(leaf, {})
+                    if fdef.get('type') == 'list':
+                        item_type = fdef.get('of') or 'record'
         lines.append(f"{pad}{{")
         inner_ctx = dict(ctx)
         inner_ctx['locals'] = dict(ctx.get('locals', {}))
@@ -881,23 +895,24 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
         fields = inst.get('fields', {})
         assign = inst['assign']
         if schema == 'object':
-            # Anonymous object — C# anonymous type (boxed as object).
-            # Bare atoms that aren't known locals are treated as string literals
-            # (the converter emits them unquoted from the JSON source).
+            # Anonymous object emitted as `Dictionary<string, object?>` so
+            # snake_case keys round-trip through JSON without the default
+            # camelCase property-naming policy mangling them. C#'s anonymous
+            # type would PascalCase the members and the serializer would then
+            # lowercase-first them — `product_service` → `productService`.
+            # Bare atoms that aren't known locals are treated as string
+            # literals; nested op-forms (TERNARY, IS_OK) resolve inline.
             known = (ctx.get('locals') or {})
             parts = []
             for k, v in fields.items():
-                val = _cs_expr(v, ctx)
-                if isinstance(v, str) and v not in known and not v.startswith('"') and '.' not in v:
-                    try: float(v)  # keep numbers
-                    except ValueError: val = f'"{v}"'
-                parts.append(f"{pascal_case(k)} = {val}")
+                val = _cs_construct_object_value(v, ctx, known)
+                parts.append(f'["{k}"] = {val}')
             body = ", ".join(parts)
             locals_dict = ctx.setdefault('locals', {})
             if assign in locals_dict:
-                lines.append(f"{pad}{assign} = (object)new {{ {body} }};")
+                lines.append(f"{pad}{assign} = new Dictionary<string, object?> {{ {body} }};")
             else:
-                lines.append(f"{pad}object {assign} = new {{ {body} }};")
+                lines.append(f"{pad}object {assign} = new Dictionary<string, object?> {{ {body} }};")
                 locals_dict[assign] = 'object'
         else:
             schema_def = (ctx.get('schemas') or {}).get(schema, {})
@@ -910,11 +925,17 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
             for k, v in fields.items():
                 fdef = schema_fields.get(k) or {}
                 field_type = fdef.get('type')
-                val = _cs_expr(v, ctx, hint=field_type)
-                if field_type in ('enum', 'string') and isinstance(v, str):
+                # Nested `object`-typed field with a pair-list value → emit as
+                # Dictionary<string, object?>. Mirrors the schema=='object' path.
+                if field_type == 'object' and isinstance(v, list) and v:
                     known = (ctx.get('locals') or {})
-                    if v not in known and not v.startswith('"') and '.' not in v:
-                        val = f'"{v}"'
+                    val = _cs_construct_object_value(v, ctx, known)
+                else:
+                    val = _cs_expr(v, ctx, hint=field_type)
+                    if field_type in ('enum', 'string') and isinstance(v, str):
+                        known = (ctx.get('locals') or {})
+                        if v not in known and not v.startswith('"') and '.' not in v:
+                            val = f'"{v}"'
                 parts.append(f"{pascal_case(k)} = {val}")
             body = ", ".join(parts)
             lines.append(f"{pad}var {assign} = new {schema} {{ {body} }};")
@@ -1011,14 +1032,69 @@ def _cs_resolve_path(expr: str, ctx: dict, hint: str = None) -> str:
             return _cs_json_cast(inner, hint)
         # No hint: caller wants a JsonNode? — stay null-safe, no trailing `!`.
         return inner
-    # Object-typed vars (from CONSTRUCT object) need dynamic access in C#.
+    # Object-typed vars (from CONSTRUCT object, now emitted as
+    # `Dictionary<string, object?>`) use indexer access so snake_case keys
+    # work and no RuntimeBinder lookup is needed. `((IDictionary<…>)root)["k"]`
+    # returns object?; a string/numeric hint adds the appropriate cast.
     if root_type == 'object':
-        inner = f"((dynamic){parts[0]})"
+        inner = parts[0]
         for p in parts[1:]:
-            inner += f".{pascal_case(p)}"
+            inner = f'((System.Collections.Generic.IDictionary<string, object?>){inner})["{p}"]'
+        if hint in ('string', 'enum', 'uuid'):
+            return f'((string?){inner})'
+        if hint == 'bool':
+            return f'((bool)({inner} ?? false))'
+        if hint == 'int':
+            return f'Convert.ToInt32({inner})'
+        if hint == 'decimal':
+            return f'Convert.ToDecimal({inner})'
         return inner
     # Typed access — same rule as before.
     return parts[0] + ''.join('.' + pascal_case(p) for p in parts[1:])
+
+
+def _cs_construct_object_value(v, ctx: dict, known: dict) -> str:
+    """Render a CONSTRUCT-object field value as a C# expression.
+
+    Scalars and identifiers fall through to _cs_expr with string-atom quoting
+    (same behavior the old emitter had). A list-of-pairs whose first pair is
+    `['op', 'TERNARY']` or `['op', 'IS_OK']` is an inline op form captured by
+    the sexpr parser — rebuild the op dict and emit the expression directly so
+    the enclosing object literal doesn't need a separate statement.
+    """
+    # Pair-list: either an inline op form or a plain nested object. If the
+    # first key is `op`, treat as an inline TERNARY/IS_OK expression. Else
+    # emit as `Dictionary<string, object?>` so snake_case keys round-trip.
+    if isinstance(v, list) and v and all(isinstance(p, list) and len(p) >= 2 for p in v):
+        op_dict = {}
+        for pair in v:
+            key = str(pair[0])
+            op_dict[key] = pair[1] if len(pair) == 2 else pair[1:]
+        if op_dict.get('op') == 'TERNARY':
+            cond_expr = _cs_construct_object_value(op_dict.get('condition'), ctx, known)
+            then_expr = _cs_construct_object_value(op_dict.get('true'), ctx, known)
+            else_expr = _cs_construct_object_value(op_dict.get('false'), ctx, known)
+            return f'({cond_expr} ? (object){then_expr} : (object){else_expr})'
+        if op_dict.get('op') == 'IS_OK':
+            left = op_dict.get('left') or op_dict.get('value')
+            left_expr = _cs_construct_object_value(left, ctx, known)
+            return f'({left_expr} is not null)'
+        # Plain nested object — emit as Dictionary.
+        parts = []
+        for pair in v:
+            k = str(pair[0])
+            inner_val = pair[1] if len(pair) == 2 else pair[1:]
+            parts.append(f'["{k}"] = {_cs_construct_object_value(inner_val, ctx, known)}')
+        return 'new Dictionary<string, object?> { ' + ', '.join(parts) + ' }'
+    # Scalar / identifier path.
+    val = _cs_expr(v, ctx)
+    if isinstance(v, str) and v not in known and not v.startswith('"') and '.' not in v:
+        try:
+            float(v)
+        except ValueError:
+            if v.lower() not in ('true', 'false', 'null', 'nil'):
+                val = f'"{v}"'
+    return val
 
 
 def _cs_expr(v, ctx: dict = None, hint: str = None) -> str:
@@ -1314,10 +1390,11 @@ def _compile_await_all_csharp(inst: dict, indent: int, ctx: dict) -> list[str]:
     lines.append(f"{pad}{{")
     lines.append(f'{pad}    Console.WriteLine($"[PARALLEL] {source} timed out after {timeout_ms}ms — partial results");')
     lines.append(f"{pad}}}")
-    # Build the tuple. Named-tuple fields match fiber names verbatim so the
-    # member-access idiom `parallel_results.fetch_products` just works.
+    # Build the tuple. Tuple fields use PascalCase so member access via
+    # `_cs_resolve_path` (which PascalCases dotted segments) hits them — e.g.
+    # `parallel_results.fetch_products` → `parallel_results.FetchProducts`.
     tuple_fields = ", ".join(
-        f"{fname}: ({tv}.Status == TaskStatus.RanToCompletion ? {tv}.Result : null)"
+        f"{pascal_case(fname)}: ({tv}.Status == TaskStatus.RanToCompletion ? {tv}.Result : null)"
         for fname, tv, _ in fibers
     )
     lines.append(f"{pad}var {source} = ({tuple_fields});")
@@ -1442,30 +1519,34 @@ def compile_error_csharp(inst: dict, pad: str) -> list[str]:
 def compile_match_csharp(inst: dict, indent: int, ctx: dict = None) -> list[str]:
     """Compile MATCH instruction to C# if/else.
 
-    The value is used verbatim — C# tuples permit snake_case field names, so
-    `parallel_results.fetch_products` already resolves correctly. Only Go
-    requires PascalCasing of trailing segments (struct fields must be exported).
-
     Phase 7b: when matching `{source}.{fiber}` and the source is a PARALLEL
     result, the OK branch rebinds the fiber's in-fiber result_var to the tuple
     field so downstream body code (which was written against the fiber-local
     name) still resolves. Also registers the rebound name as JsonNode.
+
+    PARALLEL tuples now use PascalCased field names, so dotted accesses on a
+    parallel-result root must PascalCase the fiber segment too.
     """
     pad = "    " * indent
     lines = []
-    value = inst['value']
+    value_raw = inst['value']
     cases = inst.get('cases', {})
 
     # Detect PARALLEL-result MATCH: lookup in ctx['_parallel_tasks'] by source name.
     rebind_stmt = None
     rebind_var = None
-    if isinstance(value, str) and '.' in value:
-        source, _, fname = value.partition('.')
+    value = value_raw
+    if isinstance(value_raw, str) and '.' in value_raw:
+        source, _, fname = value_raw.partition('.')
         fibers = ((ctx or {}).get('_parallel_tasks') or {}).get(source) or []
         for fn, _tv, rv in fibers:
             if fn == fname and rv:
                 rebind_var = rv
-                rebind_stmt = f"var {rv} = {value};"
+                # Access the tuple via PascalCased field (tuple_fields now
+                # PascalCases every fiber name).
+                pc_value = f"{source}.{pascal_case(fname)}"
+                value = pc_value
+                rebind_stmt = f"var {rv} = {pc_value};"
                 break
 
     if 'OK' in cases and ('NONE' in cases or 'ERR' in cases):
@@ -5614,10 +5695,15 @@ def _mock_body_to_json(body) -> str:
     - List of `['item', …]` forms → JSON array (each item's children are
       (key value) pairs emitted as an object).
     - List of `(key value)` pairs → JSON object.
-    - None / empty → `"{}"` (caller picks array/object context elsewhere if needed).
+    - None / empty → `"[]"`. Empty mock bodies are most commonly list-endpoint
+      responses (GET /products, /orders, /payments); defaulting to an empty
+      array lets downstream handlers that call `AsArray()`/ITERATE not crash.
+      Tests that need an empty object can write `(body)` → currently parses
+      as empty list, same result; or explicit scalars / pair-lists still
+      produce an object.
     """
     if not body:
-        return "{}"
+        return "[]"
     # Detect array shape: any top-level 'item' form marks this body as an array.
     if any(isinstance(b, list) and b and b[0] == 'item' for b in body):
         elements = []
@@ -5962,9 +6048,9 @@ def generate_csharp_tests(bc, main_output_dir: str):
         # configured in Program.cs still runs on top of the canned transport.
         lines.append("internal sealed class MockHttpHandler : HttpMessageHandler")
         lines.append("{")
-        lines.append("    private readonly (string Method, string Path, int Status, string Body)[] _rules;")
-        lines.append("    public MockHttpHandler((string, string, int, string)[] rules) { _rules = rules; }")
-        lines.append("    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)")
+        lines.append("    private readonly (string Method, string Path, int DelayMs, int Status, string Body)[] _rules;")
+        lines.append("    public MockHttpHandler((string, string, int, int, string)[] rules) { _rules = rules; }")
+        lines.append("    protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)")
         lines.append("    {")
         lines.append("        var method = request.Method.Method;")
         lines.append("        var path = request.RequestUri!.AbsolutePath;")
@@ -5972,12 +6058,13 @@ def generate_csharp_tests(bc, main_output_dir: str):
         lines.append("        {")
         lines.append("            if (rule.Method == method && rule.Path == path)")
         lines.append("            {")
+        lines.append("                if (rule.DelayMs > 0) await Task.Delay(rule.DelayMs, cancellationToken);")
         lines.append("                var resp = new HttpResponseMessage((HttpStatusCode)rule.Status);")
         lines.append('                resp.Content = new StringContent(rule.Body, Encoding.UTF8, "application/json");')
-        lines.append("                return Task.FromResult(resp);")
+        lines.append("                return resp;")
         lines.append("            }")
         lines.append("        }")
-        lines.append("        return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));")
+        lines.append("        return new HttpResponseMessage(HttpStatusCode.NotFound);")
         lines.append("    }")
         lines.append("}")
         lines.append("")
@@ -6043,18 +6130,16 @@ def generate_csharp_tests(bc, main_output_dir: str):
                 for ep in endpoints:
                     body_json = _mock_body_to_json(ep.get('body'))
                     body_escaped = body_json.replace('\\', '\\\\').replace('"', '\\"')
-                    rules_cs.append(f'("{ep["method"]}", "{ep["path"]}", {ep["status"]}, "{body_escaped}")')
+                    delay_ms = ep.get('delay_ms', 0) or 0
+                    rules_cs.append(f'("{ep["method"]}", "{ep["path"]}", {delay_ms}, {ep["status"]}, "{body_escaped}")')
                 rules_join = ",\n                        ".join(rules_cs)
                 lines.append(f'                services.AddHttpClient("{svc}")')
-                lines.append("                    .ConfigurePrimaryHttpMessageHandler(() => new MockHttpHandler(new (string, string, int, string)[]")
+                lines.append("                    .ConfigurePrimaryHttpMessageHandler(() => new MockHttpHandler(new (string, string, int, int, string)[]")
                 lines.append("                    {")
                 lines.append("                        " + rules_join)
                 lines.append("                    }));")
-                # Also override the _no_retry sibling if the main codegen registered one
-                # (resilience policies with retry emit it). Safe to always register — if
-                # the service has no such client, AddHttpClient just creates it harmlessly.
                 lines.append(f'                services.AddHttpClient("{svc}_no_retry")')
-                lines.append("                    .ConfigurePrimaryHttpMessageHandler(() => new MockHttpHandler(new (string, string, int, string)[]")
+                lines.append("                    .ConfigurePrimaryHttpMessageHandler(() => new MockHttpHandler(new (string, string, int, int, string)[]")
                 lines.append("                    {")
                 lines.append("                        " + rules_join)
                 lines.append("                    }));")

@@ -491,6 +491,7 @@ class SExprBytecodeParser:
                         response_prop = find_prop(ep, 'response')
                         status = 200
                         body = None
+                        delay_ms = 0
                         if response_prop:
                             status_p = find_prop(response_prop, 'status')
                             if status_p:
@@ -500,11 +501,16 @@ class SExprBytecodeParser:
                             if body_p:
                                 # body may be a list of (item …) for arrays, or pairs for a single object.
                                 body = body_p[1:]
+                            delay_p = find_prop(response_prop, 'delay_ms')
+                            if delay_p:
+                                try: delay_ms = int(delay_p[1])
+                                except (TypeError, ValueError): pass
                         endpoints.append({
                             'method': str(method_prop[1]).upper() if method_prop else 'GET',
                             'path': str(path_prop[1]) if path_prop else '/',
                             'status': status,
                             'body': body,
+                            'delay_ms': delay_ms,
                         })
                     mocks[svc_name] = endpoints
             else:
