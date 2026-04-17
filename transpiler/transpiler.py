@@ -533,16 +533,21 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
         locals_dict = ctx.setdefault('locals', {})
         data_type = locals_dict.get(data)
         store_schema = (ctx.get('store_def') or {}).get('schema', '')
-        # Pass-through only for in-memory stores. PG stores must call Insert
-        # so auto-gen columns (id, timestamps) round-trip through the DB.
-        if not is_pg and data_type == store_schema and data_type:
-            if assign == data:
-                pass
-            elif assign in locals_dict:
-                lines.append(f"{pad}{assign} = {data};")
-            else:
-                lines.append(f"{pad}var {assign} = {data};")
-                locals_dict[assign] = data_type
+        # When `data` is already a full entity (from CONSTRUCT of the store's
+        # schema), the store's Insert(Dto) won't accept it. For in-memory
+        # stores, call Seed() to persist the full entity as-is (keeps the
+        # caller-supplied PK). READ_BODY-result DTOs share the same locals
+        # registration but are flagged in `_dto_vars` — route those through
+        # the regular Insert(dto) path. PG always calls Insert.
+        dto_vars = ctx.get('_dto_vars') or set()
+        if not is_pg and data_type == store_schema and data_type and data not in dto_vars:
+            lines.append(f"{pad}{store_var}.Seed(new[] {{ {data} }});")
+            if assign != data:
+                if assign in locals_dict:
+                    lines.append(f"{pad}{assign} = {data};")
+                else:
+                    lines.append(f"{pad}var {assign} = {data};")
+                    locals_dict[assign] = data_type
         elif is_pg:
             lines.append(f"{pad}var {assign} = await {store_var}.InsertAsync({data});")
             locals_dict[assign] = store_schema
@@ -564,7 +569,6 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
         store_schema = (ctx.get('store_def') or {}).get('schema', 'object')
         schema_def = (ctx.get('schemas') or {}).get(store_schema, {})
         schema_fields = schema_def.get('fields', {})
-        # Dotted keys (e.g. payment.id) need PascalCased struct access.
         key_expr = _cs_expr(key, ctx)
         update_parts = []
         for f, v in fields.items():
@@ -576,9 +580,9 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
                     val = f'"{v}"'
             update_parts.append(f'{pascal_case(f)} = {val}')
         updates = ", ".join(update_parts)
-        # Find existing → clone with `with { }` → re-save. Re-declare the local
-        # only when it doesn't exist yet — otherwise we'd shadow / double-declare
-        # (repeat STORE_UPDATE_FIELDS to the same assign are common in sagas).
+        # Find existing → clone with `with { }` → persist via Seed() so the
+        # record stays in the store for any follow-up STORE_UPDATE_FIELDS /
+        # STORE_FIND in the same handler.
         locals_dict = ctx.setdefault('locals', {})
         if assign and assign not in locals_dict:
             lines.append(f"{pad}{store_schema}? {assign} = null;")
@@ -588,8 +592,7 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
         lines.append(f"{pad}    if (_existing != null)")
         lines.append(f"{pad}    {{")
         lines.append(f"{pad}        var _updated = _existing with {{ {updates} }};")
-        lines.append(f"{pad}        {store_var}.Delete({key_expr});")
-        lines.append(f"{pad}        // TODO: proper update path; for now delete+re-insert with updated copy")
+        lines.append(f"{pad}        {store_var}.Seed(new[] {{ _updated }});")
         if assign:
             lines.append(f"{pad}        {assign} = _updated;")
         lines.append(f"{pad}    }}")
@@ -672,6 +675,10 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
         lines.append(f"{pad}    var _verr = {assign}.Validate();")
         lines.append(f"{pad}    if (_verr != null) return Results.BadRequest(_verr);")
         lines.append(f"{pad}}}")
+        # Track as DTO so STORE_INSERT pass-through skips it. Also register
+        # schema so BRANCH field-type lookups work.
+        ctx.setdefault('locals', {})[assign] = schema
+        ctx.setdefault('_dto_vars', set()).add(assign)
 
     elif op == 'RESPOND':
         status = inst.get('status', 200)
@@ -750,9 +757,34 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
         has_retry = bool(policy and policy.get('retry'))
         client_name = f"{service}_no_retry" if (has_retry and not idempotent) else service
 
-        lines.append(
-            f'{pad}System.Text.Json.Nodes.JsonNode? {assign} = await CallServiceAsync(httpClientFactory, "{client_name}", "{method}", {path_expr}, {body_expr});'
-        )
+        # When the service has a resilience policy AND we're at handler scope
+        # (not inside a PARALLEL fiber), surface Polly-specific failures
+        # (timeout / circuit-open) as 504 / 503 before the MATCH step kicks
+        # in. Inside a fiber the return type is `Task<JsonNode?>` so IResult
+        # can't be returned — swallow the exception as null and let the outer
+        # AWAIT_ALL + MATCH NONE arm decide (graceful degradation).
+        in_fiber = ctx.get('_in_parallel_fiber', False)
+        if policy and not in_fiber:
+            lines.append(f'{pad}System.Text.Json.Nodes.JsonNode? {assign};')
+            lines.append(f'{pad}try')
+            lines.append(f'{pad}{{')
+            lines.append(
+                f'{pad}    {assign} = await CallServiceAsync(httpClientFactory, "{client_name}", "{method}", {path_expr}, {body_expr});'
+            )
+            lines.append(f'{pad}}}')
+            lines.append(f'{pad}catch (Polly.Timeout.TimeoutRejectedException)')
+            lines.append(f'{pad}{{ return Results.Json(AiLangError.Timeout("{service}"), statusCode: 504); }}')
+            lines.append(f'{pad}catch (Polly.CircuitBreaker.BrokenCircuitException)')
+            lines.append(f'{pad}{{ return Results.Json(AiLangError.Unavailable("{service}"), statusCode: 503); }}')
+        elif policy and in_fiber:
+            lines.append(f'{pad}System.Text.Json.Nodes.JsonNode? {assign} = null;')
+            lines.append(f'{pad}try {{ {assign} = await CallServiceAsync(httpClientFactory, "{client_name}", "{method}", {path_expr}, {body_expr}); }}')
+            lines.append(f'{pad}catch (Polly.Timeout.TimeoutRejectedException) {{ /* fiber: null → MATCH NONE */ }}')
+            lines.append(f'{pad}catch (Polly.CircuitBreaker.BrokenCircuitException) {{ /* fiber: null → MATCH NONE */ }}')
+        else:
+            lines.append(
+                f'{pad}System.Text.Json.Nodes.JsonNode? {assign} = await CallServiceAsync(httpClientFactory, "{client_name}", "{method}", {path_expr}, {body_expr});'
+            )
         ctx.setdefault('locals', {})[assign] = 'JsonNode'
 
     elif op == 'MATCH':
@@ -948,10 +980,14 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
         if from_ == 'auth' and field == 'user':
             lines.append(f'{pad}var {assign} = ctx.User.FindFirst("sub")?.Value ?? "";')
         elif from_ == 'clock' and field == 'now':
-            lines.append(f"{pad}var {assign} = DateTime.UtcNow;")
-        elif from_ == 'clock' and field in ('today', 'day_of_week'):
-            call = 'DateTime.UtcNow.Date' if field == 'today' else 'DateTime.UtcNow.DayOfWeek.ToString().ToLower()'
-            lines.append(f"{pad}var {assign} = {call};")
+            lines.append(f"{pad}var {assign} = clock.UtcNow();")
+            ctx.setdefault('locals', {})[assign] = 'timestamp'
+        elif from_ == 'clock' and field == 'today':
+            lines.append(f"{pad}var {assign} = clock.Today();")
+            ctx.setdefault('locals', {})[assign] = 'timestamp'
+        elif from_ == 'clock' and field == 'day_of_week':
+            lines.append(f"{pad}var {assign} = clock.DayOfWeek();")
+            ctx.setdefault('locals', {})[assign] = 'day_of_week'
         else:
             lines.append(f"{pad}var {assign} = default!;  // GET_CURRENT {from_}.{field} (unsupported)")
 
@@ -1349,6 +1385,12 @@ def _compile_parallel_csharp(inst: dict, indent: int, ctx: dict) -> list[str]:
         lines.append(f"{pad}{{")
         inner_ctx = dict(ctx)
         inner_ctx['locals'] = dict(ctx.get('locals', {}))
+        # Inside a fiber body the return type is `Task<JsonNode?>`, so the
+        # enclosing handler's IResult shortcuts don't apply. Mark the ctx so
+        # CALL_SERVICE emits the plain call without a 504/503 short-circuit —
+        # the fiber swallows the exception and the outer MATCH NONE arm on
+        # the fiber's result handles graceful degradation instead.
+        inner_ctx['_in_parallel_fiber'] = True
         for f_inst in fiber.get('instructions', []):
             lines.extend(compile_instruction_csharp(f_inst, indent + 1, inner_ctx))
         if result_var:
@@ -1799,6 +1841,15 @@ def generate_csharp(bc, output_dir: str):
     service_refs = {n: d for n, d in (bc.dependencies or {}).items() if d.get('type') == 'SERVICE_REF'}
     policies = (bc.resilience or {}).get('policies', {}) or {}
 
+    # Register one CircuitBreakerManualControl per policy so tests (and any
+    # admin tooling) can `.IsolateAsync()` to force a circuit open. Keyed by
+    # policy name so the generated pipeline can resolve its own control.
+    for policy_name, policy in policies.items():
+        if policy.get('circuit_breaker'):
+            lines.append(f'builder.Services.AddKeyedSingleton<Polly.CircuitBreaker.CircuitBreakerManualControl>("{policy_name}", (_, _) => new Polly.CircuitBreaker.CircuitBreakerManualControl());')
+    if any(p.get('circuit_breaker') for p in policies.values()):
+        lines.append("")
+
     def _emit_http_client(svc_name, svc_def, policy, include_retry):
         env_var = svc_def.get('base_url_ref', '').replace('ENV.', '') or 'UNSET'
         default_url = svc_def.get('default', 'http://localhost')
@@ -1853,6 +1904,29 @@ def generate_csharp(bc, output_dir: str):
     if uses_events_cs:
         lines.append("// ── DI: in-process event bus ──")
         lines.append("builder.Services.AddSingleton<IEventBus, InMemoryEventBus>();")
+        lines.append("")
+
+    # IAiLangClock — injected when handlers call GET_CURRENT from=clock. Tests
+    # can swap in FakeAiLangClock via (override_time …) to fix DayOfWeek/UtcNow.
+    def _handler_uses_clock(h):
+        def _w(insts):
+            for i in insts:
+                if not isinstance(i, dict):
+                    continue
+                if i.get('op') == 'GET_CURRENT' and i.get('from') == 'clock':
+                    return True
+                if isinstance(i.get('body'), list) and _w(i['body']):
+                    return True
+                if isinstance(i.get('cases'), dict):
+                    for v in i['cases'].values():
+                        if isinstance(v, list) and _w(v):
+                            return True
+            return False
+        return _w(h.get('instructions', []))
+    uses_clock_cs = any(_handler_uses_clock(h) for h in bc.handlers.values())
+    if uses_clock_cs:
+        lines.append("// ── DI: IAiLangClock (swap with FakeAiLangClock in tests) ──")
+        lines.append("builder.Services.AddSingleton<IAiLangClock, SystemAiLangClock>();")
         lines.append("")
 
     # CORS
@@ -1995,6 +2069,25 @@ def generate_csharp(bc, output_dir: str):
         uses_emit_event = 'EMIT_EVENT' in all_ops
         if uses_emit_event:
             lambda_params.append("IEventBus eventBus")
+        # GET_CURRENT clock.* → IAiLangClock so tests can substitute a fake
+        # via (override_time …). Injected only when the handler references it.
+        def _walk_for_clock(insts):
+            for i in insts:
+                if not isinstance(i, dict):
+                    continue
+                if i.get('op') == 'GET_CURRENT' and i.get('from') == 'clock':
+                    return True
+                for k in ('body',):
+                    if isinstance(i.get(k), list) and _walk_for_clock(i[k]):
+                        return True
+                if isinstance(i.get('cases'), dict):
+                    for v in i['cases'].values():
+                        if isinstance(v, list) and _walk_for_clock(v):
+                            return True
+            return False
+        uses_clock = _walk_for_clock(instructions)
+        if uses_clock:
+            lambda_params.append("IAiLangClock clock")
 
         param_str = ", ".join(lambda_params)
         is_async = is_pg or needs_body or uses_call_service or any(
@@ -2118,6 +2211,9 @@ def generate_csharp(bc, output_dir: str):
     if uses_events_cs:
         lines.append("")
         lines.extend(generate_event_bus_csharp())
+    if uses_clock_cs:
+        lines.append("")
+        lines.extend(generate_clock_csharp())
 
     with open(os.path.join(output_dir, "Program.cs"), 'w') as f:
         f.write('\n'.join(lines))
@@ -2381,6 +2477,39 @@ def _emit_event_handler_csharp(handler_name: str, handler_def: dict, bc) -> list
     return lines
 
 
+def generate_clock_csharp() -> list[str]:
+    """IAiLangClock + SystemAiLangClock (default) + FakeAiLangClock (test seam).
+
+    Tests register FakeAiLangClock via `(override_time (day_of_week X))` /
+    `(override_time (now "ISO-8601"))` so `GET_CURRENT clock.*` returns a
+    deterministic value. DayOfWeek is lowercased to match AILang enum atoms.
+    """
+    return [
+        "public interface IAiLangClock",
+        "{",
+        "    DateTime UtcNow();",
+        "    DateTime Today();",
+        "    string DayOfWeek();  // lowercased: \"monday\" .. \"sunday\"",
+        "}",
+        "",
+        "public sealed class SystemAiLangClock : IAiLangClock",
+        "{",
+        "    public DateTime UtcNow() => DateTime.UtcNow;",
+        "    public DateTime Today() => DateTime.UtcNow.Date;",
+        "    public string DayOfWeek() => DateTime.UtcNow.DayOfWeek.ToString().ToLowerInvariant();",
+        "}",
+        "",
+        "public sealed class FakeAiLangClock : IAiLangClock",
+        "{",
+        "    public DateTime FixedNow { get; set; } = DateTime.UtcNow;",
+        "    public string? FixedDayOfWeek { get; set; }",
+        "    public DateTime UtcNow() => FixedNow;",
+        "    public DateTime Today() => FixedNow.Date;",
+        "    public string DayOfWeek() => FixedDayOfWeek ?? FixedNow.DayOfWeek.ToString().ToLowerInvariant();",
+        "}",
+    ]
+
+
 def generate_event_bus_csharp() -> list[str]:
     """Emit IEventBus + InMemoryEventBus (fire-and-forget, per-subscriber Task)."""
     return [
@@ -2429,8 +2558,15 @@ def generate_resilience_handler_csharp(policy: dict, include_retry: bool, indent
     """
     pad = "    " * indent
     handler = f"{policy['name']}{'' if include_retry else '_no_retry'}"
-    lines = [f'{pad}.AddResilienceHandler("{handler}", b =>', f"{pad}{{"]
     cb = policy.get('circuit_breaker')
+    # The `(builder, context)` overload exposes ServiceProvider via ctx, which
+    # we need when a circuit breaker is present to resolve the per-policy
+    # CircuitBreakerManualControl.
+    if cb:
+        lines = [f'{pad}.AddResilienceHandler("{handler}", (b, _ctx) =>', f"{pad}{{"]
+        lines.append(f'{pad}    var _manual_{policy["name"]} = _ctx.ServiceProvider.GetKeyedService<Polly.CircuitBreaker.CircuitBreakerManualControl>("{policy["name"]}");')
+    else:
+        lines = [f'{pad}.AddResilienceHandler("{handler}", b =>', f"{pad}{{"]
     if cb:
         lines.append(f"{pad}    b.AddCircuitBreaker(new Polly.CircuitBreaker.CircuitBreakerStrategyOptions<HttpResponseMessage>")
         lines.append(f"{pad}    {{")
@@ -2441,6 +2577,7 @@ def generate_resilience_handler_csharp(policy: dict, include_retry: bool, indent
         lines.append(f"{pad}        ShouldHandle = new Polly.PredicateBuilder<HttpResponseMessage>()")
         lines.append(f"{pad}            .Handle<HttpRequestException>()")
         lines.append(f"{pad}            .HandleResult(r => (int)r.StatusCode >= 500),")
+        lines.append(f'{pad}        ManualControl = _manual_{policy["name"]},')
         lines.append(f"{pad}    }});")
     retry = policy.get('retry')
     if retry and include_retry:
@@ -2494,11 +2631,19 @@ def generate_service_client_csharp() -> list[str]:
         "    {",
         "        req.Content = System.Net.Http.Json.JsonContent.Create(body);",
         "    }",
-        "    using var resp = await client.SendAsync(req);",
-        "    if (!resp.IsSuccessStatusCode) return null;",
-        "    var json = await resp.Content.ReadAsStringAsync();",
-        "    if (string.IsNullOrWhiteSpace(json)) return null;",
-        "    return System.Text.Json.Nodes.JsonNode.Parse(json);",
+        "    try",
+        "    {",
+        "        using var resp = await client.SendAsync(req);",
+        "        if (!resp.IsSuccessStatusCode) return null;",
+        "        var json = await resp.Content.ReadAsStringAsync();",
+        "        if (string.IsNullOrWhiteSpace(json)) return null;",
+        "        return System.Text.Json.Nodes.JsonNode.Parse(json);",
+        "    }",
+        "    // Polly-specific exceptions propagate so the caller can map them to",
+        "    // 504/503 via the AiLangError.Timeout / Unavailable factories.",
+        "    catch (Polly.Timeout.TimeoutRejectedException) { throw; }",
+        "    catch (Polly.CircuitBreaker.BrokenCircuitException) { throw; }",
+        "    catch (Exception) { return null; }  // Everything else — treat as upstream NONE.",
         "}",
     ]
 
@@ -2864,6 +3009,10 @@ def generate_error_model_csharp(custom_errors: dict) -> list[str]:
          'new() { Type = "INVALID_PARAM", Field = name, Message = $"parameter {name} must be {expected}" }'),
         ("Unavailable", [("service", "string")], "UNAVAILABLE",
          'new() { Type = "UNAVAILABLE", Message = $"service {service} is unavailable" }'),
+        ("Timeout", [("service", "string")], "TIMEOUT",
+         'new() { Type = "TIMEOUT", Message = $"service {service} timed out" }'),
+        ("Internal", [("detail", "string")], "INTERNAL",
+         'new() { Type = "INTERNAL", Message = detail }'),
     ]
 
     for name, params, _, init in errors:
@@ -4259,9 +4408,11 @@ def compile_instruction_go(inst: dict, indent: int, ctx: dict = None) -> list[st
         lines.append(f"{pad}}}")
         # Enforce the AILang contract: schema validations run automatically after READ_BODY.
         lines.append(f"{pad}if _verr := {assign}.Validate(); _verr != nil {{ respondError(w, _verr); return }}")
-        # Register the body as the base schema so BRANCH field-type lookups hit
-        # `schemas[schema]` (DTO is a subset with the same-typed fields).
+        # Register as the base schema so BRANCH field-type lookups hit
+        # `schemas[schema]`. Track DTO-ness separately so STORE_INSERT
+        # pass-through (which requires the full entity) doesn't misfire.
         ctx.setdefault('locals', {})[assign] = schema
+        ctx.setdefault('_dto_vars', set()).add(assign)
 
     elif op == 'STORE_LIST_ALL':
         assign = inst['assign']
@@ -4308,17 +4459,21 @@ def compile_instruction_go(inst: dict, indent: int, ctx: dict = None) -> list[st
         locals_dict = ctx.setdefault('locals', {})
         data_type = locals_dict.get(data)
         store_schema = (ctx.get('store_def') or {}).get('schema', '')
-        # Pass-through (skip Insert call) only for in-memory stores where the
-        # full entity is already built via CONSTRUCT. For PG we MUST go
-        # through the DB so auto-gen columns (id, timestamps) come back.
-        if not is_pg and data_type == store_schema and data_type:
-            if assign == data:
-                pass  # `STORE_INSERT store payment → payment` is a no-op.
-            elif assign in locals_dict:
-                lines.append(f"{pad}{assign} = {data}")
-            else:
-                lines.append(f"{pad}{assign} := {data}")
-                locals_dict[assign] = data_type
+        store_schema_go = ailang_type_to_go(store_schema) if store_schema else store_schema
+        # In-memory store with a full entity (from CONSTRUCT) → persist via
+        # Seed() so the PK stays caller-supplied. READ_BODY-result DTOs look
+        # the same in locals but are actually `{Schema}CreateDTO` in Go —
+        # the `_dto_vars` marker keeps them out of this branch and routes
+        # them through normal `store.Insert(dto)`.
+        dto_vars = ctx.get('_dto_vars') or set()
+        if not is_pg and data_type == store_schema and data_type and data not in dto_vars:
+            lines.append(f"{pad}{store}.Seed([]{store_schema_go}{{{data}}})")
+            if assign != data:
+                if assign in locals_dict:
+                    lines.append(f"{pad}{assign} = {data}")
+                else:
+                    lines.append(f"{pad}{assign} := {data}")
+                    locals_dict[assign] = data_type
         elif is_pg:
             decl = '=' if assign in locals_dict else ':='
             lines.append(f"{pad}{assign}, err {decl} {store}.Insert(ctx, {data})")
@@ -5567,15 +5722,23 @@ def _cs_seed_object(pairs: list, schema_name: str, schemas: dict) -> str:
         fdef = fields.get(key, {})
         ftype = fdef.get('type')
         prop = pascal_case(key)
-        # Nested list: collect `(item …)` children, render as List<Elem>.
+        # Nested list: collect `(item …)` children → List<Elem> of objects;
+        # or bare scalar children → List<scalar> (e.g. `(customer_types
+        # wholesale)` or `(customer_types wholesale premium)`).
         if ftype == 'list':
             elem_schema = fdef.get('of') or 'object'
-            elems = [p for p in pair[1:] if isinstance(p, list) and p and p[0] == 'item']
-            if elems:
-                inner = ", ".join(_cs_seed_object(p[1:], elem_schema, schemas) for p in elems)
+            elem_go_like = ailang_type_to_csharp(elem_schema) if elem_schema in ('string', 'int', 'decimal', 'bool', 'uuid') else elem_schema
+            item_forms = [p for p in pair[1:] if isinstance(p, list) and p and p[0] == 'item']
+            if item_forms:
+                inner = ", ".join(_cs_seed_object(p[1:], elem_schema, schemas) for p in item_forms)
                 parts.append(f'{prop} = new List<{elem_schema}> {{ {inner} }}')
             else:
-                parts.append(f'{prop} = new List<{elem_schema}>()')
+                scalars = [p for p in pair[1:] if not isinstance(p, list)]
+                if scalars:
+                    vals = ", ".join(_cs_seed_value(s, elem_schema, schemas) for s in scalars)
+                    parts.append(f'{prop} = new List<{elem_go_like}> {{ {vals} }}')
+                else:
+                    parts.append(f'{prop} = new List<{elem_go_like}>()')
             continue
         raw = pair[1]
         parts.append(f'{prop} = {_cs_seed_value(raw, ftype, schemas)}')
@@ -5620,6 +5783,25 @@ def _split_json_path(target: str) -> list[str]:
     if segs and segs[0] == 'body':
         segs = segs[1:]
     return segs
+
+
+def _cs_json_walk(segs: list[str]) -> str:
+    """Render a `JsonElement` walk expression from a split path.
+
+    Segments of the form `name[N]` become `.GetProperty("name")[N]` so
+    assertions on `discounts_applied[0].type` reach the right subtree.
+    Bare names become `.GetProperty("name")`. Returns the expression
+    starting from `_body`.
+    """
+    import re
+    walk = '_body'
+    for s in segs:
+        m = re.match(r'^([^\[]+)\[(\d+)\]$', s)
+        if m:
+            walk += f'.GetProperty("{m.group(1)}")[{m.group(2)}]'
+        else:
+            walk += f'.GetProperty("{s}")'
+    return walk
 
 
 def _interpolate_path_csharp(path: str, captures: set) -> str:
@@ -5804,25 +5986,17 @@ def _compile_test_step_body_csharp(step: list, captures: set, pad: str) -> list[
                 # `_body.GetProperty("items").GetArrayLength()`. Bare `body.length`
                 # / `length` stays on the root `_body`.
                 segs = _split_json_path(target)
-                # Drop trailing `length` segment — the GetArrayLength() call is
-                # on the parent.
                 if segs and segs[-1] == 'length':
                     segs = segs[:-1]
-                walk = '_body'
-                for s in segs:
-                    walk += f'.GetProperty("{s}")'
+                walk = _cs_json_walk(segs)
                 lines.append(f'{pad}Assert.True({walk}.GetArrayLength() {cs_cmp} {val}, $"{target} = {{{walk}.GetArrayLength()}}");')
             else:
                 segs = _split_json_path(target)
-                walk = '_body'
-                for s in segs:
-                    walk += f'.GetProperty("{s}")'
+                walk = _cs_json_walk(segs)
                 expected = op[2] if len(op) > 2 else None
                 expected_str = str(expected).strip('"').lower() if expected is not None else ''
                 if str(expected) == 'exists':
-                    probe = '_body'
-                    for s in segs[:-1]:
-                        probe += f'.GetProperty("{s}")'
+                    probe = _cs_json_walk(segs[:-1])
                     last = segs[-1] if segs else ''
                     lines.append(f'{pad}Assert.True({probe}.TryGetProperty("{last}", out _));')
                 elif isinstance(expected, bool) or expected_str in ('true', 'false'):
@@ -6037,6 +6211,7 @@ def generate_csharp_tests(bc, main_output_dir: str):
     lines.append("using Microsoft.AspNetCore.Mvc.Testing;")
     lines.append("using Microsoft.AspNetCore.TestHost;")
     lines.append("using Microsoft.Extensions.DependencyInjection;")
+    lines.append("using Microsoft.Extensions.DependencyInjection.Extensions;")
     lines.append("using Microsoft.Extensions.Http;")
     lines.append("using Microsoft.IdentityModel.Tokens;")
     lines.append("using Xunit;")
@@ -6112,15 +6287,18 @@ def generate_csharp_tests(bc, main_output_dir: str):
         ident = _test_name_to_ident(test['name'])
         run_ops = test.get('run') or []
         mocks = test.get('mock_services') or {}
+        setup_ops = test.get('setup_ops') or []
+        override_time_ops = [op for op in setup_ops if isinstance(op, list) and op and op[0] == 'override_time']
         captures: set = set()
         lines.append("    [Fact]")
         lines.append(f"    public async Task {ident}()")
         lines.append("    {")
-        # When a test declares mocks, derive a factory with overridden HttpClient
-        # handlers and bind _client to the derived factory's CreateClient().
-        # Without mocks we keep using the shared field _client from the ctor.
         client_var = "_client"
-        if mocks:
+        # Build a derived factory when the test declares mocks or needs a
+        # DI-level override (override_time → FakeAiLangClock). Everything
+        # funnels through a single ConfigureTestServices block.
+        needs_factory = bool(mocks) or bool(override_time_ops)
+        if needs_factory:
             lines.append("        var _mockFactory = _factory.WithWebHostBuilder(builder =>")
             lines.append("        {")
             lines.append("            builder.ConfigureTestServices(services =>")
@@ -6143,6 +6321,23 @@ def generate_csharp_tests(bc, main_output_dir: str):
                 lines.append("                    {")
                 lines.append("                        " + rules_join)
                 lines.append("                    }));")
+            for ov in override_time_ops:
+                # `(override_time (day_of_week tuesday))` or `(now "ISO-8601")`.
+                # Replace IAiLangClock with a FakeAiLangClock configured from
+                # the setup form.
+                fake_init_parts = []
+                for spec in ov[1:]:
+                    if not (isinstance(spec, list) and len(spec) >= 2):
+                        continue
+                    key = str(spec[0])
+                    val = spec[1]
+                    if key == 'day_of_week':
+                        fake_init_parts.append(f'FixedDayOfWeek = "{val}"')
+                    elif key == 'now':
+                        fake_init_parts.append(f'FixedNow = DateTime.Parse("{val}")')
+                init = ", ".join(fake_init_parts)
+                lines.append("                services.RemoveAll<IAiLangClock>();")
+                lines.append(f"                services.AddSingleton<IAiLangClock>(new FakeAiLangClock {{ {init} }});")
             lines.append("            });")
             lines.append("        });")
             lines.append("        using var _mockedClient = _mockFactory.CreateClient();")
@@ -6150,14 +6345,31 @@ def generate_csharp_tests(bc, main_output_dir: str):
         # Swap the effective client name used by the compiled run ops.
         if client_var != "_client":
             lines.append(f"        var _client = {client_var};  // shadow outer field for this test")
-        # Emit seed_data setup ops before the try block so they happen on the
-        # same factory that serves the test's HTTP requests. Uses the mock
-        # factory if mocks were registered — otherwise the base factory.
-        seed_factory = '_mockFactory' if mocks else '_factory'
+        # Emit setup_ops (seed_data, force_circuit_state) before the try
+        # block so they happen on the same factory that serves the test's
+        # HTTP requests. override_time was already wired into the derived
+        # factory above.
+        seed_factory = '_mockFactory' if needs_factory else '_factory'
         for setup_op in (test.get('setup_ops') or []):
             if isinstance(setup_op, list) and setup_op and setup_op[0] == 'seed_data':
                 lines.extend(_emit_seed_data_csharp(setup_op, bc.stores, bc.schemas,
                                                      pad='        ', factory_var=seed_factory))
+            elif isinstance(setup_op, list) and setup_op and setup_op[0] == 'force_circuit_state':
+                # `(force_circuit_state (<policy_name> OPEN))` — isolate the
+                # ManualControl keyed by policy so Polly throws
+                # BrokenCircuitException on the next call.
+                for spec in setup_op[1:]:
+                    if not (isinstance(spec, list) and len(spec) >= 2):
+                        continue
+                    policy_name = str(spec[0])
+                    state = str(spec[1]).upper()
+                    lines.append(f'        {{')
+                    lines.append(f'            var _mc = {seed_factory}.Services.GetRequiredKeyedService<Polly.CircuitBreaker.CircuitBreakerManualControl>("{policy_name}");')
+                    if state == 'OPEN':
+                        lines.append(f'            await _mc.IsolateAsync();')
+                    else:
+                        lines.append(f'            await _mc.CloseAsync();')
+                    lines.append(f'        }}')
         lines.append("        try")
         lines.append("        {")
         lines.extend(_compile_test_run_csharp(run_ops, captures, indent=3))

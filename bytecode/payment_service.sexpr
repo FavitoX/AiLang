@@ -348,7 +348,7 @@
           (NONE
             (ERR_NOT_FOUND "payment" id))
           (OK
-            (BRANCH (!= payment.status "'completed'")
+            (BRANCH (!= payment.status "completed")
                       (TRUE
                         (ERR_BUSINESS_RULE "cannot_refund" "only completed payments can be refunded"))
                       (FALSE
@@ -539,7 +539,7 @@
             (card_token tok_slow)))
         (item
           (assert status)
-          (equals 503)))
+          (equals 504)))
       (clean "RESET_STORE(payment_store)"))
     (item
       (name refund_success)
