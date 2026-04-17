@@ -800,12 +800,14 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
             schema_def = (ctx.get('schemas') or {}).get(schema, {})
             schema_fields = schema_def.get('fields', {})
             parts = []
+            # Auto-fill auto_gen fields that aren't explicitly provided.
+            for sf_name, sf_def in schema_fields.items():
+                if sf_def.get('auto_gen') and sf_name not in fields:
+                    parts.append(f"{pascal_case(sf_name)} = {_autogen_default_csharp(sf_def['type'])}")
             for k, v in fields.items():
                 fdef = schema_fields.get(k) or {}
                 field_type = fdef.get('type')
                 val = _cs_expr(v, ctx, hint=field_type)
-                # Enum / string fields: if the value is a bare identifier that's
-                # not a known local, it's a literal value — quote it.
                 if field_type in ('enum', 'string') and isinstance(v, str):
                     known = (ctx.get('locals') or {})
                     if v not in known and not v.startswith('"') and '.' not in v:
@@ -4088,6 +4090,11 @@ def compile_instruction_go(inst: dict, indent: int, ctx: dict = None) -> list[st
             schema_def = (ctx.get('schemas') or {}).get(schema, {})
             schema_fields = schema_def.get('fields', {})
             parts = []
+            go_autogen = {'uuid': 'uuid.New().String()', 'timestamp': 'time.Now().UTC()',
+                          'int': '0', 'bool': 'false', 'string': '""'}
+            for sf_name, sf_def in schema_fields.items():
+                if sf_def.get('auto_gen') and sf_name not in fields:
+                    parts.append(f"{pascal_case(sf_name)}: {go_autogen.get(sf_def['type'], 'nil')}")
             for k, v in fields.items():
                 fdef = schema_fields.get(k) or {}
                 field_type = fdef.get('type')
