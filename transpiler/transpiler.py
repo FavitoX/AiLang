@@ -533,10 +533,10 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
         locals_dict = ctx.setdefault('locals', {})
         data_type = locals_dict.get(data)
         store_schema = (ctx.get('store_def') or {}).get('schema', '')
-        if data_type == store_schema and data_type:
+        # Pass-through only for in-memory stores. PG stores must call Insert
+        # so auto-gen columns (id, timestamps) round-trip through the DB.
+        if not is_pg and data_type == store_schema and data_type:
             if assign == data:
-                # `STORE_INSERT store payment → payment` with no rename is a
-                # no-op — the constructed entity is already live under `assign`.
                 pass
             elif assign in locals_dict:
                 lines.append(f"{pad}{assign} = {data};")
@@ -545,6 +545,7 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
                 locals_dict[assign] = data_type
         elif is_pg:
             lines.append(f"{pad}var {assign} = await {store_var}.InsertAsync({data});")
+            locals_dict[assign] = store_schema
         else:
             decl = assign if assign in locals_dict else f"var {assign}"
             lines.append(f"{pad}{decl} = {store_var}.Insert({data});")
@@ -1938,9 +1939,13 @@ def generate_csharp(bc, output_dir: str):
         for inst in instructions:
             lines.extend(compile_instruction_csharp(inst, 1, ctx))
 
-        # Safety return — guarantees the lambda always returns an IResult so C#
-        # doesn't complain about missing return paths in complex MATCH/BRANCH trees.
+        # Safety return — always emit so complex MATCH/BRANCH trees that the
+        # compiler can't prove as exhaustive don't trip CS1643. Wrap in the
+        # CS0162 pragma so handlers that *do* prove exhaustive don't warn
+        # about the unreachable fallback.
+        lines.append("#pragma warning disable CS0162")
         lines.append("    return Results.StatusCode(500); // unreachable — safety fallback")
+        lines.append("#pragma warning restore CS0162")
         lines.append("});")
         lines.append("")
 
@@ -4196,14 +4201,12 @@ def compile_instruction_go(inst: dict, indent: int, ctx: dict = None) -> list[st
         locals_dict = ctx.setdefault('locals', {})
         data_type = locals_dict.get(data)
         store_schema = (ctx.get('store_def') or {}).get('schema', '')
-        # Mirrors the C# branch at L523: when `data` is already a full entity
-        # (from CONSTRUCT of the store's schema), Insert(Dto) won't accept it.
-        # Re-use the constructed value directly instead of calling Insert.
-        if data_type == store_schema and data_type:
+        # Pass-through (skip Insert call) only for in-memory stores where the
+        # full entity is already built via CONSTRUCT. For PG we MUST go
+        # through the DB so auto-gen columns (id, timestamps) come back.
+        if not is_pg and data_type == store_schema and data_type:
             if assign == data:
-                # `STORE_INSERT store payment → payment` with no rename is
-                # already-constructed → skip emission; `payment` is live.
-                pass
+                pass  # `STORE_INSERT store payment → payment` is a no-op.
             elif assign in locals_dict:
                 lines.append(f"{pad}{assign} = {data}")
             else:
