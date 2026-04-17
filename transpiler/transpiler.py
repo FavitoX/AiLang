@@ -5364,24 +5364,61 @@ def _json_literal_from_body_form(body_form: list) -> str:
     """Turn a `['body', ['name', 'Widget'], ['price', 9.99]]` tail into a JSON string literal.
 
     Values are emitted as-is: numbers stay numeric; non-numeric atoms become JSON strings.
+    Nested lists become JSON objects (pairs) or arrays (list of `item` forms).
     The returned string is a JSON document (no surrounding C#/Go quoting)."""
     parts = []
     for pair in body_form:
         if not (isinstance(pair, list) and len(pair) >= 2):
             continue
         key = str(pair[0])
-        val = pair[1]
-        if isinstance(val, bool):
-            parts.append(f'"{key}":{"true" if val else "false"}')
-        elif isinstance(val, (int, float)):
-            parts.append(f'"{key}":{val}')
-        elif isinstance(val, str) and val.lower() in ('true', 'false'):
-            parts.append(f'"{key}":{val.lower()}')
+        tail = pair[1:]
+        # Nested list/object shape: (key (child …) (child …) …). Multiple `item`
+        # children → array; zero or more pair children → object. A single
+        # `['item', …]` child is still an array — don't unwrap to a scalar.
+        looks_nested = all(isinstance(x, list) for x in tail)
+        single_item = (len(tail) == 1 and isinstance(tail[0], list)
+                       and tail[0] and tail[0][0] == 'item')
+        if looks_nested and (len(tail) > 1 or single_item):
+            val = tail
         else:
-            # Escape embedded quotes & backslashes for JSON safety.
-            s = str(val).replace('\\', '\\\\').replace('"', '\\"')
-            parts.append(f'"{key}":"{s}"')
+            val = tail[0]
+        parts.append(f'"{key}":{_json_value_literal(val)}')
     return '{' + ','.join(parts) + '}'
+
+
+def _json_value_literal(val) -> str:
+    """Render a single value as a JSON literal.
+
+    Recurses into lists: list of `['item', …]` forms → array; list of
+    `[key, value]` pairs → object; scalar → string/number/bool literal.
+    """
+    if isinstance(val, bool):
+        return 'true' if val else 'false'
+    if isinstance(val, (int, float)):
+        return str(val)
+    if isinstance(val, str):
+        if val.lower() in ('true', 'false'):
+            return val.lower()
+        try:
+            float(val)
+            return val
+        except ValueError:
+            pass
+        s = val.replace('\\', '\\\\').replace('"', '\\"')
+        return f'"{s}"'
+    if isinstance(val, list):
+        # Empty → empty object by default.
+        if not val:
+            return '{}'
+        # Array shape: list of `['item', …]` forms.
+        if all(isinstance(x, list) and x and x[0] == 'item' for x in val):
+            elements = [_json_literal_from_body_form(x[1:]) for x in val]
+            return '[' + ','.join(elements) + ']'
+        # Object shape: list of `[key, value]` pairs.
+        return _json_literal_from_body_form(val)
+    # Fallback — stringify.
+    s = str(val).replace('\\', '\\\\').replace('"', '\\"')
+    return f'"{s}"'
 
 
 def _assert_is_length_op(target: str) -> bool:
