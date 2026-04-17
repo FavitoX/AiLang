@@ -227,7 +227,7 @@
           (NONE
             (ERR_NOT_FOUND "order" id))
           (OK
-            (BRANCH (!= order.status "'pending'")
+            (BRANCH (!= order.status pending)
                       (TRUE
                         (ERR_CUSTOM ERR_ORDER_NOT_CANCELLABLE (order_id id) (current_status order.status)))
                       (FALSE

@@ -215,7 +215,7 @@
                 { "op": "COMPUTE", "assign": "revenue",
                   "left": "revenue", "operator": "+", "right": "o.total",
                   "result_type": "decimal" },
-                { "op": "BRANCH", "condition": { "left": "o.status", "op": "==", "right": "'pending'" }, "cases": {
+                { "op": "BRANCH", "condition": { "left": "o.status", "op": "==", "right": "pending" }, "cases": {
                     "TRUE": [
                       { "op": "COMPUTE", "assign": "pending_count",
                         "left": "pending_count", "operator": "+", "right": 1,
@@ -292,17 +292,17 @@
 
         { "op": "COMMENT", "text": "── Calculate system health ──" },
         { "op": "DEFINE_VAR", "name": "services_up", "type": "int", "value": 0 },
-        { "op": "BRANCH", "condition": { "left": "products_section.status", "op": "==", "right": "'ok'" }, "cases": {
+        { "op": "BRANCH", "condition": { "left": "products_section.status", "op": "==", "right": "ok" }, "cases": {
             "TRUE": [{ "op": "COMPUTE", "assign": "services_up", "left": "services_up", "operator": "+", "right": 1, "result_type": "int" }],
             "FALSE": []
           }
         },
-        { "op": "BRANCH", "condition": { "left": "orders_section.status", "op": "==", "right": "'ok'" }, "cases": {
+        { "op": "BRANCH", "condition": { "left": "orders_section.status", "op": "==", "right": "ok" }, "cases": {
             "TRUE": [{ "op": "COMPUTE", "assign": "services_up", "left": "services_up", "operator": "+", "right": 1, "result_type": "int" }],
             "FALSE": []
           }
         },
-        { "op": "BRANCH", "condition": { "left": "payments_section.status", "op": "==", "right": "'ok'" }, "cases": {
+        { "op": "BRANCH", "condition": { "left": "payments_section.status", "op": "==", "right": "ok" }, "cases": {
             "TRUE": [{ "op": "COMPUTE", "assign": "services_up", "left": "services_up", "operator": "+", "right": 1, "result_type": "int" }],
             "FALSE": []
           }

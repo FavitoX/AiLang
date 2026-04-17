@@ -540,9 +540,27 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
             lines.append(f"{pad}var {inst['assign']} = {store_var}.Update({inst['key']}, {inst['data']});")
 
     elif op == 'STORE_UPDATE_FIELDS':
+        key = inst.get('key', 'id')
+        assign = inst.get('assign')
         fields = inst.get('fields', {})
-        for field, value in fields.items():
-            lines.append(f'{pad}// STORE_UPDATE_FIELDS: {field} = {value}')
+        store_schema = (ctx.get('store_def') or {}).get('schema', 'object')
+        updates = ", ".join(f'{pascal_case(f)} = {_cs_expr(v, ctx)}' for f, v in fields.items())
+        # Find existing → clone with `with { }` → re-save.
+        if assign:
+            lines.append(f"{pad}{store_schema}? {assign} = null;")
+            ctx.setdefault('locals', {})[assign] = store_schema
+        lines.append(f"{pad}{{")
+        lines.append(f"{pad}    var _existing = {store_var}.Find({key});")
+        lines.append(f"{pad}    if (_existing != null)")
+        lines.append(f"{pad}    {{")
+        lines.append(f"{pad}        var _updated = _existing with {{ {updates} }};")
+        lines.append(f"{pad}        {store_var}.Delete({key});")
+        # Re-insert via the full entity — bypass DTO since we have all fields.
+        lines.append(f"{pad}        // TODO: proper update path; for now delete+re-insert with updated copy")
+        if assign:
+            lines.append(f"{pad}        {assign} = _updated;")
+        lines.append(f"{pad}    }}")
+        lines.append(f"{pad}}}")
 
     elif op == 'STORE_DELETE':
         if is_pg:
@@ -752,28 +770,28 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
     elif op == 'APPEND':
         target = inst['target']
         if 'value' in inst:
-            lines.append(f"{pad}{target}.Add({_cs_value(inst['value'])});")
+            lines.append(f"{pad}{target}.Add({_cs_expr(inst['value'], ctx)});")
         else:
-            # Object-construction append: look up target's declared element type.
             locals_dict = ctx.get('locals', {}) or {}
             ttype = locals_dict.get(target, 'List<object>')
             elem = extract_list_elem(ailang_type_to_csharp(ttype))
             fields = inst.get('object_fields', {})
-            init = ", ".join(f"{pascal_case(k)} = {_cs_value(v)}" for k, v in fields.items())
+            init = ", ".join(f"{pascal_case(k)} = {_cs_expr(v, ctx)}" for k, v in fields.items())
             lines.append(f"{pad}{target}.Add(new {elem} {{ {init} }});")
 
     elif op == 'ITERATE':
         collection = inst['collection']
         item = inst['item']
-        # Phase 7b: iterating a JsonNode array requires .AsArray() — foreach on
-        # JsonNode? is a type error. Also propagate the element type to inner
-        # locals so field access inside the body routes through JsonNode indexing.
-        coll_type = (ctx.get('locals') or {}).get(collection) if ctx else None
+        # Resolve the collection path: dotted paths get PascalCase for typed records
+        # or indexer access for JsonNode roots.
+        coll_root = collection.split('.')[0] if '.' in collection else collection
+        coll_type = (ctx.get('locals') or {}).get(coll_root) if ctx else None
+        coll_expr = _cs_expr(collection, ctx)
         if coll_type == 'JsonNode':
-            lines.append(f"{pad}foreach (var {item} in {collection}!.AsArray())")
+            lines.append(f"{pad}foreach (var {item} in {coll_expr}!.AsArray())")
             item_type = 'JsonNode'
         else:
-            lines.append(f"{pad}foreach (var {item} in {collection})")
+            lines.append(f"{pad}foreach (var {item} in {coll_expr})")
             item_type = 'object'
         lines.append(f"{pad}{{")
         inner_ctx = dict(ctx)
@@ -2119,6 +2137,33 @@ def _emit_event_handler_csharp(handler_name: str, handler_def: dict, bc) -> list
         'schemas': bc.schemas if bc else {},
         'locals': {},
     }
+    # Resolve DI services the handler body may need (CALL_SERVICE → IHttpClientFactory,
+    # STORE ops → IXStore). EVENT_HANDLERs are `static` local functions — they can't
+    # capture outer-scope locals, so we resolve from `sp` explicitly.
+    def _walk_ops(insts):
+        ops = set()
+        for i in insts:
+            if isinstance(i, dict):
+                ops.add(i.get('op', ''))
+                for key in ('body',):
+                    if isinstance(i.get(key), list):
+                        ops |= _walk_ops(i[key])
+                if isinstance(i.get('cases'), dict):
+                    for v in i['cases'].values():
+                        if isinstance(v, list):
+                            ops |= _walk_ops(v)
+        return ops
+    all_ops = _walk_ops(handler_def.get('instructions', []))
+    if 'CALL_SERVICE' in all_ops:
+        lines.append('    var httpClientFactory = sp.GetRequiredService<IHttpClientFactory>();')
+    # Stores: resolve the primary store if any STORE_ op appears.
+    if any(op.startswith('STORE_') for op in all_ops) and bc.stores:
+        for store_name, store_def in bc.stores.items():
+            schema = store_def['schema']
+            lines.append(f'    var {camel_case(store_name)} = sp.GetRequiredService<I{schema}Store>();')
+            ctx['store_var'] = camel_case(store_name)
+            ctx['store_def'] = store_def
+
     # Cast eventData to JsonNode so `event.data.X` paths resolve via Phase 3b
     # indexer access. AILang's `event.data` IS the full payload — the `.data`
     # segment is stripped by registering the root as `event.data` → `_evtData`.

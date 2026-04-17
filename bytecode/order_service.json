@@ -294,7 +294,7 @@
         { "op": "MATCH", "value": "order", "cases": {
             "NONE": [{ "op": "ERR_NOT_FOUND", "entity": "order", "id": "id" }],
             "OK": [
-              { "op": "BRANCH", "condition": { "left": "order.status", "op": "!=", "right": "'pending'" }, "cases": {
+              { "op": "BRANCH", "condition": { "left": "order.status", "op": "!=", "right": "pending" }, "cases": {
                   "TRUE": [
                     { "op": "ERR_CUSTOM", "type": "ERR_ORDER_NOT_CANCELLABLE",
                       "params": {
