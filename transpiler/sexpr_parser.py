@@ -368,6 +368,23 @@ def sexpr_to_instruction(expr: list) -> dict:
         # (STORE_DELETE product_store id)
         return {'op': 'STORE_DELETE', 'store': expr[1], 'key': expr[2]}
 
+    if op == 'STORE_UPDATE_FIELDS':
+        # (STORE_UPDATE_FIELDS store key ((field1 val1) (field2 val2)) → assign)
+        args, assign = _split_arrow(expr)
+        store = args[0] if args else None
+        key = args[1] if len(args) > 1 else None
+        fields = {}
+        for a in args[2:]:
+            if isinstance(a, list):
+                # Each item is either (field val) directly or a list of (field val) pairs.
+                if a and isinstance(a[0], list):
+                    for pair in a:
+                        if isinstance(pair, list) and len(pair) >= 2:
+                            fields[pair[0]] = pair[1]
+                elif len(a) >= 2:
+                    fields[a[0]] = a[1]
+        return {'op': 'STORE_UPDATE_FIELDS', 'store': store, 'key': key, 'fields': fields, 'assign': assign}
+
     # ── SQL operations ──
     if op == 'SQL_QUERY':
         # (SQL_QUERY store "SELECT ..." [(param ...)]* → result)
