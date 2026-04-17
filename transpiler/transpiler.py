@@ -544,7 +544,18 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
         assign = inst.get('assign')
         fields = inst.get('fields', {})
         store_schema = (ctx.get('store_def') or {}).get('schema', 'object')
-        updates = ", ".join(f'{pascal_case(f)} = {_cs_expr(v, ctx)}' for f, v in fields.items())
+        schema_def = (ctx.get('schemas') or {}).get(store_schema, {})
+        schema_fields = schema_def.get('fields', {})
+        update_parts = []
+        for f, v in fields.items():
+            ftype = (schema_fields.get(f) or {}).get('type')
+            val = _cs_expr(v, ctx, hint=ftype)
+            if ftype in ('enum', 'string') and isinstance(v, str):
+                known = (ctx.get('locals') or {})
+                if v not in known and not v.startswith('"') and '.' not in v:
+                    val = f'"{v}"'
+            update_parts.append(f'{pascal_case(f)} = {val}')
+        updates = ", ".join(update_parts)
         # Find existing → clone with `with { }` → re-save.
         if assign:
             lines.append(f"{pad}{store_schema}? {assign} = null;")
@@ -679,15 +690,23 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
         lines.extend(_compile_await_all_csharp(inst, indent, ctx))
 
     elif op == 'CALL_SERVICE':
-        # (CALL_SERVICE name (method X) (path "..") (idempotent b) (body {...}) → assign)
         service = inst['service']
         method = inst.get('method', 'GET').upper()
-        path_expr = path_to_csharp_interpolated(inst.get('path', ''))
+        # Path interpolation: resolve {var.field} via _cs_expr for JsonNode awareness.
+        import re
+        raw_path = inst.get('path', '')
+        def _resolve_path_segment(m):
+            expr_str = m.group(1)
+            resolved = _cs_expr(expr_str, ctx)
+            return '{' + resolved + '}'
+        path_expr = '"' + re.sub(r'\{([^}]+)\}', _resolve_path_segment, raw_path) + '"'
+        if '{' in path_expr:
+            path_expr = '$' + path_expr
         assign = inst['assign']
         body = inst.get('body')
         body_expr = 'null'
         if body:
-            pairs = ", ".join(f'["{k}"] = {_cs_value(v)}' for k, v in body.items())
+            pairs = ", ".join(f'["{k}"] = {_cs_expr(v, ctx)}' for k, v in body.items())
             body_expr = f'new System.Collections.Generic.Dictionary<string, object?> {{ {pairs} }}'
 
         # Pick the resilience variant. When idempotent=false and the policy
@@ -774,10 +793,17 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
         else:
             locals_dict = ctx.get('locals', {}) or {}
             ttype = locals_dict.get(target, 'List<object>')
-            elem = extract_list_elem(ailang_type_to_csharp(ttype))
+            elem_name = extract_list_elem(ttype) if ttype else 'object'
+            elem_cs = extract_list_elem(ailang_type_to_csharp(ttype))
+            elem_schema = (ctx.get('schemas') or {}).get(elem_name, {})
+            elem_fields = elem_schema.get('fields', {})
             fields = inst.get('object_fields', {})
-            init = ", ".join(f"{pascal_case(k)} = {_cs_expr(v, ctx)}" for k, v in fields.items())
-            lines.append(f"{pad}{target}.Add(new {elem} {{ {init} }});")
+            parts = []
+            for k, v in fields.items():
+                ftype = (elem_fields.get(k) or {}).get('type')
+                parts.append(f"{pascal_case(k)} = {_cs_expr(v, ctx, hint=ftype)}")
+            init = ", ".join(parts)
+            lines.append(f"{pad}{target}.Add(new {elem_cs} {{ {init} }});")
 
     elif op == 'ITERATE':
         collection = inst['collection']
@@ -863,8 +889,9 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
         level = inst.get('level', 'INFO')
         import re
         msg = inst['message']
-        # PascalCase member access segments inside {interpolation} braces.
-        msg = re.sub(r'\{(\w+(?:\.\w+)+)\}', lambda m: '{' + m.group(1).split('.')[0] + ''.join('.' + pascal_case(s) for s in m.group(1).split('.')[1:]) + '}', msg)
+        # Resolve dotted paths inside {interpolation} braces via _cs_expr so
+        # JsonNode roots get indexer access and typed roots get PascalCase.
+        msg = re.sub(r'\{(\w+(?:\.\w+)+)\}', lambda m: '{' + _cs_expr(m.group(1), ctx) + '}', msg)
         lines.append(f'{pad}Console.WriteLine($"[{level}] {msg}");')
 
     return [l for l in lines if l != ""]
@@ -1444,12 +1471,14 @@ def compile_branch_csharp(inst: dict, indent: int, ctx: dict = None) -> list[str
                 root = v.split('.')[0]
                 return (ctx.get('locals') or {}).get(root) in ('JsonNode', 'any_json')
             return False
-        if hint_left is None and _is_json_root(left_raw) and isinstance(right_raw, str):
-            hint_left = 'string'
-        if hint_right is None and _is_json_root(right_raw) and isinstance(left_raw, str):
-            hint_right = 'string'
-        left = _cs_expr(left_raw, ctx, hint=hint_left)
         op = condition.get('op', '==')
+        numeric_ops = {'<', '>', '<=', '>='}
+        default_hint = 'int' if op in numeric_ops else 'string'
+        if hint_left is None and _is_json_root(left_raw) and isinstance(right_raw, str):
+            hint_left = default_hint
+        if hint_right is None and _is_json_root(right_raw) and isinstance(left_raw, str):
+            hint_right = default_hint
+        left = _cs_expr(left_raw, ctx, hint=hint_left)
         right = _cs_expr(right_raw, ctx, hint=hint_right)
         # Quote bare-atom rhs that isn't a known local — it's a literal value.
         if isinstance(right_raw, str) and right_raw not in ((ctx.get('locals') or {})) and not right_raw.startswith('"') and '.' not in right_raw:
