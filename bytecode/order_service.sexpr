@@ -300,21 +300,21 @@
           (product_service
             (item
               (method GET)
-              (path "/products/prod-001")
+              (path "/products/aaaa0001-0000-0000-0000-000000000001")
               (response
                 (status 200)
                 (body
-                  (id prod-001)
+                  (id aaaa0001-0000-0000-0000-000000000001)
                   (name Widget)
                   (price 9.99)
                   (stock 100))))
             (item
               (method GET)
-              (path "/products/prod-002")
+              (path "/products/aaaa0002-0000-0000-0000-000000000002")
               (response
                 (status 200)
                 (body
-                  (id prod-002)
+                  (id aaaa0002-0000-0000-0000-000000000002)
                   (name Gadget)
                   (price 19.99)
                   (stock 50)))))))
@@ -328,10 +328,10 @@
             (customer_name "John Doe")
             (items
               (item
-                (product_id prod-001)
+                (product_id aaaa0001-0000-0000-0000-000000000001)
                 (quantity 2))
               (item
-                (product_id prod-002)
+                (product_id aaaa0002-0000-0000-0000-000000000002)
                 (quantity 1)))))
         (item
           (assert status)
@@ -359,11 +359,11 @@
           (product_service
             (item
               (method GET)
-              (path "/products/prod-001")
+              (path "/products/aaaa0001-0000-0000-0000-000000000001")
               (response
                 (status 200)
                 (body
-                  (id prod-001)
+                  (id aaaa0001-0000-0000-0000-000000000001)
                   (name Widget)
                   (price 9.99)
                   (stock 2)))))))
@@ -377,7 +377,7 @@
             (customer_name "Jane Doe")
             (items
               (item
-                (product_id prod-001)
+                (product_id aaaa0001-0000-0000-0000-000000000001)
                 (quantity 10)))))
         (item
           (assert status)
@@ -393,7 +393,7 @@
           (product_service
             (item
               (method GET)
-              (path "/products/nonexistent-id")
+              (path "/products/aaaa9999-0000-0000-0000-000000000000")
               (response
                 (status 404)
                 (body
@@ -409,7 +409,7 @@
             (customer_name "Jane Doe")
             (items
               (item
-                (product_id nonexistent-id)
+                (product_id aaaa9999-0000-0000-0000-000000000000)
                 (quantity 1)))))
         (item
           (assert status)
@@ -424,11 +424,11 @@
         (seed_data
           (order_store
             (item
-              (id order-to-cancel)
+              (id bbbb0001-0000-0000-0000-000000000001)
               (customer_name "Cancel Test")
               (items
                 (item
-                  (product_id prod-001)
+                  (product_id aaaa0001-0000-0000-0000-000000000001)
                   (product_name Widget)
                   (quantity 1)
                   (unit_price 9.99)
@@ -440,7 +440,7 @@
         (item
           (action REQUEST)
           (method PUT)
-          (path "/orders/order-to-cancel/cancel")
+          (path "/orders/bbbb0001-0000-0000-0000-000000000001/cancel")
           (auth true))
         (item
           (assert status)
@@ -455,11 +455,11 @@
         (seed_data
           (order_store
             (item
-              (id already-cancelled)
+              (id bbbb0002-0000-0000-0000-000000000002)
               (customer_name "Already Cancelled")
               (items
                 (item
-                  (product_id prod-001)
+                  (product_id aaaa0001-0000-0000-0000-000000000001)
                   (product_name Widget)
                   (quantity 1)
                   (unit_price 9.99)
@@ -471,7 +471,7 @@
         (item
           (action REQUEST)
           (method PUT)
-          (path "/orders/already-cancelled/cancel")
+          (path "/orders/bbbb0002-0000-0000-0000-000000000002/cancel")
           (auth true))
         (item
           (assert status)
@@ -492,7 +492,7 @@
             (customer_name "No Auth")
             (items
               (item
-                (product_id prod-001)
+                (product_id aaaa0001-0000-0000-0000-000000000001)
                 (quantity 1)))))
         (item
           (assert status)
@@ -520,7 +520,7 @@
           (product_service
             (item
               (method GET)
-              (path "/products/slow-product")
+              (path "/products/aaaa0003-0000-0000-0000-000000000003")
               (response
                 (delay_ms 5000)
                 (status 200)
@@ -536,7 +536,7 @@
             (customer_name "Timeout Test")
             (items
               (item
-                (product_id slow-product)
+                (product_id aaaa0003-0000-0000-0000-000000000003)
                 (quantity 1)))))
         (item
           (assert status)
@@ -560,7 +560,7 @@
             (customer_name "Circuit Open Test")
             (items
               (item
-                (product_id any-product)
+                (product_id aaaa0004-0000-0000-0000-000000000004)
                 (quantity 1)))))
         (item
           (assert status)

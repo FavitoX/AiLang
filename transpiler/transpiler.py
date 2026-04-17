@@ -657,11 +657,19 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
         # AILang contract: READ_BODY runs schema validations (required/min/max/gt/…)
         # automatically. Generator enforces this by calling Validate() right after
         # JSON decode — mirrors the behavior described in CLAUDE.md.
-        lines.append(f"{pad}var {inst['assign']} = await ctx.Request.ReadFromJsonAsync<{inst['schema']}Dto>();")
-        lines.append(f"{pad}if ({inst['assign']} is null)")
-        lines.append(f"{pad}    return Results.BadRequest(AiLangError.InvalidBody(\"{inst['schema']}\", \"body is null\"));")
+        # JsonException on missing required props / malformed JSON → 400 instead
+        # of the ASP.NET default 500. Handlers may still fail later in the
+        # pipeline; only the deserialization step is protected here.
+        schema = inst['schema']
+        assign = inst['assign']
+        lines.append(f"{pad}{schema}Dto? {assign} = null;")
+        lines.append(f"{pad}try {{ {assign} = await ctx.Request.ReadFromJsonAsync<{schema}Dto>(); }}")
+        lines.append(f"{pad}catch (System.Text.Json.JsonException _je)")
+        lines.append(f"{pad}{{ return Results.BadRequest(AiLangError.InvalidBody(\"{schema}\", _je.Message)); }}")
+        lines.append(f"{pad}if ({assign} is null)")
+        lines.append(f"{pad}    return Results.BadRequest(AiLangError.InvalidBody(\"{schema}\", \"body is null\"));")
         lines.append(f"{pad}{{")
-        lines.append(f"{pad}    var _verr = {inst['assign']}.Validate();")
+        lines.append(f"{pad}    var _verr = {assign}.Validate();")
         lines.append(f"{pad}    if (_verr != null) return Results.BadRequest(_verr);")
         lines.append(f"{pad}}}")
 
@@ -5606,7 +5614,18 @@ def _compile_test_step_body_csharp(step: list, captures: set, pad: str) -> list[
                 else:
                     cmp_op, val = '==', op[2]
                 cs_cmp = {'==': '==', '!=': '!=', '<': '<', '<=': '<=', '>': '>', '>=': '>='}.get(cmp_op, '==')
-                lines.append(f'{pad}Assert.True(_body.GetArrayLength() {cs_cmp} {val}, $"body.length = {{_body.GetArrayLength()}}");')
+                # Walk to the enclosing array: `body.items.length` →
+                # `_body.GetProperty("items").GetArrayLength()`. Bare `body.length`
+                # / `length` stays on the root `_body`.
+                segs = _split_json_path(target)
+                # Drop trailing `length` segment — the GetArrayLength() call is
+                # on the parent.
+                if segs and segs[-1] == 'length':
+                    segs = segs[:-1]
+                walk = '_body'
+                for s in segs:
+                    walk += f'.GetProperty("{s}")'
+                lines.append(f'{pad}Assert.True({walk}.GetArrayLength() {cs_cmp} {val}, $"{target} = {{{walk}.GetArrayLength()}}");')
             else:
                 segs = _split_json_path(target)
                 walk = '_body'
@@ -5720,7 +5739,20 @@ def _compile_test_step_body_go(step: list, captures: set, pad: str) -> list[str]
                 lines.append(f'{pad}if _status != {want} {{ t.Fatalf("want status {want}, got %d (body=%s)", _status, string(_rawBody)) }}')
             elif _assert_is_length_op(target):
                 cmp_op, val = ('==', op[2]) if len(op) < 4 else (str(op[2]), op[3])
-                lines.append(f'{pad}if !(len(_bodyArr) {cmp_op} {val}) {{ t.Errorf("body.length = %d, want {cmp_op} {val}", len(_bodyArr)) }}')
+                # `body.length` → len(_bodyArr) (root is an array).
+                # `body.items.length` → len of the nested slice, reached via
+                # map indexing and a []any assertion.
+                segs = _split_json_path(target)
+                if segs and segs[-1] == 'length':
+                    segs = segs[:-1]
+                if not segs:
+                    lines.append(f'{pad}if !(len(_bodyArr) {cmp_op} {val}) {{ t.Errorf("{target} = %d, want {cmp_op} {val}", len(_bodyArr)) }}')
+                else:
+                    walk = '_body'
+                    for s in segs[:-1]:
+                        walk = f'({walk}["{s}"].(map[string]any))'
+                    last = segs[-1]
+                    lines.append(f'{pad}if _arr, _ := {walk}["{last}"].([]any); !(len(_arr) {cmp_op} {val}) {{ t.Errorf("{target} = %d, want {cmp_op} {val}", len(_arr)) }}')
             else:
                 segs = _split_json_path(target)
                 walk = '_body'

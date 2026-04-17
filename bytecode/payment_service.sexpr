@@ -395,11 +395,11 @@
           (order_service
             (item
               (method PUT)
-              (path "/orders/order-001/confirm")
+              (path "/orders/bbbb0001-0000-0000-0000-000000000001/confirm")
               (response
                 (status 200)
                 (body
-                  (id order-001)
+                  (id bbbb0001-0000-0000-0000-000000000001)
                   (status confirmed)))))))
       (run
         (item
@@ -408,7 +408,7 @@
           (path "/payments")
           (auth true)
           (body
-            (order_id order-001)
+            (order_id bbbb0001-0000-0000-0000-000000000001)
             (amount 99.99)
             (currency USD)
             (payment_method credit_card)
@@ -447,7 +447,7 @@
           (path "/payments")
           (auth true)
           (body
-            (order_id order-002)
+            (order_id bbbb0002-0000-0000-0000-000000000002)
             (amount 5000.0)
             (currency USD)
             (payment_method credit_card)
@@ -490,7 +490,7 @@
           (path "/payments")
           (auth true)
           (body
-            (order_id order-003)
+            (order_id bbbb0003-0000-0000-0000-000000000003)
             (amount 99.99)
             (currency USD)
             (payment_method debit_card)
@@ -532,7 +532,7 @@
           (path "/payments")
           (auth true)
           (body
-            (order_id order-004)
+            (order_id bbbb0004-0000-0000-0000-000000000004)
             (amount 50.0)
             (currency USD)
             (payment_method credit_card)
@@ -547,8 +547,8 @@
         (seed_data
           (payment_store
             (item
-              (id pay-to-refund)
-              (order_id order-005)
+              (id cccc0001-0000-0000-0000-000000000001)
+              (order_id bbbb0005-0000-0000-0000-000000000005)
               (amount 75.0)
               (currency USD)
               (payment_method credit_card)
@@ -570,7 +570,7 @@
         (item
           (action REQUEST)
           (method POST)
-          (path "/payments/pay-to-refund/refund")
+          (path "/payments/cccc0001-0000-0000-0000-000000000001/refund")
           (auth true))
         (item
           (assert status)
@@ -585,8 +585,8 @@
         (seed_data
           (payment_store
             (item
-              (id pay-pending)
-              (order_id order-006)
+              (id cccc0002-0000-0000-0000-000000000002)
+              (order_id bbbb0006-0000-0000-0000-000000000006)
               (amount 25.0)
               (currency USD)
               (payment_method credit_card)
@@ -596,7 +596,7 @@
         (item
           (action REQUEST)
           (method POST)
-          (path "/payments/pay-pending/refund")
+          (path "/payments/cccc0002-0000-0000-0000-000000000002/refund")
           (auth true))
         (item
           (assert status)
@@ -614,7 +614,7 @@
           (path "/payments")
           (auth false)
           (body
-            (order_id order-007)
+            (order_id bbbb0007-0000-0000-0000-000000000007)
             (amount 10.0)
             (currency USD)
             (payment_method credit_card)))

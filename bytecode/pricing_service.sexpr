@@ -303,11 +303,11 @@
           (product_service
             (item
               (method GET)
-              (path "/products/prod-001")
+              (path "/products/aaaa0001-0000-0000-0000-000000000001")
               (response
                 (status 200)
                 (body
-                  (id prod-001)
+                  (id aaaa0001-0000-0000-0000-000000000001)
                   (name Widget)
                   (price 10.0)
                   (stock 100))))))
@@ -319,7 +319,7 @@
           (method POST)
           (path "/pricing/calculate")
           (body
-            (product_id prod-001)
+            (product_id aaaa0001-0000-0000-0000-000000000001)
             (quantity 5)
             (customer_type regular)))
         (item
@@ -344,11 +344,11 @@
           (product_service
             (item
               (method GET)
-              (path "/products/prod-001")
+              (path "/products/aaaa0001-0000-0000-0000-000000000001")
               (response
                 (status 200)
                 (body
-                  (id prod-001)
+                  (id aaaa0001-0000-0000-0000-000000000001)
                   (name Widget)
                   (price 10.0)
                   (stock 200))))))
@@ -360,7 +360,7 @@
           (method POST)
           (path "/pricing/calculate")
           (body
-            (product_id prod-001)
+            (product_id aaaa0001-0000-0000-0000-000000000001)
             (quantity 50)
             (customer_type regular)))
         (item
@@ -388,11 +388,11 @@
           (product_service
             (item
               (method GET)
-              (path "/products/prod-001")
+              (path "/products/aaaa0001-0000-0000-0000-000000000001")
               (response
                 (status 200)
                 (body
-                  (id prod-001)
+                  (id aaaa0001-0000-0000-0000-000000000001)
                   (name Widget)
                   (price 10.0)
                   (stock 500))))))
@@ -404,7 +404,7 @@
           (method POST)
           (path "/pricing/calculate")
           (body
-            (product_id prod-001)
+            (product_id aaaa0001-0000-0000-0000-000000000001)
             (quantity 100)
             (customer_type premium)))
         (item
@@ -430,11 +430,11 @@
           (product_service
             (item
               (method GET)
-              (path "/products/prod-001")
+              (path "/products/aaaa0001-0000-0000-0000-000000000001")
               (response
                 (status 200)
                 (body
-                  (id prod-001)
+                  (id aaaa0001-0000-0000-0000-000000000001)
                   (name Widget)
                   (price 10.0)
                   (stock 500))))))
@@ -455,7 +455,7 @@
           (method POST)
           (path "/pricing/calculate")
           (body
-            (product_id prod-001)
+            (product_id aaaa0001-0000-0000-0000-000000000001)
             (quantity 100)
             (customer_type wholesale)
             (coupon_code MEGA20)))
@@ -485,11 +485,11 @@
           (product_service
             (item
               (method GET)
-              (path "/products/prod-001")
+              (path "/products/aaaa0001-0000-0000-0000-000000000001")
               (response
                 (status 200)
                 (body
-                  (id prod-001)
+                  (id aaaa0001-0000-0000-0000-000000000001)
                   (name Widget)
                   (price 10.0)
                   (stock 100)))))))
@@ -499,7 +499,7 @@
           (method POST)
           (path "/pricing/calculate")
           (body
-            (product_id prod-001)
+            (product_id aaaa0001-0000-0000-0000-000000000001)
             (quantity 5)
             (customer_type regular)
             (coupon_code EXPIRED10)))
@@ -526,11 +526,11 @@
           (product_service
             (item
               (method GET)
-              (path "/products/prod-001")
+              (path "/products/aaaa0001-0000-0000-0000-000000000001")
               (response
                 (status 200)
                 (body
-                  (id prod-001)
+                  (id aaaa0001-0000-0000-0000-000000000001)
                   (name Widget)
                   (price 10.0)
                   (stock 100)))))))
@@ -540,7 +540,7 @@
           (method POST)
           (path "/pricing/calculate")
           (body
-            (product_id prod-001)
+            (product_id aaaa0001-0000-0000-0000-000000000001)
             (quantity 5)
             (customer_type regular)
             (coupon_code WHOLESALE5)))
