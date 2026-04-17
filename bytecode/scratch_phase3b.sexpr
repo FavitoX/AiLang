@@ -13,8 +13,8 @@
   (port 8098))
 
 (schema PriceCheckRequest
-  (field product_id string  (required))
-  (field quantity   decimal (required) (gt 0)))
+  (field product_id string (required))
+  (field quantity   int    (required) (gt 0)))
 
 (schema PriceCheckResponse
   (field product_id string (required))

@@ -696,8 +696,15 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
         arith_ops = {'+', '-', '*', '/', '%'}
         cmp_ops = {'==', '!=', '<', '<=', '>', '>=' }
         hint_left = hint_right = None
+        def _is_json_path_cs(v):
+            if not (isinstance(v, str) and '.' in v):
+                return False
+            root = v.split('.')[0]
+            return (ctx.get('locals') or {}).get(root) == 'JsonNode'
         if operator in arith_ops:
-            hint_left = hint_right = 'decimal'
+            left_raw, right_raw = inst.get('left'), inst.get('right')
+            if _is_json_path_cs(left_raw) or _is_json_path_cs(right_raw):
+                hint_left = hint_right = 'decimal'
         elif operator in cmp_ops:
             # Simple inference: if one side is a scalar literal, use its type for the other.
             left_raw, right_raw = inst.get('left'), inst.get('right')
@@ -1278,7 +1285,6 @@ def compile_match_csharp(inst: dict, indent: int, ctx: dict = None) -> list[str]
         lines.append(f"{pad}}}")
 
         if cases.get('OK'):
-            # If the fail branch always returns, emit OK inline at the same indent.
             has_return_in_fail = any('return' in line for line in lines)
             if not has_return_in_fail:
                 lines.append(f"{pad}else")
@@ -1287,12 +1293,28 @@ def compile_match_csharp(inst: dict, indent: int, ctx: dict = None) -> list[str]
             ok_pad = "    " * ok_indent
             if rebind_stmt:
                 lines.append(f"{ok_pad}{rebind_stmt}")
-                # Register the rebound var as JsonNode so Phase 3b field access kicks in.
                 ctx.setdefault('locals', {})[rebind_var] = 'JsonNode'
             for sub in cases['OK']:
                 lines.extend(compile_instruction_csharp(sub, ok_indent, ctx))
             if not has_return_in_fail:
                 lines.append(f"{pad}}}")
+    else:
+        # Value-dispatch MATCH (integer / string arms — not RESULT pattern).
+        # Emit as if/else-if chain: MATCH value (3 (…)) (2 (…)) (DEFAULT (…))
+        first = True
+        for arm_key, arm_body in cases.items():
+            arm_str = str(arm_key)
+            if arm_str == 'DEFAULT':
+                lines.append(f"{pad}else")
+            elif first:
+                lines.append(f"{pad}if ({_cs_expr(value, ctx)} == {_cs_value(arm_key)})")
+                first = False
+            else:
+                lines.append(f"{pad}else if ({_cs_expr(value, ctx)} == {_cs_value(arm_key)})")
+            lines.append(f"{pad}{{")
+            for sub in arm_body:
+                lines.extend(compile_instruction_csharp(sub, indent + 1, ctx))
+            lines.append(f"{pad}}}")
 
     return lines
 
@@ -3022,13 +3044,13 @@ def generate_event_bus_go() -> list[str]:
 
 
 def generate_service_client_go(bc) -> list[str]:
-    """Global helper: callService(ctx, svcName, baseURL, method, path, body, idempotent) → map[string]any.
+    """Global helper: callService(…) → any.
 
-    Two variants: policy-less (simple retry-free HTTP call with 10s default
-    timeout) and full (per-policy circuit breaker + retry loop + per-attempt
-    ctx timeout). The variant is chosen by whether the bytecode declares any
-    resilience policies. Returns nil on final failure so MATCH OK/NONE works
-    via `== nil`/`!= nil`.
+    Returns `map[string]any` for JSON objects and `[]any` for JSON arrays
+    (encoding/json's standard decode into any).  Returns nil on failure.
+    Two variants: policy-less (simple HTTP with 10s timeout) and full
+    (circuit breaker + retry). Selected by whether the bytecode declares
+    resilience policies.
     """
     policies = (bc.resilience or {}).get('policies', {}) or {}
     service_refs = {n: d for n, d in (bc.dependencies or {}).items() if d.get('type') == 'SERVICE_REF'}
@@ -3038,7 +3060,7 @@ def generate_service_client_go(bc) -> list[str]:
             "// ── INTER-SERVICE HTTP HELPER (no resilience policies) ──",
             "var _httpClient = &http.Client{Timeout: 10 * time.Second}",
             "",
-            "func callService(ctx context.Context, svcName, baseURL, method, path string, body any, _idempotent bool) map[string]any {",
+            "func callService(ctx context.Context, svcName, baseURL, method, path string, body any, _idempotent bool) any {",
             "\tvar reqBody io.Reader",
             "\tif body != nil {",
             "\t\tb, err := json.Marshal(body)",
@@ -3055,7 +3077,7 @@ def generate_service_client_go(bc) -> list[str]:
             '\t\tslog.Info("call_service non-2xx", "status", resp.StatusCode, "path", path)',
             "\t\treturn nil",
             "\t}",
-            "\tvar out map[string]any",
+            "\tvar out any",
             "\tif err := json.NewDecoder(resp.Body).Decode(&out); err != nil {",
             '\t\tslog.Error("call_service decode", "err", err)',
             "\t\treturn nil",
@@ -3135,7 +3157,7 @@ def generate_service_client_go(bc) -> list[str]:
     lines.extend([
         "// callService performs a single HTTP call with (optional) circuit breaker,",
         "// per-attempt timeout, and retry-with-backoff. Returns nil on final failure.",
-        "func callService(ctx context.Context, svcName, baseURL, method, path string, body any, idempotent bool) map[string]any {",
+        "func callService(ctx context.Context, svcName, baseURL, method, path string, body any, idempotent bool) any {",
         "\tif len(_cbs) > 0 { _cbsOnce.Do(_initCBs) }",
         '\tpolicy := _svcPolicies[svcName]',
         "\ttimeout := 10 * time.Second",
@@ -3184,7 +3206,7 @@ def generate_service_client_go(bc) -> list[str]:
         '\t\tslog.Info("call_service attempt failed", "svc", svcName, "attempt", attempt+1, "err", err.Error())',
         "\t}",
         "\tif lastBody == nil { return nil }",
-        "\tvar out map[string]any",
+        "\tvar out any",
         "\tif err := json.Unmarshal(lastBody, &out); err != nil {",
         '\t\tslog.Error("call_service decode", "err", err)',
         "\t\treturn nil",
@@ -3858,7 +3880,9 @@ def compile_instruction_go(inst: dict, indent: int, ctx: dict = None) -> list[st
         lines.append(
             f'{pad}{assign} := callService(r.Context(), "{service}", rt.serviceURLs["{service}"], "{method}", {path_expr}, {body_expr}, {idempotent})'
         )
-        ctx.setdefault('locals', {})[assign] = 'map'
+        # callService returns `any` — objects decode as map[string]any, arrays as
+        # []any. Register as 'any_json' so downstream knows to assert per context.
+        ctx.setdefault('locals', {})[assign] = 'any_json'
 
     elif op == 'EMIT_EVENT':
         data_expr = _go_value(inst.get('data')) if inst.get('data') not in (None, '') else 'nil'
@@ -3882,8 +3906,18 @@ def compile_instruction_go(inst: dict, indent: int, ctx: dict = None) -> list[st
         arith_ops = {'+', '-', '*', '/', '%'}
         cmp_ops = {'==', '!=', '<', '<=', '>', '>='}
         hint_left = hint_right = None
+        def _is_json_path(v):
+            """True when v is a dotted path whose root was set by CALL_SERVICE."""
+            if not (isinstance(v, str) and '.' in v):
+                return False
+            root = v.split('.')[0]
+            return (ctx.get('locals') or {}).get(root) in ('any_json', 'map', 'JsonNode')
         if operator in arith_ops:
-            hint_left = hint_right = 'decimal'
+            # Only hint as decimal when at least one side is a JsonNode path —
+            # avoids wrapping pure-int arithmetic in float64().
+            left_raw, right_raw = inst.get('left'), inst.get('right')
+            if _is_json_path(left_raw) or _is_json_path(right_raw):
+                hint_left = hint_right = 'decimal'
         elif operator in cmp_ops:
             def _scalar_hint(x):
                 from sexpr_parser import StringLiteral
@@ -3937,12 +3971,12 @@ def compile_instruction_go(inst: dict, indent: int, ctx: dict = None) -> list[st
         # emitted `_<coll>_arr` is a temporary []any slice; `item` inside the
         # body becomes one element, registered as `map` so Phase 3b kicks in.
         coll_type = (ctx.get('locals') or {}).get(collection) if ctx else None
-        if coll_type == 'map':
+        if coll_type in ('map', 'any_json'):
             arr_var = f"_{collection}_arr"
-            lines.append(f'{pad}{arr_var}, _ := any({collection}).([]any)')
+            lines.append(f'{pad}{arr_var}, _ := {collection}.([]any)')
             lines.append(f"{pad}for _, _elem := range {arr_var} {{")
             lines.append(f'{pad}\t{item}, _ := _elem.(map[string]any)')
-            item_type = 'map'
+            item_type = 'any_json'
         else:
             lines.append(f"{pad}for _, {item} := range {collection} {{")
             item_type = 'object'
@@ -4020,19 +4054,28 @@ def _go_resolve_path(expr: str, ctx: dict, hint: str = None) -> str:
     if not parts or not (parts[0] and (parts[0][0].isalpha() or parts[0][0] == '_')):
         return expr
     root_type = (ctx.get('locals') or {}).get(parts[0]) if ctx else None
-    if root_type == 'map':
-        # Nested maps: intermediate segments must assert map[string]any to keep indexing.
+    if root_type in ('map', 'any_json'):
+        # Root may be `any` (callService) or already asserted to map[string]any.
+        # First access needs `.(map[string]any)` assertion when root is raw any.
+        needs_initial_assert = (root_type == 'any_json')
         inner = parts[0]
         for i, seg in enumerate(parts[1:], start=1):
-            if i < len(parts) - 1:
+            if i == 1 and needs_initial_assert:
+                inner = f'{inner}.(map[string]any)["{seg}"]'
+            elif i < len(parts) - 1:
                 inner = f'{inner}["{seg}"].(map[string]any)'
             else:
                 inner = f'{inner}["{seg}"]'
         if hint and hint not in ('list', 'object'):
             return _go_json_cast(inner, hint)
         return inner
-    # Typed struct field access
-    return parts[0] + ''.join('.' + pascal_case(p) for p in parts[1:])
+    # Typed struct field access. When the hint is numeric and the path is a typed
+    # struct field, widen to float64 so mixed JsonNode*struct arithmetic compiles
+    # (Go doesn't have implicit numeric widening).
+    typed_expr = parts[0] + ''.join('.' + pascal_case(p) for p in parts[1:])
+    if hint == 'decimal':
+        return f'float64({typed_expr})'
+    return typed_expr
 
 
 def _go_expr(v, ctx: dict = None, hint: str = None) -> str:
@@ -4040,7 +4083,14 @@ def _go_expr(v, ctx: dict = None, hint: str = None) -> str:
         s = v
         if s and (s[0].isalpha() or s[0] == '_') and all(c.isalnum() or c in '_.' for c in s):
             return _go_resolve_path(s, ctx, hint)
-    return _go_value(v)
+    base = _go_value(v)
+    # Widen plain identifiers whose known type is int when used in a decimal
+    # context (Go has no implicit numeric conversions).
+    if hint == 'decimal' and ctx and isinstance(v, str):
+        known_type = (ctx.get('locals') or {}).get(v)
+        if known_type == 'int':
+            return f'float64({base})'
+    return base
 
 
 def _go_value(v) -> str:
@@ -4233,7 +4283,7 @@ def _compile_parallel_go(inst: dict, indent: int, ctx: dict) -> list[str]:
                 rv = f_inst['assign']
         fiber_result_lookup[fname] = rv
         fiber_result_vars.append((fname, shared, rv))
-        lines.append(f"{pad}var {shared} map[string]any")
+        lines.append(f"{pad}var {shared} any")
 
     lines.append(f"{pad}var _wg_{assign} sync.WaitGroup")
     lines.append(f"{pad}_wg_{assign}.Add({len(fibers)})")
@@ -4284,7 +4334,7 @@ def _compile_await_all_go(inst: dict, indent: int, ctx: dict) -> list[str]:
         lines.append(f"{pad}<-_done_{source}")
 
     # Build anonymous struct — Go inline struct field separator is `;`, not `,`.
-    struct_fields = "; ".join(f"{pascal_case(fn)} map[string]any" for fn, _, _ in fibers)
+    struct_fields = "; ".join(f"{pascal_case(fn)} any" for fn, _, _ in fibers)
     field_inits = ", ".join(f"{pascal_case(fn)}: {sv}" for fn, sv, _ in fibers)
     lines.append(f"{pad}{source} := struct {{ {struct_fields} }}{{{field_inits}}}")
     lines.append(f"{pad}_ = {source}  // suppress unused warning when handler reads fields conditionally")
@@ -4448,7 +4498,7 @@ def compile_match_go(inst: dict, indent: int, ctx: dict = None) -> list[str]:
             if rebind_stmt:
                 lines.append(f"{pad}{rebind_stmt}")
                 lines.append(f"{pad}_ = {rebind_var}")
-                ctx.setdefault('locals', {})[rebind_var] = 'map'
+                ctx.setdefault('locals', {})[rebind_var] = 'any_json'
             for sub in cases['OK']:
                 lines.extend(compile_instruction_go(sub, indent, ctx))
         else:
@@ -4456,7 +4506,7 @@ def compile_match_go(inst: dict, indent: int, ctx: dict = None) -> list[str]:
             if rebind_stmt:
                 lines.append(f"{pad}\t{rebind_stmt}")
                 lines.append(f"{pad}\t_ = {rebind_var}")
-                ctx.setdefault('locals', {})[rebind_var] = 'map'
+                ctx.setdefault('locals', {})[rebind_var] = 'any_json'
             for sub in cases['OK']:
                 lines.extend(compile_instruction_go(sub, indent + 1, ctx))
             lines.append(f"{pad}}}")
@@ -4467,9 +4517,25 @@ def compile_match_go(inst: dict, indent: int, ctx: dict = None) -> list[str]:
         if rebind_stmt:
             lines.append(f"{pad}{rebind_stmt}")
             lines.append(f"{pad}_ = {rebind_var}")
-            ctx.setdefault('locals', {})[rebind_var] = 'map'
+            ctx.setdefault('locals', {})[rebind_var] = 'any_json'
         for sub in cases['OK']:
             lines.extend(compile_instruction_go(sub, indent, ctx))
+    else:
+        # Value-dispatch MATCH (integer / string arms — not RESULT pattern).
+        first = True
+        for arm_key, arm_body in cases.items():
+            arm_str = str(arm_key)
+            if arm_str == 'DEFAULT':
+                lines.append(f"{pad}}} else {{")
+            elif first:
+                lines.append(f"{pad}if {_go_expr(raw_value, ctx)} == {_go_value(arm_key)} {{")
+                first = False
+            else:
+                lines.append(f"{pad}}} else if {_go_expr(raw_value, ctx)} == {_go_value(arm_key)} {{")
+            for sub in arm_body:
+                lines.extend(compile_instruction_go(sub, indent + 1, ctx))
+        if cases:
+            lines.append(f"{pad}}}")
 
     return lines
 
