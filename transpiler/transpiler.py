@@ -501,7 +501,7 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
             lines.append(f"{pad}var {assign} = {store_var}.ListAll();")
 
     elif op == 'STORE_FIND':
-        key = inst['key']
+        key = _cs_expr(inst['key'], ctx)
         if is_pg:
             lines.append(f"{pad}var {inst['assign']} = await {store_var}.FindAsync({key});")
         else:
@@ -891,7 +891,7 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
         elif from_ == 'clock' and field == 'now':
             lines.append(f"{pad}var {assign} = DateTime.UtcNow;")
         elif from_ == 'clock' and field in ('today', 'day_of_week'):
-            call = 'DateTime.UtcNow.Date' if field == 'today' else 'DateTime.UtcNow.DayOfWeek'
+            call = 'DateTime.UtcNow.Date' if field == 'today' else 'DateTime.UtcNow.DayOfWeek.ToString().ToLower()'
             lines.append(f"{pad}var {assign} = {call};")
         else:
             lines.append(f"{pad}var {assign} = default!;  // GET_CURRENT {from_}.{field} (unsupported)")
@@ -986,14 +986,26 @@ def _cs_resolve_path(expr: str, ctx: dict, hint: str = None) -> str:
 def _cs_expr(v, ctx: dict = None, hint: str = None) -> str:
     """Context-aware value formatter. Delegates to _cs_value for scalars/literals
     but routes dotted identifiers through _cs_resolve_path so JsonNode-typed
-    roots get indexer access instead of pascalized member access."""
+    roots get indexer access instead of pascalized member access.
+
+    When hint is 'string' or 'enum' and the value is a bare atom that isn't
+    a known local variable, it's treated as a literal string and quoted."""
     from sexpr_parser import StringLiteral
     if ctx and isinstance(v, str) and not isinstance(v, StringLiteral) and '.' in v:
-        # Only treat as identifier if the chars look like one (no quoting etc).
         s = v
         if s and (s[0].isalpha() or s[0] == '_') and all(c.isalnum() or c in '_.' for c in s):
             return _cs_resolve_path(s, ctx, hint)
-    return _cs_value(v)
+    result = _cs_value(v)
+    # Centralized bare-atom quoting for string/enum hints.
+    if hint in ('string', 'enum') and ctx and isinstance(v, str) and not isinstance(v, StringLiteral):
+        known = (ctx.get('locals') or {})
+        if v not in known and not v.startswith('"') and '.' not in v:
+            try:
+                float(v)
+            except ValueError:
+                if v.lower() not in ('true', 'false', 'null', 'nil'):
+                    result = f'"{v}"'
+    return result
 
 
 def _cs_value(v) -> str:
@@ -1502,11 +1514,10 @@ def compile_branch_csharp(inst: dict, indent: int, ctx: dict = None) -> list[str
             hint_right = default_hint
         left = _cs_expr(left_raw, ctx, hint=hint_left)
         right = _cs_expr(right_raw, ctx, hint=hint_right)
-        # Quote bare-atom rhs that isn't a known local — it's a literal value.
         if isinstance(right_raw, str) and right_raw not in ((ctx.get('locals') or {})) and not right_raw.startswith('"') and '.' not in right_raw:
             try: float(right_raw)
             except ValueError:
-                if right_raw.lower() not in ('true', 'false'):
+                if right_raw.lower() not in ('true', 'false', 'null', 'nil'):
                     right = f'"{right_raw}"'
         if op == 'NOT_IN':
             cond_str = f"!{right}.Contains({left})"

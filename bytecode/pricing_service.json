@@ -177,26 +177,36 @@
                     { "op": "DEFINE_VAR", "name": "total_discount_pct", "type": "decimal", "value": 0 },
 
                     { "op": "COMMENT", "text": "── Rule 1: Volume discount (first match wins) ──" },
-                    { "op": "MATCH", "value": "request.quantity", "cases": {
-                        "GTE_100": [
+                    { "op": "BRANCH", "condition": { "left": "request.quantity", "op": ">=", "right": 100 }, "cases": {
+                        "TRUE": [
                           { "op": "APPEND", "target": "discounts", "value": {
                               "type": "volume", "reason": "volume 100+", "percentage": 15 }},
                           { "op": "COMPUTE", "assign": "total_discount_pct",
                             "left": "total_discount_pct", "operator": "+", "right": 15, "result_type": "decimal" }
                         ],
-                        "GTE_50": [
-                          { "op": "APPEND", "target": "discounts", "value": {
-                              "type": "volume", "reason": "volume 50+", "percentage": 10 }},
-                          { "op": "COMPUTE", "assign": "total_discount_pct",
-                            "left": "total_discount_pct", "operator": "+", "right": 10, "result_type": "decimal" }
-                        ],
-                        "GTE_20": [
-                          { "op": "APPEND", "target": "discounts", "value": {
-                              "type": "volume", "reason": "volume 20+", "percentage": 5 }},
-                          { "op": "COMPUTE", "assign": "total_discount_pct",
-                            "left": "total_discount_pct", "operator": "+", "right": 5, "result_type": "decimal" }
-                        ],
-                        "DEFAULT": []
+                        "FALSE": [
+                          { "op": "BRANCH", "condition": { "left": "request.quantity", "op": ">=", "right": 50 }, "cases": {
+                              "TRUE": [
+                                { "op": "APPEND", "target": "discounts", "value": {
+                                    "type": "volume", "reason": "volume 50+", "percentage": 10 }},
+                                { "op": "COMPUTE", "assign": "total_discount_pct",
+                                  "left": "total_discount_pct", "operator": "+", "right": 10, "result_type": "decimal" }
+                              ],
+                              "FALSE": [
+                                { "op": "BRANCH", "condition": { "left": "request.quantity", "op": ">=", "right": 20 }, "cases": {
+                                    "TRUE": [
+                                      { "op": "APPEND", "target": "discounts", "value": {
+                                          "type": "volume", "reason": "volume 20+", "percentage": 5 }},
+                                      { "op": "COMPUTE", "assign": "total_discount_pct",
+                                        "left": "total_discount_pct", "operator": "+", "right": 5, "result_type": "decimal" }
+                                    ],
+                                    "FALSE": []
+                                  }
+                                }
+                              ]
+                            }
+                          }
+                        ]
                       }
                     },
 
@@ -220,20 +230,25 @@
 
                     { "op": "COMMENT", "text": "── Rule 3: Day of week discount ──" },
                     { "op": "GET_CURRENT", "what": "day_of_week", "assign": "today" },
-                    { "op": "MATCH", "value": "today", "cases": {
-                        "tuesday": [
+                    { "op": "BRANCH", "condition": { "left": "today", "op": "==", "right": "tuesday" }, "cases": {
+                        "TRUE": [
                           { "op": "APPEND", "target": "discounts", "value": {
                               "type": "promo", "reason": "Tuesday promo", "percentage": 5 }},
                           { "op": "COMPUTE", "assign": "total_discount_pct",
                             "left": "total_discount_pct", "operator": "+", "right": 5, "result_type": "decimal" }
                         ],
-                        "thursday": [
-                          { "op": "APPEND", "target": "discounts", "value": {
-                              "type": "promo", "reason": "Thursday promo", "percentage": 3 }},
-                          { "op": "COMPUTE", "assign": "total_discount_pct",
-                            "left": "total_discount_pct", "operator": "+", "right": 3, "result_type": "decimal" }
-                        ],
-                        "DEFAULT": []
+                        "FALSE": [
+                          { "op": "BRANCH", "condition": { "left": "today", "op": "==", "right": "thursday" }, "cases": {
+                              "TRUE": [
+                                { "op": "APPEND", "target": "discounts", "value": {
+                                    "type": "promo", "reason": "Thursday promo", "percentage": 3 }},
+                                { "op": "COMPUTE", "assign": "total_discount_pct",
+                                  "left": "total_discount_pct", "operator": "+", "right": 3, "result_type": "decimal" }
+                              ],
+                              "FALSE": []
+                            }
+                          }
+                        ]
                       }
                     },
 

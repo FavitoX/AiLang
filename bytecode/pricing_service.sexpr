@@ -174,26 +174,30 @@
                         (DEFINE_VAR discounts List<DiscountDetail> (list))
                         (DEFINE_VAR total_discount_pct decimal 0)
                         ;; ── Rule 1: Volume discount (first match wins) ──
-                        (MATCH request.quantity
-                                      (GTE_100
+                        (BRANCH (>= request.quantity 100)
+                                      (TRUE
                                         (APPEND discounts
                                                           (type volume)
                                                           (reason "volume 100+")
                                                           (percentage 15))
                                         (COMPUTE total_discount_pct + 15 → total_discount_pct))
-                                      (GTE_50
-                                        (APPEND discounts
-                                                          (type volume)
-                                                          (reason "volume 50+")
-                                                          (percentage 10))
-                                        (COMPUTE total_discount_pct + 10 → total_discount_pct))
-                                      (GTE_20
-                                        (APPEND discounts
-                                                          (type volume)
-                                                          (reason "volume 20+")
-                                                          (percentage 5))
-                                        (COMPUTE total_discount_pct + 5 → total_discount_pct))
-                                      (DEFAULT))
+                                      (FALSE
+                                        (BRANCH (>= request.quantity 50)
+                                                          (TRUE
+                                                            (APPEND discounts
+                                                                                  (type volume)
+                                                                                  (reason "volume 50+")
+                                                                                  (percentage 10))
+                                                            (COMPUTE total_discount_pct + 10 → total_discount_pct))
+                                                          (FALSE
+                                                            (BRANCH (>= request.quantity 20)
+                                                                                  (TRUE
+                                                                                    (APPEND discounts
+                                                                                                              (type volume)
+                                                                                                              (reason "volume 20+")
+                                                                                                              (percentage 5))
+                                                                                    (COMPUTE total_discount_pct + 5 → total_discount_pct))
+                                                                                  (FALSE))))))
                         ;; ── Rule 2: Customer type discount ──
                         (MATCH request.customer_type
                                       (premium
@@ -211,20 +215,22 @@
                                       (regular))
                         ;; ── Rule 3: Day of week discount ──
                         (GET_CURRENT clock day_of_week → today)
-                        (MATCH today
-                                      (tuesday
+                        (BRANCH (== today tuesday)
+                                      (TRUE
                                         (APPEND discounts
                                                           (type promo)
                                                           (reason "Tuesday promo")
                                                           (percentage 5))
                                         (COMPUTE total_discount_pct + 5 → total_discount_pct))
-                                      (thursday
-                                        (APPEND discounts
-                                                          (type promo)
-                                                          (reason "Thursday promo")
-                                                          (percentage 3))
-                                        (COMPUTE total_discount_pct + 3 → total_discount_pct))
-                                      (DEFAULT))
+                                      (FALSE
+                                        (BRANCH (== today thursday)
+                                                          (TRUE
+                                                            (APPEND discounts
+                                                                                  (type promo)
+                                                                                  (reason "Thursday promo")
+                                                                                  (percentage 3))
+                                                            (COMPUTE total_discount_pct + 3 → total_discount_pct))
+                                                          (FALSE))))
                         ;; ── Rule 4: Coupon (optional) ──
                         (BRANCH (!= request.coupon_code null)
                                       (TRUE
