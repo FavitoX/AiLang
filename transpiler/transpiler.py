@@ -642,7 +642,8 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
             declared = entry.get('params', []) or []
             status = entry.get('http_status', 422)
             # Pass params in the declared order so the factory signature matches.
-            args = [_cs_value(params.get(p, "")) for p in declared]
+            # Use _cs_expr so JsonNode-typed roots get indexer access (Phase 3b).
+            args = [_cs_expr(params.get(p, ""), ctx) for p in declared]
             lines.append(f'{pad}return Results.Json(AiLangError.{factory}({", ".join(args)}), statusCode: {status});')
         else:
             tag = err_type_tag(err_type)
@@ -842,7 +843,11 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
 
     elif op == 'LOG':
         level = inst.get('level', 'INFO')
-        lines.append(f'{pad}Console.WriteLine($"[{level}] {inst["message"]}");')
+        import re
+        msg = inst['message']
+        # PascalCase member access segments inside {interpolation} braces.
+        msg = re.sub(r'\{(\w+(?:\.\w+)+)\}', lambda m: '{' + m.group(1).split('.')[0] + ''.join('.' + pascal_case(s) for s in m.group(1).split('.')[1:]) + '}', msg)
+        lines.append(f'{pad}Console.WriteLine($"[{level}] {msg}");')
 
     return [l for l in lines if l != ""]
 
@@ -1824,6 +1829,9 @@ def generate_csharp(bc, output_dir: str):
         for inst in instructions:
             lines.extend(compile_instruction_csharp(inst, 1, ctx))
 
+        # Safety return — guarantees the lambda always returns an IResult so C#
+        # doesn't complain about missing return paths in complex MATCH/BRANCH trees.
+        lines.append("    return Results.StatusCode(500); // unreachable — safety fallback")
         lines.append("});")
         lines.append("")
 
