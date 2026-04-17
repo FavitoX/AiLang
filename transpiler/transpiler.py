@@ -4549,6 +4549,39 @@ def _group_ops_by_request(run_ops: list) -> list[list]:
     return groups
 
 
+def _env_var_for_dependency(bc, dep_name: str, fallback: str = None) -> str:
+    """Resolve `(dependencies (name (base_url_ref ENV.X) …))` → env var name `X`.
+    Falls back to `UPPER_SNAKE_URL` when no explicit ref exists."""
+    dep = (bc.dependencies or {}).get(dep_name) or {}
+    ref = dep.get('base_url_ref', '') or ''
+    ref = ref.replace('ENV.', '').strip()
+    if ref:
+        return ref
+    if fallback:
+        return fallback
+    return dep_name.upper() + "_URL"
+
+
+def _mock_body_to_json(body) -> str:
+    """Turn a parsed (body …) tail into a JSON literal string.
+
+    - List of `['item', …]` forms → JSON array (each item's children are
+      (key value) pairs emitted as an object).
+    - List of `(key value)` pairs → JSON object.
+    - None / empty → `"{}"` (caller picks array/object context elsewhere if needed).
+    """
+    if not body:
+        return "{}"
+    # Detect array shape: any top-level 'item' form marks this body as an array.
+    if any(isinstance(b, list) and b and b[0] == 'item' for b in body):
+        elements = []
+        for b in body:
+            if isinstance(b, list) and b and b[0] == 'item':
+                elements.append(_json_literal_from_body_form(b[1:]))
+        return '[' + ','.join(elements) + ']'
+    return _json_literal_from_body_form(body)
+
+
 def _scan_captures(run_ops: list) -> list[str]:
     """Return CAPTURE target variables in declaration order (dedup preserving order)."""
     seen = []
@@ -4642,12 +4675,16 @@ def _compile_test_step_body_csharp(step: list, captures: set, pad: str) -> list[
                 for s in segs:
                     walk += f'.GetProperty("{s}")'
                 expected = op[2] if len(op) > 2 else None
+                expected_str = str(expected).strip('"').lower() if expected is not None else ''
                 if str(expected) == 'exists':
                     probe = '_body'
                     for s in segs[:-1]:
                         probe += f'.GetProperty("{s}")'
                     last = segs[-1] if segs else ''
                     lines.append(f'{pad}Assert.True({probe}.TryGetProperty("{last}", out _));')
+                elif isinstance(expected, bool) or expected_str in ('true', 'false'):
+                    want_bool = 'true' if (expected is True or expected_str == 'true') else 'false'
+                    lines.append(f'{pad}Assert.Equal({want_bool}, {walk}.GetBoolean());')
                 elif isinstance(expected, (int, float)) and not isinstance(expected, bool):
                     lines.append(f'{pad}Assert.Equal({expected}M, {walk}.GetDecimal());')
                 else:
@@ -4753,8 +4790,12 @@ def _compile_test_step_body_go(step: list, captures: set, pad: str) -> list[str]
                     walk = f'({walk}["{s}"].(map[string]any))'
                 last = segs[-1]
                 expected = op[2] if len(op) > 2 else None
+                expected_str = str(expected).strip('"').lower() if expected is not None else ''
                 if str(expected) == 'exists':
                     lines.append(f'{pad}if _, _ok := {walk}["{last}"]; !_ok {{ t.Errorf("missing field: {target}") }}')
+                elif isinstance(expected, bool) or expected_str in ('true', 'false'):
+                    want_bool = 'true' if (expected is True or expected_str == 'true') else 'false'
+                    lines.append(f'{pad}if v, _ := {walk}["{last}"].(bool); v != {want_bool} {{ t.Errorf("{target} = %v, want {want_bool}", {walk}["{last}"]) }}')
                 elif isinstance(expected, (int, float)) and not isinstance(expected, bool):
                     lines.append(f'{pad}if v, _ := {walk}["{last}"].(float64); v != {float(expected)} {{ t.Errorf("{target} = %v, want {expected}", {walk}["{last}"]) }}')
                 else:
@@ -4819,6 +4860,10 @@ def generate_csharp_tests(bc, main_output_dir: str):
     with open(os.path.join(tests_dir, f"{main_proj_name}.Tests.csproj"), 'w') as f:
         f.write(csproj)
 
+    # Any test in this file that needs CALL_SERVICE mocks drives an extra helper
+    # + per-test WithWebHostBuilder override. Emit those conditionally.
+    any_mocks = any(t.get('mock_services') for t in bc.tests)
+
     # ApiTests.cs
     jwt_env_default = "dev-secret-key-min-32-characters!!"
     lines = []
@@ -4827,16 +4872,45 @@ def generate_csharp_tests(bc, main_output_dir: str):
     lines.append("// Auto-generated from (tests ...) section — DO NOT EDIT")
     lines.append("// ═══════════════════════════════════════════════════════════════")
     lines.append("using System.IdentityModel.Tokens.Jwt;")
+    lines.append("using System.Net;")
     lines.append("using System.Net.Http;")
     lines.append("using System.Net.Http.Headers;")
     lines.append("using System.Security.Claims;")
     lines.append("using System.Text;")
     lines.append("using System.Text.Json;")
     lines.append("using Microsoft.AspNetCore.Mvc.Testing;")
+    lines.append("using Microsoft.AspNetCore.TestHost;")
     lines.append("using Microsoft.Extensions.DependencyInjection;")
+    lines.append("using Microsoft.Extensions.Http;")
     lines.append("using Microsoft.IdentityModel.Tokens;")
     lines.append("using Xunit;")
     lines.append("")
+    if any_mocks:
+        # MockHttpHandler: intercepts CALL_SERVICE outbound traffic for a named HttpClient.
+        # First matching (method, path) rule wins; unmatched requests respond 404.
+        # We install it via ConfigurePrimaryHttpMessageHandler so the resilience pipeline
+        # configured in Program.cs still runs on top of the canned transport.
+        lines.append("internal sealed class MockHttpHandler : HttpMessageHandler")
+        lines.append("{")
+        lines.append("    private readonly (string Method, string Path, int Status, string Body)[] _rules;")
+        lines.append("    public MockHttpHandler((string, string, int, string)[] rules) { _rules = rules; }")
+        lines.append("    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)")
+        lines.append("    {")
+        lines.append("        var method = request.Method.Method;")
+        lines.append("        var path = request.RequestUri!.AbsolutePath;")
+        lines.append("        foreach (var rule in _rules)")
+        lines.append("        {")
+        lines.append("            if (rule.Method == method && rule.Path == path)")
+        lines.append("            {")
+        lines.append("                var resp = new HttpResponseMessage((HttpStatusCode)rule.Status);")
+        lines.append('                resp.Content = new StringContent(rule.Body, Encoding.UTF8, "application/json");')
+        lines.append("                return Task.FromResult(resp);")
+        lines.append("            }")
+        lines.append("        }")
+        lines.append("        return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));")
+        lines.append("    }")
+        lines.append("}")
+        lines.append("")
     lines.append("public class ApiTests : IDisposable")
     lines.append("{")
     lines.append("    // A fresh WebApplicationFactory per test: each test gets its own DI graph")
@@ -4880,10 +4954,47 @@ def generate_csharp_tests(bc, main_output_dir: str):
     for test in bc.tests:
         ident = _test_name_to_ident(test['name'])
         run_ops = test.get('run') or []
+        mocks = test.get('mock_services') or {}
         captures: set = set()
         lines.append("    [Fact]")
         lines.append(f"    public async Task {ident}()")
         lines.append("    {")
+        # When a test declares mocks, derive a factory with overridden HttpClient
+        # handlers and bind _client to the derived factory's CreateClient().
+        # Without mocks we keep using the shared field _client from the ctor.
+        client_var = "_client"
+        if mocks:
+            lines.append("        var _mockFactory = _factory.WithWebHostBuilder(builder =>")
+            lines.append("        {")
+            lines.append("            builder.ConfigureTestServices(services =>")
+            lines.append("            {")
+            for svc, endpoints in mocks.items():
+                rules_cs = []
+                for ep in endpoints:
+                    body_json = _mock_body_to_json(ep.get('body'))
+                    body_escaped = body_json.replace('\\', '\\\\').replace('"', '\\"')
+                    rules_cs.append(f'("{ep["method"]}", "{ep["path"]}", {ep["status"]}, "{body_escaped}")')
+                rules_join = ",\n                        ".join(rules_cs)
+                lines.append(f'                services.AddHttpClient("{svc}")')
+                lines.append("                    .ConfigurePrimaryHttpMessageHandler(() => new MockHttpHandler(new (string, string, int, string)[]")
+                lines.append("                    {")
+                lines.append("                        " + rules_join)
+                lines.append("                    }));")
+                # Also override the _no_retry sibling if the main codegen registered one
+                # (resilience policies with retry emit it). Safe to always register — if
+                # the service has no such client, AddHttpClient just creates it harmlessly.
+                lines.append(f'                services.AddHttpClient("{svc}_no_retry")')
+                lines.append("                    .ConfigurePrimaryHttpMessageHandler(() => new MockHttpHandler(new (string, string, int, string)[]")
+                lines.append("                    {")
+                lines.append("                        " + rules_join)
+                lines.append("                    }));")
+            lines.append("            });")
+            lines.append("        });")
+            lines.append("        using var _mockedClient = _mockFactory.CreateClient();")
+            client_var = "_mockedClient"
+        # Swap the effective client name used by the compiled run ops.
+        if client_var != "_client":
+            lines.append(f"        var _client = {client_var};  // shadow outer field for this test")
         lines.append("        try")
         lines.append("        {")
         lines.extend(_compile_test_run_csharp(run_ops, captures, indent=3))
@@ -4948,8 +5059,27 @@ def generate_go_tests(bc, output_dir: str):
     for test in bc.tests:
         ident = 'Test' + pascal_case(_test_name_to_ident(test['name']))
         run_ops = test.get('run') or []
+        mocks = test.get('mock_services') or {}
         captures: set = set()
         lines.append(f"func {ident}(t *testing.T) {{")
+        # Mocks must be started and env vars set BEFORE newTestServer — buildHandler
+        # reads serviceURLs at wire-up time.
+        for svc, endpoints in mocks.items():
+            env_var = _env_var_for_dependency(bc, svc)
+            mock_var = f"_mock_{svc}"
+            lines.append(f"\t{mock_var} := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {{")
+            lines.append('\t\tw.Header().Set("Content-Type", "application/json")')
+            for ep in endpoints:
+                json_body = _mock_body_to_json(ep.get('body'))
+                lines.append(f'\t\tif r.Method == "{ep["method"]}" && r.URL.Path == "{ep["path"]}" {{')
+                lines.append(f'\t\t\tw.WriteHeader({ep["status"]})')
+                lines.append(f'\t\t\tw.Write([]byte(`{json_body}`))')
+                lines.append('\t\t\treturn')
+                lines.append('\t\t}')
+            lines.append("\t\thttp.NotFound(w, r)")
+            lines.append("\t}))")
+            lines.append(f"\tdefer {mock_var}.Close()")
+            lines.append(f'\tt.Setenv("{env_var}", {mock_var}.URL)')
         lines.append("\tts := newTestServer(t)")
         lines.extend(_compile_test_run_go(run_ops, captures, indent=1))
         lines.append("}")

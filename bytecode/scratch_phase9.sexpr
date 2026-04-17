@@ -1,0 +1,123 @@
+;; Scratch service — v0.9 phase 9 validator for the LEGACY test format
+;; + mock_services. Same service shape as phase 3b (calls product_service,
+;; reads JsonNode fields, returns typed response), but tests are written in
+;; the (tests (cases (item (name X) (setup (mock_services …)) (run (item …))))) form.
+
+(service scratch_legacy_tests
+  (version "0.9-phase9")
+  (port 8099))
+
+(schema PriceCheckRequest
+  (field product_id string  (required))
+  (field quantity   decimal (required) (gt 0)))
+
+(schema PriceCheckResponse
+  (field product_id string  (required))
+  (field unit_price decimal (required))
+  (field subtotal   decimal (required))
+  (field in_stock   bool    (required)))
+
+(config
+  (jwt_secret secret "JWT_SECRET"))
+
+(auth
+  (provider jwt)
+  (secret_ref jwt_secret))
+
+(cors
+  (origins "*")
+  (methods POST)
+  (headers "Content-Type" "Authorization")
+  (max_age 3600))
+
+(dependencies
+  (product_service
+    (type SERVICE_REF)
+    (target product_service)
+    (base_url_ref ENV.PRODUCT_SERVICE_URL)
+    (default "http://localhost:8080")))
+
+(route POST "/check-price" handler_check_price)
+
+(handler handler_check_price
+  (auth (requires authenticated))
+  (returns (RESULT PriceCheckResponse Error))
+  (do
+    (READ_BODY PriceCheckRequest → body)
+    (MATCH body
+      (ERR (ERR_INVALID_BODY "PriceCheckRequest"))
+      (OK
+        (CALL_SERVICE product_service
+          (method GET)
+          (path "/products/{body.product_id}")
+          (idempotent true)
+          → product_result)
+        (MATCH product_result
+          (NONE (ERR_NOT_FOUND "product" body.product_id))
+          (OK
+            (COMPUTE product_result.price * body.quantity → subtotal)
+            (CONSTRUCT PriceCheckResponse
+              (product_id   product_result.id)
+              (unit_price   product_result.price)
+              (subtotal     subtotal)
+              (in_stock     product_result.active)
+              → resp)
+            (RESPOND 200 resp)))))))
+
+;; ── Legacy-format tests (v0.6 shape: cases/item/assert/equals) ──
+(tests
+  (cases
+    (item
+      (name price_check_happy_path)
+      (setup
+        (mock_services
+          (product_service
+            (item
+              (method GET)
+              (path "/products/widget-1")
+              (response
+                (status 200)
+                (body
+                  (id widget-1)
+                  (name "Test Widget")
+                  (price 10)
+                  (active true)))))))
+      (run
+        (item
+          (action REQUEST)
+          (method POST)
+          (path "/check-price")
+          (auth true)
+          (body
+            (product_id widget-1)
+            (quantity 4)))
+        (item
+          (assert status)
+          (equals 200))
+        (item
+          (assert body.product_id)
+          (equals widget-1))
+        (item
+          (assert body.unit_price)
+          (equals 10))
+        (item
+          (assert body.subtotal)
+          (equals 40))
+        (item
+          (assert body.in_stock)
+          (equals true))))
+
+    (item
+      (name price_check_requires_auth)
+      (run
+        (item
+          (action REQUEST)
+          (method POST)
+          (path "/check-price")
+          (auth false)
+          (body
+            (product_id widget-1)
+            (quantity 1)))
+        (item
+          (assert status)
+          (equals 401))))))

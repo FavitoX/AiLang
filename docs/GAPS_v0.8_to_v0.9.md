@@ -121,7 +121,11 @@ pero no transpilan a código compilable en C# .NET 10 / Go 1.25.
   - Seams: C# expone `public partial class Program { }`; Go expone `func buildHandler() http.Handler`. Los stores in-memory exponen `Reset()` para `RESET_STORE` en `(clean ...)`.
   - Cubre REQUEST (con auth/body), ASSERT (status/nested fields/`exists`/`length >= N`), CAPTURE con interpolación de path (`{var}`).
   - Bonus: fix al contrato de `READ_BODY` — ahora llama `body.Validate()` automáticamente tanto en C# como Go (antes solo existía el método en Go y jamás se invocaba).
-- **Pendiente:** formato legacy `(tests (cases (item (name X) (setup (mock_services ...)) (run (item (action REQUEST) ...)))))` que usan order/pricing/payment/dashboard — requiere parser separado en `_parse_tests`.
+- **Phase 9 (2026-04-16 — ✅ implementado):** parser normaliza el formato legacy `(tests (cases (item (name X) (setup (mock_services …)) (run (item (action REQUEST) …) (item (assert path) (equals v))))))` al mismo AST v0.7 (`[{name, run: [REQUEST|ASSERT|CAPTURE], clean, mock_services}]`). `mock_services` se extrae a dict `{svc: [{method, path, status, body}]}` con el body convertido a JSON (array si hay `item` anidados, object si hay pares).
+  - **Go gen**: emite `httptest.NewServer` con routing method+path por cada mock, luego `t.Setenv(<env-var>, mock.URL)` para que `buildHandler()` lea la URL correcta al armar el serviceURLs map. El env var se resuelve desde `dependencies.<svc>.base_url_ref`.
+  - **C# gen**: emite una clase `MockHttpHandler : HttpMessageHandler` + en cada `[Fact]` con mocks deriva el factory con `WithWebHostBuilder(b => b.ConfigureTestServices(s => s.AddHttpClient("svc").ConfigurePrimaryHttpMessageHandler(() => new MockHttpHandler(...))))`. También registra el cliente `<svc>_no_retry` para policies con retry no-idempotent.
+  - **Bonus**: asserts con `(equals true/false)` ahora usan el branch correcto (bool) en vez de caer al string en ambos targets.
+  - Validado con `scratch_phase9.sexpr`: 2/2 tests pasan Go + C# (happy path con mock + requires_auth).
 - PostgreSQL-backed services quedan fuera del MVP (necesitan testcontainers/DB real).
 
 ---

@@ -385,28 +385,165 @@ class SExprBytecodeParser:
         return {'wrapper': 'single', 'type': str(inner)}
 
     def _parse_tests(self) -> list:
+        """Parse both test formats and normalize to a single AST shape.
+
+        v0.7 (inline):
+          (tests name (test "label" (setup …) (run (REQUEST …) (ASSERT …)) (clean …)) …)
+
+        Legacy v0.6 (JSON-origin):
+          (tests (cases (item (name X) (setup …) (run (item (action REQUEST) …)
+                                                     (item (assert path) (equals v))))))
+
+        Normalized output per test:
+          { name, run: [[REQUEST …] | [ASSERT …] | [CAPTURE …], …],
+            clean: list-of-ops, mock_services: {svc: [{method,path,status,body}]} }
+        Setup is absorbed into the normalized fields so downstream doesn't have
+        to know which format came in. Setup ops other than mock_services are
+        kept under test['setup_ops'] for future use (MOCK_CLOCK, seed_data).
+        """
         tests_form = find_form(self.exprs, 'tests')
         if not tests_form:
             return []
-        
+
+        # Legacy wrapper: (tests (cases (item …) …))
+        cases_form = None
+        for item in tests_form[1:]:
+            if isinstance(item, list) and item and item[0] == 'cases':
+                cases_form = item
+                break
+        if cases_form:
+            return [self._normalize_legacy_test(c) for c in cases_form[1:]
+                    if isinstance(c, list) and c and c[0] == 'item']
+
+        # v0.7: inline (test …) forms
         tests = []
         for test_form in find_all_props(tests_form, 'test'):
             test = {'name': test_form[1]}
-            
             setup = find_prop(test_form, 'setup')
             run = find_prop(test_form, 'run')
             clean = find_prop(test_form, 'clean')
-            
             if setup:
                 test['setup'] = setup[1:]
+                # v0.7 didn't use mock_services in any shipped test yet, but we
+                # still honor the same parsing path so legacy features aren't
+                # gated behind the outer wrapper.
+                mocks, setup_ops = self._partition_setup(setup[1:])
+                test['mock_services'] = mocks
+                test['setup_ops'] = setup_ops
+            else:
+                test['mock_services'] = {}
+                test['setup_ops'] = []
             if run:
                 test['run'] = run[1:]
             if clean:
                 test['clean'] = clean[1:]
-            
             tests.append(test)
-        
+
         return tests
+
+    def _normalize_legacy_test(self, case: list) -> dict:
+        """Turn one (item (name …) (setup …) (run (item (action REQUEST) …) (item (assert …) (equals …)))) into the v0.7-shape dict."""
+        name_prop = find_prop(case, 'name')
+        name = str(name_prop[1]) if name_prop else 'unnamed'
+        setup_prop = find_prop(case, 'setup')
+        run_prop = find_prop(case, 'run')
+        clean_prop = find_prop(case, 'clean')
+
+        mocks, setup_ops = self._partition_setup(setup_prop[1:] if setup_prop else [])
+
+        run_ops = []
+        for item in (run_prop[1:] if run_prop else []):
+            if not (isinstance(item, list) and item and item[0] == 'item'):
+                continue
+            op = self._legacy_item_to_op(item)
+            if op:
+                run_ops.append(op)
+
+        return {
+            'name': name,
+            'run': run_ops,
+            'clean': clean_prop[1:] if clean_prop else [],
+            'mock_services': mocks,
+            'setup_ops': setup_ops,
+        }
+
+    @staticmethod
+    def _partition_setup(setup_items: list) -> tuple:
+        """Split a setup body into (mocks_dict, other_ops). Mocks are emitted
+        as HTTP stubs by the test generator; other ops (override_time, seed_data,
+        MOCK_CLOCK) flow through for future support."""
+        mocks = {}
+        others = []
+        for sub in setup_items:
+            if not (isinstance(sub, list) and sub):
+                continue
+            if sub[0] == 'mock_services':
+                for svc_form in sub[1:]:
+                    if not (isinstance(svc_form, list) and svc_form):
+                        continue
+                    svc_name = str(svc_form[0])
+                    endpoints = []
+                    for ep in svc_form[1:]:
+                        if not (isinstance(ep, list) and ep and ep[0] == 'item'):
+                            continue
+                        method_prop = find_prop(ep, 'method')
+                        path_prop = find_prop(ep, 'path')
+                        response_prop = find_prop(ep, 'response')
+                        status = 200
+                        body = None
+                        if response_prop:
+                            status_p = find_prop(response_prop, 'status')
+                            if status_p:
+                                try: status = int(status_p[1])
+                                except (TypeError, ValueError): pass
+                            body_p = find_prop(response_prop, 'body')
+                            if body_p:
+                                # body may be a list of (item …) for arrays, or pairs for a single object.
+                                body = body_p[1:]
+                        endpoints.append({
+                            'method': str(method_prop[1]).upper() if method_prop else 'GET',
+                            'path': str(path_prop[1]) if path_prop else '/',
+                            'status': status,
+                            'body': body,
+                        })
+                    mocks[svc_name] = endpoints
+            else:
+                others.append(sub)
+        return mocks, others
+
+    @staticmethod
+    def _legacy_item_to_op(item: list):
+        """Translate a legacy (item (action REQUEST) …) or (item (assert …) (equals …)) into a v0.7 op."""
+        action_prop = find_prop(item, 'action')
+        if action_prop and str(action_prop[1]).upper() == 'REQUEST':
+            method_prop = find_prop(item, 'method')
+            path_prop = find_prop(item, 'path')
+            auth_prop = find_prop(item, 'auth')
+            body_prop = find_prop(item, 'body')
+            op = ['REQUEST',
+                  str(method_prop[1]).upper() if method_prop else 'GET',
+                  str(path_prop[1]) if path_prop else '/']
+            if auth_prop:
+                op.append(['auth', 'true' if str(auth_prop[1]).lower() == 'true' else 'false'])
+            if body_prop:
+                op.append(['body'] + list(body_prop[1:]))
+            return op
+        assert_prop = find_prop(item, 'assert')
+        if assert_prop:
+            target = str(assert_prop[1])
+            eq_prop = find_prop(item, 'equals')
+            exists_prop = find_prop(item, 'exists')
+            if eq_prop is not None:
+                return ['ASSERT', target, eq_prop[1]]
+            if exists_prop is not None:
+                return ['ASSERT', target, 'exists']
+            return ['ASSERT', target]
+        capture_prop = find_prop(item, 'capture')
+        if capture_prop:
+            as_prop = find_prop(item, 'as')
+            return ['CAPTURE', str(capture_prop[1]), '→',
+                    str(as_prop[1]) if as_prop else 'captured']
+        return None
 
     def _parse_custom_errors(self) -> dict:
         """Parse custom errors from either:
