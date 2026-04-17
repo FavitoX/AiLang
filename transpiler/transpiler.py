@@ -748,12 +748,20 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
     elif op == 'ITERATE':
         collection = inst['collection']
         item = inst['item']
-        lines.append(f"{pad}foreach (var {item} in {collection})")
+        # Phase 7b: iterating a JsonNode array requires .AsArray() — foreach on
+        # JsonNode? is a type error. Also propagate the element type to inner
+        # locals so field access inside the body routes through JsonNode indexing.
+        coll_type = (ctx.get('locals') or {}).get(collection) if ctx else None
+        if coll_type == 'JsonNode':
+            lines.append(f"{pad}foreach (var {item} in {collection}!.AsArray())")
+            item_type = 'JsonNode'
+        else:
+            lines.append(f"{pad}foreach (var {item} in {collection})")
+            item_type = 'object'
         lines.append(f"{pad}{{")
-        # Inner scope: copy locals and register `item` (unknown element type).
         inner_ctx = dict(ctx)
         inner_ctx['locals'] = dict(ctx.get('locals', {}))
-        inner_ctx['locals'][item] = 'object'
+        inner_ctx['locals'][item] = item_type
         for sub in inst.get('body', []):
             lines.extend(compile_instruction_csharp(sub, indent + 1, inner_ctx))
         lines.append(f"{pad}}}")
@@ -1052,13 +1060,14 @@ def _compile_parallel_csharp(inst: dict, indent: int, ctx: dict) -> list[str]:
     for fiber in fibers:
         fname = fiber['name']
         task_var = f"_task_{assign}_{fname}"
-        fiber_task_names.append((fname, task_var))
-
         # Determine the fiber's "result var" from the last instruction's assign.
+        # Remembered alongside the task var so MATCH on `{assign}.{fname}` can
+        # rebind it in the OK arm (the result_var is otherwise lambda-local).
         result_var = None
         for f_inst in fiber.get('instructions', []):
             if f_inst.get('assign'):
                 result_var = f_inst['assign']
+        fiber_task_names.append((fname, task_var, result_var))
 
         lines.append(f"{pad}var {task_var} = Task.Run<System.Text.Json.Nodes.JsonNode?>(async () =>")
         lines.append(f"{pad}{{")
@@ -1092,7 +1101,7 @@ def _compile_await_all_csharp(inst: dict, indent: int, ctx: dict) -> list[str]:
     if not fibers:
         return [f"{pad}// WARN: AWAIT_ALL {source} — no matching PARALLEL block"]
 
-    task_list = ", ".join(tv for _, tv in fibers)
+    task_list = ", ".join(tv for _, tv, _ in fibers)
     lines = [f"{pad}// ── AWAIT_ALL {source} (timeout {timeout_ms}ms) ──"]
     lines.append(f"{pad}try")
     lines.append(f"{pad}{{")
@@ -1109,7 +1118,7 @@ def _compile_await_all_csharp(inst: dict, indent: int, ctx: dict) -> list[str]:
     # member-access idiom `parallel_results.fetch_products` just works.
     tuple_fields = ", ".join(
         f"{fname}: ({tv}.Status == TaskStatus.RanToCompletion ? {tv}.Result : null)"
-        for fname, tv in fibers
+        for fname, tv, _ in fibers
     )
     lines.append(f"{pad}var {source} = ({tuple_fields});")
     return lines
@@ -1236,11 +1245,28 @@ def compile_match_csharp(inst: dict, indent: int, ctx: dict = None) -> list[str]
     The value is used verbatim — C# tuples permit snake_case field names, so
     `parallel_results.fetch_products` already resolves correctly. Only Go
     requires PascalCasing of trailing segments (struct fields must be exported).
+
+    Phase 7b: when matching `{source}.{fiber}` and the source is a PARALLEL
+    result, the OK branch rebinds the fiber's in-fiber result_var to the tuple
+    field so downstream body code (which was written against the fiber-local
+    name) still resolves. Also registers the rebound name as JsonNode.
     """
     pad = "    " * indent
     lines = []
     value = inst['value']
     cases = inst.get('cases', {})
+
+    # Detect PARALLEL-result MATCH: lookup in ctx['_parallel_tasks'] by source name.
+    rebind_stmt = None
+    rebind_var = None
+    if isinstance(value, str) and '.' in value:
+        source, _, fname = value.partition('.')
+        fibers = ((ctx or {}).get('_parallel_tasks') or {}).get(source) or []
+        for fn, _tv, rv in fibers:
+            if fn == fname and rv:
+                rebind_var = rv
+                rebind_stmt = f"var {rv} = {value};"
+                break
 
     if 'OK' in cases and ('NONE' in cases or 'ERR' in cases):
         # RESULT match (find/read_body pattern) — OK/NONE or OK/ERR
@@ -1257,8 +1283,14 @@ def compile_match_csharp(inst: dict, indent: int, ctx: dict = None) -> list[str]
             if not has_return_in_fail:
                 lines.append(f"{pad}else")
                 lines.append(f"{pad}{{")
+            ok_indent = indent if has_return_in_fail else indent + 1
+            ok_pad = "    " * ok_indent
+            if rebind_stmt:
+                lines.append(f"{ok_pad}{rebind_stmt}")
+                # Register the rebound var as JsonNode so Phase 3b field access kicks in.
+                ctx.setdefault('locals', {})[rebind_var] = 'JsonNode'
             for sub in cases['OK']:
-                lines.extend(compile_instruction_csharp(sub, indent if has_return_in_fail else indent + 1, ctx))
+                lines.extend(compile_instruction_csharp(sub, ok_indent, ctx))
             if not has_return_in_fail:
                 lines.append(f"{pad}}}")
 
@@ -3900,10 +3932,23 @@ def compile_instruction_go(inst: dict, indent: int, ctx: dict = None) -> list[st
     elif op == 'ITERATE':
         collection = inst['collection']
         item = inst['item']
-        lines.append(f"{pad}for _, {item} := range {collection} {{")
+        # Phase 7b: JsonNode-like collections (from CALL_SERVICE) are decoded as
+        # map[string]any. To iterate as a list, cast the raw slice first. The
+        # emitted `_<coll>_arr` is a temporary []any slice; `item` inside the
+        # body becomes one element, registered as `map` so Phase 3b kicks in.
+        coll_type = (ctx.get('locals') or {}).get(collection) if ctx else None
+        if coll_type == 'map':
+            arr_var = f"_{collection}_arr"
+            lines.append(f'{pad}{arr_var}, _ := any({collection}).([]any)')
+            lines.append(f"{pad}for _, _elem := range {arr_var} {{")
+            lines.append(f'{pad}\t{item}, _ := _elem.(map[string]any)')
+            item_type = 'map'
+        else:
+            lines.append(f"{pad}for _, {item} := range {collection} {{")
+            item_type = 'object'
         inner_ctx = dict(ctx)
         inner_ctx['locals'] = dict(ctx.get('locals', {}))
-        inner_ctx['locals'][item] = 'object'
+        inner_ctx['locals'][item] = item_type
         for sub in inst.get('body', []):
             lines.extend(compile_instruction_go(sub, indent + 1, inner_ctx))
         lines.append(f"{pad}}}")
@@ -4174,12 +4219,20 @@ def _compile_parallel_go(inst: dict, indent: int, ctx: dict) -> list[str]:
     fibers = inst.get('fibers', []) or []
 
     lines = [f"{pad}// ── PARALLEL {assign}: {len(fibers)} fiber(s) ──"]
-    fiber_result_vars = []  # [(fiber_name, shared_var), ...]
+    fiber_result_vars = []  # [(fiber_name, shared_var, result_var), ...]
 
+    # Precompute each fiber's inner result_var — same logic as C# side — so the
+    # PARALLEL metadata records it for downstream MATCH rebinding.
+    fiber_result_lookup = {}
     for fiber in fibers:
         fname = fiber['name']
         shared = f"_pres_{assign}_{fname}"
-        fiber_result_vars.append((fname, shared))
+        rv = None
+        for f_inst in fiber.get('instructions', []):
+            if f_inst.get('assign'):
+                rv = f_inst['assign']
+        fiber_result_lookup[fname] = rv
+        fiber_result_vars.append((fname, shared, rv))
         lines.append(f"{pad}var {shared} map[string]any")
 
     lines.append(f"{pad}var _wg_{assign} sync.WaitGroup")
@@ -4188,10 +4241,7 @@ def _compile_parallel_go(inst: dict, indent: int, ctx: dict) -> list[str]:
     for fiber in fibers:
         fname = fiber['name']
         shared = f"_pres_{assign}_{fname}"
-        result_var = None
-        for f_inst in fiber.get('instructions', []):
-            if f_inst.get('assign'):
-                result_var = f_inst['assign']
+        result_var = fiber_result_lookup.get(fname)
         lines.append(f"{pad}go func() {{")
         lines.append(f"{pad}\tdefer _wg_{assign}.Done()")
         inner_ctx = dict(ctx)
@@ -4234,8 +4284,8 @@ def _compile_await_all_go(inst: dict, indent: int, ctx: dict) -> list[str]:
         lines.append(f"{pad}<-_done_{source}")
 
     # Build anonymous struct — Go inline struct field separator is `;`, not `,`.
-    struct_fields = "; ".join(f"{pascal_case(fn)} map[string]any" for fn, _ in fibers)
-    field_inits = ", ".join(f"{pascal_case(fn)}: {sv}" for fn, sv in fibers)
+    struct_fields = "; ".join(f"{pascal_case(fn)} map[string]any" for fn, _, _ in fibers)
+    field_inits = ", ".join(f"{pascal_case(fn)}: {sv}" for fn, sv, _ in fibers)
     lines.append(f"{pad}{source} := struct {{ {struct_fields} }}{{{field_inits}}}")
     lines.append(f"{pad}_ = {source}  // suppress unused warning when handler reads fields conditionally")
     return lines
@@ -4365,21 +4415,59 @@ def compile_match_go(inst: dict, indent: int, ctx: dict = None) -> list[str]:
     lines = []
     # Member access like `parallel_results.fetch_products` must PascalCase the
     # trailing segments to match Go struct field naming.
-    value = _go_value(inst['value'])
+    raw_value = inst['value']
+    value = _go_value(raw_value)
     cases = inst.get('cases', {})
 
+    # Phase 7b: parallel-result MATCH rebinds the fiber's inner result_var.
+    rebind_var = None
+    rebind_stmt = None
+    if isinstance(raw_value, str) and '.' in raw_value:
+        source, _, fname = raw_value.partition('.')
+        fibers = ((ctx or {}).get('_parallel_tasks') or {}).get(source) or []
+        for fn, _sv, rv in fibers:
+            if fn == fname and rv:
+                rebind_var = rv
+                rebind_stmt = f"{rv} := {source}.{pascal_case(fname)}"
+                break
+
     if 'OK' in cases and 'NONE' in cases:
-        # OK + NONE → pointer/nullable check (store.Find pattern)
-        lines.append(f"{pad}if {value} == nil {{")
+        # OK + NONE → pointer/nullable check (store.Find pattern).
+        # If the NONE branch always returns (err response), keep the old flat
+        # layout so OK continues at the outer indent. Otherwise wrap OK in an
+        # `else` so it doesn't execute with the nil value.
+        none_lines = []
         for sub in cases['NONE']:
-            lines.extend(compile_instruction_go(sub, indent + 1, ctx))
-        lines.append(f"{pad}}}")
-        for sub in cases['OK']:
-            lines.extend(compile_instruction_go(sub, indent, ctx))
+            none_lines.extend(compile_instruction_go(sub, indent + 1, ctx))
+        none_returns = any(l.strip().startswith('return') for l in none_lines)
+
+        lines.append(f"{pad}if {value} == nil {{")
+        lines.extend(none_lines)
+        if none_returns:
+            lines.append(f"{pad}}}")
+            if rebind_stmt:
+                lines.append(f"{pad}{rebind_stmt}")
+                lines.append(f"{pad}_ = {rebind_var}")
+                ctx.setdefault('locals', {})[rebind_var] = 'map'
+            for sub in cases['OK']:
+                lines.extend(compile_instruction_go(sub, indent, ctx))
+        else:
+            lines.append(f"{pad}}} else {{")
+            if rebind_stmt:
+                lines.append(f"{pad}\t{rebind_stmt}")
+                lines.append(f"{pad}\t_ = {rebind_var}")
+                ctx.setdefault('locals', {})[rebind_var] = 'map'
+            for sub in cases['OK']:
+                lines.extend(compile_instruction_go(sub, indent + 1, ctx))
+            lines.append(f"{pad}}}")
     elif 'OK' in cases and 'ERR' in cases:
         # OK + ERR → value-type MATCH after READ_BODY. Decode errors were already
         # handled by READ_BODY, so the ERR branch is dead code in Go (structs
         # can't be compared to nil). Emit the OK branch inline only.
+        if rebind_stmt:
+            lines.append(f"{pad}{rebind_stmt}")
+            lines.append(f"{pad}_ = {rebind_var}")
+            ctx.setdefault('locals', {})[rebind_var] = 'map'
         for sub in cases['OK']:
             lines.extend(compile_instruction_go(sub, indent, ctx))
 

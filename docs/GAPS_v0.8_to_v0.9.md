@@ -160,17 +160,22 @@ En Go se mantiene `map[string]any` (idiom estándar, no hay alternativa cleaner)
 ## 3. Pendientes conocidos post-Phase 3b
 
 ### dashboard_service (parse-only, no builda)
-El parse-time está desbloqueado (commit dc1a4e0), pero construir el service requiere varios gaps de instrucción aparte de Phase 3b:
-- **PARALLEL result plumbing**: los locals dentro de un fiber (p.ej. `products_response`) no fluyen al scope externo tras `AWAIT_ALL`. El acceso correcto es `parallel_results.fetch_products` — requiere reescribir los usos siguientes.
-- **ITERATE sobre JsonNode/map**: `(ITERATE products_response p (COMPUTE p.price * p.stock → …))` necesita que el iterador `p` herede el tipo JsonNode del collection (ahora queda como `object`), y que el wrapper emita `.AsArray()!` en C# / `.([]any)` en Go.
-- **SET_VAR con object literal**: `(SET_VAR products_section "{'total_count': …}")` emite el Python dict repr como string literal — hace falta soportar `(SET_VAR name (object (k v) …))` o similar.
-- **DEFINE_VAR con default object**: mismo problema — el default viene como string.
-- **MATCH con arms enteros**: `(MATCH services_up (3 …) (2 …) …)` no genera un switch; cae en el camino RESULT-style.
-- **COMPUTE widening int↔decimal**: `decimal_field * int_field` falla en Go (`mismatched types float64 and int`). C# lo tolera gracias a conversiones implícitas.
-- **GET_CURRENT dispatch**: hoy `(GET_CURRENT auth user → now)` + `(CONSTRUCT … (generated_at now) …)` emite `now = ctx.User.FindFirst("sub")?.Value`, aunque la intención era `CLOCK.NOW`. Hay que mapear el par `(from field)` a las operaciones correctas.
+El parse-time está desbloqueado (commit dc1a4e0). Phase 7b (2026-04-16) resuelve dos gaps. Quedan otros:
+
+**Resueltos en Phase 7b**:
+- ✅ **PARALLEL MATCH rebind**: `MATCH parallel_results.fetch_products` ahora auto-bindea el fiber's inner `result_var` (`products_response`) a `parallel_results.fetch_products` en el arm OK, en ambos targets. También registra el rebind en `ctx.locals` como JsonNode/map → Phase 3b field access funciona en el body del OK.
+- ✅ **ITERATE sobre JsonNode**: en C#, el iterador emite `.AsArray()!` y registra `item` como JsonNode en el inner scope. En Go, extrae a `[]any` via type assertion y asserta cada `_elem` a `map[string]any`.
+- ✅ **Go MATCH OK+NONE layout**: cuando NONE no retorna, OK se envuelve en `else` (antes ejecutaba con el valor nil).
+
+**Bloqueadores residuales**:
+- **Go `callService` sólo decodea objects**: retorna `map[string]any`, arrays revientan. Las fixtures del dashboard (`/products`, `/orders`, `/payments`) devuelven arrays. Refactor: hacer que retorne `any` y que los call sites asserteen por shape. Afecta también pricing y order.
+- **SET_VAR / DEFINE_VAR con object literal**: `(SET_VAR products_section "{'total_count': …}")` — el converter JSON→sexpr serializó un object literal como repr de Python. Necesita soporte para `(object (k v) …)` en ambos, sexpr parser + codegen.
+- **MATCH con arms enteros**: `(MATCH services_up (3 …) (2 …) …)` cae en el camino RESULT-style. Hacen falta arms de valor concreto → `switch` en ambos targets.
+- **COMPUTE widening int↔decimal en Go**: `decimal_field * int_field` falla (`mismatched types float64 and int`). C# tolera via conversiones implícitas.
+- **GET_CURRENT `auth.user` vs `clock.now`**: el codegen ya dispatchea bien (`clock now` → `DateTime.UtcNow`/`time.Now()`). El dashboard bytecode tiene un bug: pide `(GET_CURRENT auth user → now)` pero lo usa como timestamp. Es bug del bytecode, no del codegen — fixear en `.sexpr`.
 
 ### pricing_service, payment_service, order_service
-Gaps propios documentados en memoria (topic_key `legacy/per-service-codegen-gaps`); ninguno bloqueado solamente por Phase 3b.
+Gaps propios documentados en memoria (topic_key `legacy/per-service-codegen-gaps`); ninguno bloqueado solamente por Phase 3b/7b.
 
 
 ## 3. Orden de prioridad recomendado para v0.9

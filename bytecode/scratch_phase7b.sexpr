@@ -1,0 +1,138 @@
+;; Scratch service — v0.9 phase 7b validator.
+;; Exercises PARALLEL + MATCH OK rebind + ITERATE over JsonNode field access.
+;;
+;; Note: Go's callService() currently decodes into map[string]any, so arrays
+;; don't round-trip (see "Go callService shape" in docs/GAPS). This scratch
+;; therefore has the upstream mock return objects, not arrays — validates
+;; the PARALLEL plumbing + JsonNode field access without tripping that gap.
+
+(service scratch_p7b
+  (version "0.9-phase7b")
+  (port 8100))
+
+(schema SummaryResponse
+  (field products_ok bool    (required))
+  (field orders_ok   bool    (required))
+  (field sample_name string  (required)))
+
+(config
+  (jwt_secret secret "JWT_SECRET"))
+
+(auth
+  (provider jwt)
+  (secret_ref jwt_secret))
+
+(cors
+  (origins "*")
+  (methods GET)
+  (headers "Content-Type" "Authorization")
+  (max_age 3600))
+
+(dependencies
+  (product_service
+    (type SERVICE_REF)
+    (target product_service)
+    (base_url_ref ENV.PRODUCT_SERVICE_URL)
+    (default "http://localhost:8080"))
+  (order_service
+    (type SERVICE_REF)
+    (target order_service)
+    (base_url_ref ENV.ORDER_SERVICE_URL)
+    (default "http://localhost:8081")))
+
+(route GET "/summary" handler_summary)
+
+(handler handler_summary
+  (auth (requires authenticated))
+  (returns (RESULT SummaryResponse Error))
+  (do
+    (PARALLEL → parallel_results
+      (fiber fetch_product
+        (CALL_SERVICE product_service
+          (method GET)
+          (path "/products/p1")
+          (idempotent true)
+          → products_response))
+      (fiber fetch_order
+        (CALL_SERVICE order_service
+          (method GET)
+          (path "/orders/o1")
+          (idempotent true)
+          → orders_response)))
+    (AWAIT_ALL parallel_results (timeout_ms 2000))
+    (DEFINE_VAR products_ok  bool   false)
+    (DEFINE_VAR orders_ok    bool   false)
+    (DEFINE_VAR sample_name  string "none")
+    ;; OK-arm auto-binds `products_response` = parallel_results.fetch_product (JsonNode in C#).
+    (MATCH parallel_results.fetch_product
+      (NONE (LOG WARNING "product_service unavailable"))
+      (OK
+        (SET_VAR products_ok true)
+        ;; Phase 3b field access over the rebound JsonNode root.
+        (SET_VAR sample_name products_response.name)))
+    (MATCH parallel_results.fetch_order
+      (NONE (LOG WARNING "order_service unavailable"))
+      (OK (SET_VAR orders_ok true)))
+    (CONSTRUCT SummaryResponse
+      (products_ok products_ok)
+      (orders_ok   orders_ok)
+      (sample_name sample_name)
+      → resp)
+    (RESPOND 200 resp)))
+
+;; ── Legacy-format tests (both services mocked) ──
+(tests
+  (cases
+    (item
+      (name summary_both_ok)
+      (setup
+        (mock_services
+          (product_service
+            (item
+              (method GET)
+              (path "/products/p1")
+              (response
+                (status 200)
+                (body
+                  (id p1)
+                  (name "Alpha Widget")
+                  (price 10)))))
+          (order_service
+            (item
+              (method GET)
+              (path "/orders/o1")
+              (response
+                (status 200)
+                (body
+                  (id o1)
+                  (total 50)))))))
+      (run
+        (item (action REQUEST) (method GET) (path "/summary") (auth true))
+        (item (assert status) (equals 200))
+        (item (assert body.products_ok) (equals true))
+        (item (assert body.orders_ok) (equals true))
+        (item (assert body.sample_name) (equals "Alpha Widget"))))
+
+    (item
+      (name summary_product_down)
+      (setup
+        (mock_services
+          (product_service
+            (item
+              (method GET)
+              (path "/products/p1")
+              (response
+                (status 500))))
+          (order_service
+            (item
+              (method GET)
+              (path "/orders/o1")
+              (response
+                (status 200)
+                (body (id o1) (total 99)))))))
+      (run
+        (item (action REQUEST) (method GET) (path "/summary") (auth true))
+        (item (assert status) (equals 200))
+        (item (assert body.products_ok) (equals false))
+        (item (assert body.orders_ok) (equals true))
+        (item (assert body.sample_name) (equals "none"))))))
