@@ -110,7 +110,13 @@
                     → payments_response)))
     (AWAIT_ALL parallel_results (timeout_ms 5000))
     ;; ── Process products (graceful degradation) ──
-    (DEFINE_VAR products_section object "{'total_count': 0, 'total_value': 0, 'low_stock': [], 'status': 'unavailable'}")
+    (DEFINE_VAR products_section object nil)
+        (CONSTRUCT object
+          (total_count 0)
+          (total_value 0)
+          (low_stock "[]")
+          (status unavailable)
+        → products_section)
     (MATCH parallel_results.fetch_products
           (ERR
             (LOG WARNING "product_service unavailable for dashboard"))
@@ -126,9 +132,21 @@
                                     (TRUE
                                       (APPEND low_stock_items p))
                                     (FALSE)))
-            (SET_VAR products_section "{'total_count': 'product_count', 'total_value': 'total_value', 'low_stock': 'low_stock_items', 'status': 'ok'}")))
+            (CONSTRUCT object
+                      (total_count product_count)
+                      (total_value total_value)
+                      (low_stock low_stock_items)
+                      (status ok)
+                    → products_section)))
     ;; ── Process orders (graceful degradation) ──
-    (DEFINE_VAR orders_section object "{'total_count': 0, 'pending_count': 0, 'total_revenue': 0, 'recent': [], 'status': 'unavailable'}")
+    (DEFINE_VAR orders_section object nil)
+        (CONSTRUCT object
+          (total_count 0)
+          (pending_count 0)
+          (total_revenue 0)
+          (recent "[]")
+          (status unavailable)
+        → orders_section)
     (MATCH parallel_results.fetch_orders
           (ERR
             (LOG WARNING "order_service unavailable for dashboard"))
@@ -144,9 +162,22 @@
                                       (COMPUTE pending_count + 1 → pending_count))
                                     (FALSE)))
             (COMPUTE_FN take_last orders_response 5 → recent_orders)
-            (SET_VAR orders_section "{'total_count': 'order_count', 'pending_count': 'pending_count', 'total_revenue': 'revenue', 'recent': 'recent_orders', 'status': 'ok'}")))
+            (CONSTRUCT object
+                      (total_count order_count)
+                      (pending_count pending_count)
+                      (total_revenue revenue)
+                      (recent recent_orders)
+                      (status ok)
+                    → orders_section)))
     ;; ── Process payments (graceful degradation) ──
-    (DEFINE_VAR payments_section object "{'total_count': 0, 'completed_count': 0, 'failed_count': 0, 'total_processed': 0, 'status': 'unavailable'}")
+    (DEFINE_VAR payments_section object nil)
+        (CONSTRUCT object
+          (total_count 0)
+          (completed_count 0)
+          (failed_count 0)
+          (total_processed 0)
+          (status unavailable)
+        → payments_section)
     (MATCH parallel_results.fetch_payments
           (ERR
             (LOG WARNING "payment_service unavailable for dashboard"))
@@ -164,7 +195,13 @@
                                     (failed
                                       (COMPUTE failed + 1 → failed))
                                     (DEFAULT)))
-            (SET_VAR payments_section "{'total_count': 'pay_count', 'completed_count': 'completed', 'failed_count': 'failed', 'total_processed': 'processed', 'status': 'ok'}")))
+            (CONSTRUCT object
+                      (total_count pay_count)
+                      (completed_count completed)
+                      (failed_count failed)
+                      (total_processed processed)
+                      (status ok)
+                    → payments_section)))
     ;; ── Calculate system health ──
     (DEFINE_VAR services_up int 0)
     (BRANCH (== products_section.status "'ok'")
@@ -190,7 +227,7 @@
           (0
             (SET_VAR overall_status critical)))
     ;; ── Build and respond ──
-    (GET_CURRENT auth user → now)
+    (GET_CURRENT clock now → now)
     (CONSTRUCT DashboardResponse
           (generated_at now)
           (products products_section)

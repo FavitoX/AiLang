@@ -180,24 +180,60 @@ def emit_instruction(inst: dict, depth: int = 0) -> str:
     # Variables / expressions
     if op == "DEFINE_VAR":
         val = inst.get("value")
+        name = inst["name"]
+        type_info = f' {inst["type"]}' if inst.get("type") else ""
+        if isinstance(val, dict):
+            # Dict default → declare nil, then CONSTRUCT object to assign.
+            declare = f'(DEFINE_VAR {name}{type_info} nil)'
+            fields = "\n".join(f"{inner}({k} {atom(v)})" for k, v in val.items())
+            construct = f'(CONSTRUCT object\n{fields}\n{child_pad}→ {name})'
+            return declare + "\n" + child_pad + construct
         if isinstance(val, list) and not val:
             val_s = "(list)"
         elif val is None:
             val_s = "nil"
         else:
             val_s = atom(val)
-        type_info = f' {inst["type"]}' if inst.get("type") else ""
-        return f'(DEFINE_VAR {inst["name"]}{type_info} {val_s})'
+        return f'(DEFINE_VAR {name}{type_info} {val_s})'
 
     if op == "SET_VAR":
-        return f'(SET_VAR {inst["name"]} {atom(inst.get("value", "nil"))})'
+        val = inst.get("value", "nil")
+        name = inst["name"]
+        if isinstance(val, dict):
+            # Dict value → CONSTRUCT object inline.
+            fields = "\n".join(f"{inner}({k} {atom(v)})" for k, v in val.items())
+            return f'(CONSTRUCT object\n{fields}\n{child_pad}→ {name})'
+        return f'(SET_VAR {name} {atom(val)})'
 
     if op == "COMPUTE":
-        rtype = f' → {inst["assign"]}'
-        return (
-            f'(COMPUTE {atom(inst.get("left"))} {inst.get("operator", "+")} '
-            f'{atom(inst.get("right"))}{rtype})'
+        left_raw = inst.get("left")
+        right_raw = inst.get("right")
+        # Flatten nested sub-expressions into preceding temp COMPUTEs so the
+        # result is always `(COMPUTE atom op atom → assign)`.
+        prefix_lines = []
+        if isinstance(left_raw, dict) and "op" in left_raw:
+            tmp = f"_tmp_{inst['assign']}_l"
+            prefix_lines.append(emit_instruction({
+                "op": "COMPUTE", "left": left_raw.get("left"),
+                "operator": left_raw["op"], "right": left_raw.get("right"),
+                "assign": tmp,
+            }, depth))
+            left_raw = tmp
+        if isinstance(right_raw, dict) and "op" in right_raw:
+            tmp = f"_tmp_{inst['assign']}_r"
+            prefix_lines.append(emit_instruction({
+                "op": "COMPUTE", "left": right_raw.get("left"),
+                "operator": right_raw["op"], "right": right_raw.get("right"),
+                "assign": tmp,
+            }, depth))
+            right_raw = tmp
+        line = (
+            f'(COMPUTE {atom(left_raw)} {inst.get("operator", "+")} '
+            f'{atom(right_raw)} → {inst["assign"]})'
         )
+        if prefix_lines:
+            return "\n".join(prefix_lines) + "\n" + child_pad + line
+        return line
 
     if op == "COMPUTE_FN":
         args = " ".join(atom(a) for a in inst.get("args", []))
@@ -219,7 +255,24 @@ def emit_instruction(inst: dict, depth: int = 0) -> str:
         )
 
     if op == "GET_CURRENT":
-        return f'(GET_CURRENT {inst.get("from","auth")} {inst.get("field","user")} → {inst["assign"]})'
+        # Legacy JSON uses "what" (timestamp / day_of_week / auth.user) instead
+        # of the canonical (from, field) pair. Normalize here.
+        what = inst.get("what")
+        from_ = inst.get("from")
+        field = inst.get("field")
+        if what and not from_:
+            what_map = {
+                "timestamp": ("clock", "now"),
+                "day_of_week": ("clock", "day_of_week"),
+                "today": ("clock", "today"),
+            }
+            if what.startswith("auth"):
+                from_, field = "auth", what.split(".")[-1] if "." in what else "user"
+            else:
+                from_, field = what_map.get(what, ("clock", what))
+        from_ = from_ or "auth"
+        field = field or "user"
+        return f'(GET_CURRENT {from_} {field} → {inst["assign"]})'
 
     if op == "APPEND":
         value = inst.get("value", {})

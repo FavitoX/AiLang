@@ -309,7 +309,7 @@
                                                                                   (approved
                                                                                     ;; ── Step 4: Confirm order ──
                                                                                     (STORE_UPDATE_FIELDS payment_store payment.id ((status completed) (gateway_ref charge_result.reference)) → payment)
-                                                                                    (GET_CURRENT auth user → now)
+                                                                                    (GET_CURRENT clock now → now)
                                                                                     (STORE_UPDATE_FIELDS payment_store payment.id ((completed_at now)) → payment)
                                                                                     (CALL_SERVICE order_service
                                                                                                               (method PUT)

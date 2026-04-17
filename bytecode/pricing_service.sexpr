@@ -210,7 +210,7 @@
                                         (COMPUTE total_discount_pct + 15 → total_discount_pct))
                                       (regular))
                         ;; ── Rule 3: Day of week discount ──
-                        (GET_CURRENT auth user → today)
+                        (GET_CURRENT clock day_of_week → today)
                         (MATCH today
                                       (tuesday
                                         (APPEND discounts
@@ -237,7 +237,7 @@
                                                                                   (TRUE
                                                                                     (ERR_CUSTOM ERR_COUPON_INVALID (code request.coupon_code) (reason "coupon is inactive")))
                                                                                   (FALSE
-                                                                                    (GET_CURRENT auth user → now)
+                                                                                    (GET_CURRENT clock now → now)
                                                                                     (BRANCH (> now coupon.valid_until)
                                                                                                               (TRUE
                                                                                                                 (ERR_CUSTOM ERR_COUPON_EXPIRED (code request.coupon_code)))
@@ -259,7 +259,8 @@
                         ;; ── Cap discount at max ──
                         (COMPUTE_FN min total_discount_pct 40 → total_discount_pct)
                         ;; ── Calculate final price ──
-                        (COMPUTE 1 - "{'op': '/', 'left': 'total_discount_pct', 'right': 100}" → discount_multiplier)
+                        (COMPUTE total_discount_pct / 100 → _tmp_discount_multiplier_r)
+                                    (COMPUTE 1 - _tmp_discount_multiplier_r → discount_multiplier)
                         (COMPUTE subtotal * discount_multiplier → final_price)
                         (COMPUTE_FN round final_price 2 → final_price)
                         (CONSTRUCT PriceResponse

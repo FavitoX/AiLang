@@ -776,15 +776,29 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
     elif op == 'CONSTRUCT':
         schema = inst['schema']
         fields = inst.get('fields', {})
-        schema_def = (ctx.get('schemas') or {}).get(schema, {})
-        schema_fields = schema_def.get('fields', {})
-        parts = []
-        for k, v in fields.items():
-            field_type = (schema_fields.get(k) or {}).get('type')
-            parts.append(f"{pascal_case(k)} = {_cs_expr(v, ctx, hint=field_type)}")
-        body = ", ".join(parts)
-        lines.append(f"{pad}var {inst['assign']} = new {schema} {{ {body} }};")
-        ctx.setdefault('locals', {})[inst['assign']] = schema
+        assign = inst['assign']
+        if schema == 'object':
+            # Anonymous object — C# anonymous type (boxed as object).
+            parts = []
+            for k, v in fields.items():
+                parts.append(f"{pascal_case(k)} = {_cs_expr(v, ctx)}")
+            body = ", ".join(parts)
+            locals_dict = ctx.setdefault('locals', {})
+            if assign in locals_dict:
+                lines.append(f"{pad}{assign} = (object)new {{ {body} }};")
+            else:
+                lines.append(f"{pad}object {assign} = new {{ {body} }};")
+                locals_dict[assign] = 'object'
+        else:
+            schema_def = (ctx.get('schemas') or {}).get(schema, {})
+            schema_fields = schema_def.get('fields', {})
+            parts = []
+            for k, v in fields.items():
+                field_type = (schema_fields.get(k) or {}).get('type')
+                parts.append(f"{pascal_case(k)} = {_cs_expr(v, ctx, hint=field_type)}")
+            body = ", ".join(parts)
+            lines.append(f"{pad}var {assign} = new {schema} {{ {body} }};")
+            ctx.setdefault('locals', {})[assign] = schema
 
     elif op == 'GET_CURRENT':
         from_ = inst.get('from', 'auth')
@@ -3990,15 +4004,28 @@ def compile_instruction_go(inst: dict, indent: int, ctx: dict = None) -> list[st
     elif op == 'CONSTRUCT':
         schema = inst['schema']
         fields = inst.get('fields', {})
-        schema_def = (ctx.get('schemas') or {}).get(schema, {})
-        schema_fields = schema_def.get('fields', {})
-        parts = []
-        for k, v in fields.items():
-            field_type = (schema_fields.get(k) or {}).get('type')
-            parts.append(f"{pascal_case(k)}: {_go_expr(v, ctx, hint=field_type)}")
-        body = ", ".join(parts)
-        lines.append(f"{pad}{inst['assign']} := {schema}{{{body}}}")
-        ctx.setdefault('locals', {})[inst['assign']] = schema
+        assign = inst['assign']
+        if schema == 'object':
+            parts = []
+            for k, v in fields.items():
+                parts.append(f'"{k}": {_go_expr(v, ctx)}')
+            body = ", ".join(parts)
+            locals_dict = ctx.setdefault('locals', {})
+            if assign in locals_dict:
+                lines.append(f"{pad}{assign} = map[string]any{{{body}}}")
+            else:
+                lines.append(f"{pad}{assign} := map[string]any{{{body}}}")
+                locals_dict[assign] = 'object'
+        else:
+            schema_def = (ctx.get('schemas') or {}).get(schema, {})
+            schema_fields = schema_def.get('fields', {})
+            parts = []
+            for k, v in fields.items():
+                field_type = (schema_fields.get(k) or {}).get('type')
+                parts.append(f"{pascal_case(k)}: {_go_expr(v, ctx, hint=field_type)}")
+            body = ", ".join(parts)
+            lines.append(f"{pad}{assign} := {schema}{{{body}}}")
+            ctx.setdefault('locals', {})[assign] = schema
 
     elif op == 'GET_CURRENT':
         from_ = inst.get('from', 'auth')
