@@ -2691,6 +2691,7 @@ def generate_store_csharp(schema: str, schema_def: dict, store_def: dict = None)
     lines.append(f"    {schema}? Update({pk_cs_type} {pk_field}, {schema}Dto data);")
     lines.append(f"    bool Delete({pk_cs_type} {pk_field});")
     lines.append("    void Reset();  // test seam — RESET_STORE in (tests ... (clean ...))")
+    lines.append(f"    void Seed(System.Collections.Generic.IEnumerable<{schema}> items);  // test seam — seed_data in (tests ... (setup ...))")
     lines.append("}")
     lines.append("")
 
@@ -2745,6 +2746,13 @@ def generate_store_csharp(schema: str, schema_def: dict, store_def: dict = None)
     lines.append("")
     lines.append(f"    public bool Delete({pk_cs_type} {pk_field}) => _data.TryRemove({pk_field}, out _);")
     lines.append("    public void Reset() => _data.Clear();")
+    # Seed inserts records at their declared PK without touching auto-gen
+    # defaults. Used only by tests' (setup (seed_data …)). Replaces on conflict.
+    lines.append(f"    public void Seed(System.Collections.Generic.IEnumerable<{schema}> items)")
+    lines.append("    {")
+    lines.append("        foreach (var item in items)")
+    lines.append(f"            _data[item.{pk_prop}] = item;")
+    lines.append("    }")
     lines.append("}")
     return lines
 
@@ -3968,6 +3976,16 @@ def generate_store_go(schema: str, schema_def: dict, store_def: dict = None) -> 
     lines.append(f"func (s *{schema}Store) Reset() {{")
     lines.append("\ts.mu.Lock(); defer s.mu.Unlock()")
     lines.append(f"\ts.data = make(map[{pk_map_key}]{schema})")
+    lines.append("}")
+    lines.append("")
+
+    # Seed — test seam for (setup (seed_data …)). Inserts at the declared PK
+    # without running the Insert auto-gen path. Replaces on conflict.
+    lines.append(f"func (s *{schema}Store) Seed(items []{schema}) {{")
+    lines.append("\ts.mu.Lock(); defer s.mu.Unlock()")
+    lines.append("\tfor _, item := range items {")
+    lines.append(f"\t\ts.data[item.{pk_prop}] = item")
+    lines.append("\t}")
     lines.append("}")
 
     return lines
@@ -5433,6 +5451,88 @@ def _assert_is_length_op(target: str) -> bool:
     return target.endswith('.length') or target == 'length'
 
 
+def _cs_seed_value(raw, field_type: str, schemas: dict) -> str:
+    """Render a seed_data value as a C# literal, keyed off the schema field type.
+
+    `raw` is a scalar (string/number/bool) or a list of child forms. When the
+    schema field is `(list ElemSchema)`, recurse into each `(item …)` child.
+    """
+    if field_type == 'uuid':
+        return f'Guid.Parse("{raw}")'
+    if field_type == 'timestamp':
+        return f'DateTime.Parse("{raw}")'
+    if field_type == 'bool':
+        v = str(raw).lower()
+        return 'true' if v == 'true' else 'false'
+    if field_type == 'int':
+        return str(raw)
+    if field_type == 'decimal':
+        return f'{raw}M'
+    if field_type in ('string', 'enum'):
+        s = str(raw).strip('"').replace('\\', '\\\\').replace('"', '\\"')
+        return f'"{s}"'
+    return f'"{raw}"'
+
+
+def _cs_seed_object(pairs: list, schema_name: str, schemas: dict) -> str:
+    """Render a C# object initializer for an entity from a list of (key val…) pairs."""
+    schema_def = schemas.get(schema_name, {})
+    fields = schema_def.get('fields', {})
+    parts = []
+    for pair in pairs:
+        if not (isinstance(pair, list) and len(pair) >= 2):
+            continue
+        key = str(pair[0])
+        fdef = fields.get(key, {})
+        ftype = fdef.get('type')
+        prop = pascal_case(key)
+        # Nested list: collect `(item …)` children, render as List<Elem>.
+        if ftype == 'list':
+            elem_schema = fdef.get('of') or 'object'
+            elems = [p for p in pair[1:] if isinstance(p, list) and p and p[0] == 'item']
+            if elems:
+                inner = ", ".join(_cs_seed_object(p[1:], elem_schema, schemas) for p in elems)
+                parts.append(f'{prop} = new List<{elem_schema}> {{ {inner} }}')
+            else:
+                parts.append(f'{prop} = new List<{elem_schema}>()')
+            continue
+        raw = pair[1]
+        parts.append(f'{prop} = {_cs_seed_value(raw, ftype, schemas)}')
+    return f'new {schema_name} {{ {", ".join(parts)} }}'
+
+
+def _emit_seed_data_csharp(seed_op: list, stores: dict, schemas: dict, pad: str, factory_var: str) -> list[str]:
+    """Emit a seeding block for one `(seed_data …)` op.
+
+    `seed_op` is the full `['seed_data', [store_name, ['item', …], …]]` form.
+    For each store reference, resolve the store service via DI and call Seed()
+    with a C# array of schema-typed initializers.
+    """
+    lines = []
+    if len(seed_op) < 2:
+        return lines
+    lines.append(f'{pad}{{')
+    lines.append(f'{pad}    using var _seedScope = {factory_var}.Services.CreateScope();')
+    for store_ref in seed_op[1:]:
+        if not (isinstance(store_ref, list) and store_ref):
+            continue
+        store_name = str(store_ref[0])
+        store_def = stores.get(store_name)
+        if not store_def:
+            continue
+        schema = store_def.get('schema')
+        items = [p for p in store_ref[1:] if isinstance(p, list) and p and p[0] == 'item']
+        if not items:
+            continue
+        local = '_' + camel_case(store_name)
+        lines.append(f'{pad}    var {local} = _seedScope.ServiceProvider.GetRequiredService<I{schema}Store>();')
+        entities = [_cs_seed_object(it[1:], schema, schemas) for it in items]
+        inner = ", ".join(entities)
+        lines.append(f'{pad}    {local}.Seed(new[] {{ {inner} }});')
+    lines.append(f'{pad}}}')
+    return lines
+
+
 def _split_json_path(target: str) -> list[str]:
     """'body.error.type' → ['error', 'type']. Strips the leading 'body.'."""
     segs = target.split('.')
@@ -5965,6 +6065,14 @@ def generate_csharp_tests(bc, main_output_dir: str):
         # Swap the effective client name used by the compiled run ops.
         if client_var != "_client":
             lines.append(f"        var _client = {client_var};  // shadow outer field for this test")
+        # Emit seed_data setup ops before the try block so they happen on the
+        # same factory that serves the test's HTTP requests. Uses the mock
+        # factory if mocks were registered — otherwise the base factory.
+        seed_factory = '_mockFactory' if mocks else '_factory'
+        for setup_op in (test.get('setup_ops') or []):
+            if isinstance(setup_op, list) and setup_op and setup_op[0] == 'seed_data':
+                lines.extend(_emit_seed_data_csharp(setup_op, bc.stores, bc.schemas,
+                                                     pad='        ', factory_var=seed_factory))
         lines.append("        try")
         lines.append("        {")
         lines.extend(_compile_test_run_csharp(run_ops, captures, indent=3))
