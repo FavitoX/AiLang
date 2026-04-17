@@ -1,0 +1,139 @@
+;; Scratch service: v0.9 phase 8 — test generator validator.
+;;
+;; Exercises every (tests ...) construct the generator needs to handle:
+;;   * REQUEST with auth + body
+;;   * REQUEST without auth (401 path)
+;;   * ASSERT status, ASSERT body.<nested>, ASSERT body.id exists
+;;   * ASSERT body.length >= N
+;;   * CAPTURE body.id → var and subsequent path interpolation ("/widgets/{id}")
+;;   * RESET_STORE in (clean ...)
+;;
+;; Minimal CRUD so the asserts are honest — widget store is in-memory.
+
+(service scratch_tests
+  (version "0.9-phase8")
+  (port 8097))
+
+(schema Widget
+  (field id     uuid    (auto_gen))
+  (field name   string  (required) (min 1) (max 100))
+  (field weight decimal (required) (gt 0)))
+
+(store widget_store
+  (type IN_MEMORY)
+  (schema Widget)
+  (index id PRIMARY))
+
+(config
+  (port       int    8097)
+  (jwt_secret secret "JWT_SECRET"))
+
+(auth
+  (provider jwt)
+  (secret_ref jwt_secret))
+
+(cors
+  (origins "*")
+  (methods GET POST DELETE)
+  (headers "Content-Type" "Authorization")
+  (max_age 3600))
+
+(route GET    "/widgets"      handler_list)
+(route POST   "/widgets"      handler_create)
+(route GET    "/widgets/:id"  handler_get)
+(route DELETE "/widgets/:id"  handler_delete)
+
+(handler handler_list
+  (auth PUBLIC)
+  (returns (RESULT (List Widget) Error))
+  (do
+    (STORE_LIST_ALL widget_store → widgets)
+    (RESPOND 200 widgets)))
+
+(handler handler_create
+  (auth (requires authenticated))
+  (returns (RESULT Widget Error))
+  (do
+    (READ_BODY Widget → body)
+    (STORE_INSERT widget_store body → widget)
+    (RESPOND 201 widget)))
+
+(handler handler_get
+  (auth PUBLIC)
+  (params (id uuid))
+  (returns (RESULT Widget Error))
+  (do
+    (READ_PARAM id uuid → id)
+    (STORE_FIND widget_store id → widget)
+    (MATCH widget
+      (NONE (ERR_NOT_FOUND Widget id))
+      (OK   (RESPOND 200 widget)))))
+
+(handler handler_delete
+  (auth (requires authenticated))
+  (params (id uuid))
+  (returns (RESULT Void Error))
+  (do
+    (READ_PARAM id uuid → id)
+    (STORE_FIND widget_store id → existing)
+    (MATCH existing
+      (NONE (ERR_NOT_FOUND Widget id))
+      (OK
+        (STORE_DELETE widget_store id)
+        (RESPOND 204)))))
+
+;; ── Tests ────────────────────────────────────────────────────
+
+(tests scratch_tests
+
+  (test "create_then_list_captures_id"
+    (run
+      (REQUEST POST "/widgets"
+        (auth true)
+        (body (name "Alpha") (weight 2.5)))
+      (ASSERT status 201)
+      (ASSERT body.name "Alpha")
+      (ASSERT body.id exists)
+      (CAPTURE body.id → widget_id)
+
+      (REQUEST GET "/widgets")
+      (ASSERT status 200)
+      (ASSERT body.length >= 1)
+
+      (REQUEST GET "/widgets/{widget_id}")
+      (ASSERT status 200)
+      (ASSERT body.name "Alpha"))
+    (clean (RESET_STORE widget_store)))
+
+  (test "create_zero_weight_rejected"
+    (run
+      (REQUEST POST "/widgets"
+        (auth true)
+        (body (name "ZeroW") (weight 0)))
+      (ASSERT status 400))
+    (clean (RESET_STORE widget_store)))
+
+  (test "create_requires_auth"
+    (run
+      (REQUEST POST "/widgets"
+        (auth false)
+        (body (name "NoAuth") (weight 1)))
+      (ASSERT status 401))
+    (clean (RESET_STORE widget_store)))
+
+  (test "delete_roundtrip"
+    (run
+      (REQUEST POST "/widgets"
+        (auth true)
+        (body (name "ToKill") (weight 1)))
+      (ASSERT status 201)
+      (CAPTURE body.id → id)
+
+      (REQUEST DELETE "/widgets/{id}"
+        (auth true))
+      (ASSERT status 204)
+
+      (REQUEST GET "/widgets/{id}")
+      (ASSERT status 404)
+      (ASSERT body.error.type "NOT_FOUND"))
+    (clean (RESET_STORE widget_store))))

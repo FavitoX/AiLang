@@ -115,8 +115,14 @@ pero no transpilan a código compilable en C# .NET 10 / Go 1.25.
 - Requieren acceso a `event.data` (payload del evento).
 
 ### `tests` (legacy format)
-- Ya parseado (generic form), pero el transpilador actual no emite proyectos
-  de tests. Considerar xUnit (C#) / `*_test.go` (Go) con TestServer/httptest.
+- **Phase 8 (2026-04-16):** Generator implementado para el formato v0.7 (`(test "name" (setup) (run ...) (clean ...))`).
+  - C#: `{Service}/Tests/ApiTests.cs` con `WebApplicationFactory<Program>` + xUnit + un `[Fact]` por test. Factory fresh por test para aislamiento total.
+  - Go: `{Service}/main_test.go` con `httptest.NewServer(buildHandler())`.
+  - Seams: C# expone `public partial class Program { }`; Go expone `func buildHandler() http.Handler`. Los stores in-memory exponen `Reset()` para `RESET_STORE` en `(clean ...)`.
+  - Cubre REQUEST (con auth/body), ASSERT (status/nested fields/`exists`/`length >= N`), CAPTURE con interpolación de path (`{var}`).
+  - Bonus: fix al contrato de `READ_BODY` — ahora llama `body.Validate()` automáticamente tanto en C# como Go (antes solo existía el método en Go y jamás se invocaba).
+- **Pendiente:** formato legacy `(tests (cases (item (name X) (setup (mock_services ...)) (run (item (action REQUEST) ...)))))` que usan order/pricing/payment/dashboard — requiere parser separado en `_parse_tests`.
+- PostgreSQL-backed services quedan fuera del MVP (necesitan testcontainers/DB real).
 
 ---
 

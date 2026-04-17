@@ -586,9 +586,16 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
             )
 
     elif op == 'READ_BODY':
+        # AILang contract: READ_BODY runs schema validations (required/min/max/gt/…)
+        # automatically. Generator enforces this by calling Validate() right after
+        # JSON decode — mirrors the behavior described in CLAUDE.md.
         lines.append(f"{pad}var {inst['assign']} = await ctx.Request.ReadFromJsonAsync<{inst['schema']}Dto>();")
         lines.append(f"{pad}if ({inst['assign']} is null)")
         lines.append(f"{pad}    return Results.BadRequest(AiLangError.InvalidBody(\"{inst['schema']}\", \"body is null\"));")
+        lines.append(f"{pad}{{")
+        lines.append(f"{pad}    var _verr = {inst['assign']}.Validate();")
+        lines.append(f"{pad}    if (_verr != null) return Results.BadRequest(_verr);")
+        lines.append(f"{pad}}}")
 
     elif op == 'RESPOND':
         status = inst.get('status', 200)
@@ -1615,6 +1622,11 @@ def generate_csharp(bc, output_dir: str):
 
     lines.append(f'app.Run("http://0.0.0.0:{port}");')
     lines.append("")
+    # Test seam: WebApplicationFactory<Program> from Microsoft.AspNetCore.Mvc.Testing
+    # requires a reachable Program type — the top-level Program class is internal
+    # by default, so we expose it via a partial declaration.
+    lines.append("public partial class Program { }")
+    lines.append("")
 
     # Schemas
     for schema_name, schema_def in bc.schemas.items():
@@ -1673,6 +1685,12 @@ def generate_csharp(bc, output_dir: str):
         '    <Nullable>enable</Nullable>\n'
         '    <ImplicitUsings>enable</ImplicitUsings>\n'
         '  </PropertyGroup>\n'
+        '  <ItemGroup>\n'
+        '    <!-- Tests/ is its own project; ASP.NET would otherwise auto-include it. -->\n'
+        '    <Compile Remove="Tests/**" />\n'
+        '    <Content Remove="Tests/**" />\n'
+        '    <None Remove="Tests/**" />\n'
+        '  </ItemGroup>\n'
         '  <ItemGroup>\n'
         + '\n'.join(pkg_refs) + '\n'
         '  </ItemGroup>\n'
@@ -1736,6 +1754,46 @@ def generate_schema_csharp(name: str, schema_def: dict) -> list[str]:
                 nullable = "?" if ftype in ('string', 'list', 'object') else ""
             lines.append(f'    [JsonPropertyName("{field_name}")]')
             lines.append(f"    public {modifier}{csharp_type}{nullable} {prop_name} {{ get; init; }}")
+
+        # Validate() — mirrors Go's (d XDto) Validate() *AiLangError. Returns null
+        # on success; ensures the READ_BODY contract ("run all schema validations")
+        # holds regardless of target language.
+        lines.append("")
+        lines.append("    public AiLangError? Validate()")
+        lines.append("    {")
+        for field_name, field_def in dto_fields.items():
+            ftype = field_def.get('type')
+            required = field_def.get('required', False)
+            prop = pascal_case(field_name)
+            if ftype == 'string' and required:
+                min_len = field_def.get('min', 0)
+                max_len = field_def.get('max', 0)
+                if min_len > 0:
+                    lines.append(f'        if (string.IsNullOrWhiteSpace({prop}) || {prop}!.Length < {min_len})')
+                    lines.append(f'            return AiLangError.Validation("{field_name}", "required, min length {min_len}");')
+                else:
+                    lines.append(f'        if ({prop} == null)')
+                    lines.append(f'            return AiLangError.Validation("{field_name}", "required");')
+                if max_len > 0:
+                    lines.append(f'        if ({prop}!.Length > {max_len})')
+                    lines.append(f'            return AiLangError.Validation("{field_name}", "max length {max_len}");')
+            if ftype in ('int', 'decimal'):
+                gt = field_def.get('gt')
+                gte = field_def.get('gte')
+                suffix = 'M' if ftype == 'decimal' else ''
+                if gt is not None:
+                    lines.append(f'        if ({prop} <= {gt}{suffix})')
+                    lines.append(f'            return AiLangError.Validation("{field_name}", "must be > {gt}");')
+                if gte is not None:
+                    lines.append(f'        if ({prop} < {gte}{suffix})')
+                    lines.append(f'            return AiLangError.Validation("{field_name}", "must be >= {gte}");')
+            if ftype == 'list':
+                min_items = field_def.get('min_items')
+                if min_items and required:
+                    lines.append(f'        if ({prop} == null || {prop}.Count < {min_items})')
+                    lines.append(f'            return AiLangError.Validation("{field_name}", "required, min {min_items} items");')
+        lines.append("        return null;")
+        lines.append("    }")
         lines.append("}")
 
     return lines
@@ -2196,6 +2254,7 @@ def generate_store_csharp(schema: str, schema_def: dict) -> list[str]:
     lines.append(f"    {schema} Insert({schema}Dto data);")
     lines.append(f"    {schema}? Update(Guid id, {schema}Dto data);")
     lines.append("    bool Delete(Guid id);")
+    lines.append("    void Reset();  // test seam — RESET_STORE in (tests ... (clean ...))")
     lines.append("}")
     lines.append("")
 
@@ -2250,6 +2309,7 @@ def generate_store_csharp(schema: str, schema_def: dict) -> list[str]:
     lines.append("    }")
     lines.append("")
     lines.append("    public bool Delete(Guid id) => _data.TryRemove(id, out _);")
+    lines.append("    public void Reset() => _data.Clear();")
     lines.append("}")
     return lines
 
@@ -2609,6 +2669,40 @@ def generate_go(bc, output_dir: str):
     lines.append("}")
     lines.append("")
 
+    # buildHandler — test seam. Exports the full middleware stack so that
+    # main_test.go can wrap it with httptest.NewServer without touching main().
+    # Postgres is skipped here: the tests target in-memory stores only.
+    lines.append("// buildHandler wires the full service graph and returns the HTTP handler.")
+    lines.append("// Used by main() and by main_test.go (httptest). Not for PG-backed services.")
+    lines.append("func buildHandler() http.Handler {")
+    if not is_pg:
+        for store_name, store_def in bc.stores.items():
+            lines.append(f"\tstore := New{store_def['schema']}Store()")
+    if uses_call_service_anywhere:
+        lines.append("\tserviceURLs := map[string]string{")
+        for svc_name, svc_def in service_refs_go.items():
+            env_var = svc_def.get('base_url_ref', '').replace('ENV.', '') or 'UNSET'
+            default_url = svc_def.get('default', 'http://localhost')
+            lines.append(f'\t\t"{svc_name}": func() string {{ if v := os.Getenv("{env_var}"); v != "" {{ return v }}; return "{default_url}" }}(),')
+        lines.append("\t}")
+    if uses_events_go:
+        lines.append("\tbus := NewEventBus()")
+        for h_name, h_def in event_handlers_go:
+            evt = h_def.get('event') or h_name
+            fn_name = pascal_case(h_name) if h_name.startswith('on_') else 'On' + pascal_case(h_name)
+            lines.append(f'\tbus.Subscribe("{evt}", {fn_name})')
+    router_fields = []
+    if bc.stores and not is_pg:
+        router_fields.append("store: store")
+    if uses_call_service_anywhere:
+        router_fields.append("serviceURLs: serviceURLs")
+    if uses_events_go:
+        router_fields.append("bus: bus")
+    lines.append(f"\trouter := &Router{{{', '.join(router_fields)}}}")
+    lines.append("\treturn corsMiddleware(tracingMiddleware(router.mux()))")
+    lines.append("}")
+    lines.append("")
+
     # Main
     lines.append("func main() {")
     lines.append(f'\t// JWT env var: {jwt_env}')
@@ -2624,34 +2718,31 @@ def generate_go(bc, output_dir: str):
         for store_name, store_def in bc.stores.items():
             schema = store_def['schema']
             lines.append(f"\tvar store I{schema}Store = NewPostgres{schema}Store(pool)")
+        # PG path keeps the old inline wiring — buildHandler() is in-memory only.
+        if uses_call_service_anywhere:
+            lines.append("\tserviceURLs := map[string]string{")
+            for svc_name, svc_def in service_refs_go.items():
+                env_var = svc_def.get('base_url_ref', '').replace('ENV.', '') or 'UNSET'
+                default_url = svc_def.get('default', 'http://localhost')
+                lines.append(f'\t\t"{svc_name}": func() string {{ if v := os.Getenv("{env_var}"); v != "" {{ return v }}; return "{default_url}" }}(),')
+            lines.append("\t}")
+        if uses_events_go:
+            lines.append("\tbus := NewEventBus()")
+            for h_name, h_def in event_handlers_go:
+                evt = h_def.get('event') or h_name
+                fn_name = pascal_case(h_name) if h_name.startswith('on_') else 'On' + pascal_case(h_name)
+                lines.append(f'\tbus.Subscribe("{evt}", {fn_name})')
+        router_fields = []
+        if bc.stores:
+            router_fields.append("store: store")
+        if uses_call_service_anywhere:
+            router_fields.append("serviceURLs: serviceURLs")
+        if uses_events_go:
+            router_fields.append("bus: bus")
+        lines.append(f"\trouter := &Router{{{', '.join(router_fields)}}}")
+        lines.append("\thandler := corsMiddleware(tracingMiddleware(router.mux()))")
     else:
-        for store_name, store_def in bc.stores.items():
-            lines.append(f"\tstore := New{store_def['schema']}Store()")
-    # Resolve SERVICE_REF base URLs at startup (env var w/ default fallback).
-    if uses_call_service_anywhere:
-        lines.append("\tserviceURLs := map[string]string{")
-        for svc_name, svc_def in service_refs_go.items():
-            env_var = svc_def.get('base_url_ref', '').replace('ENV.', '') or 'UNSET'
-            default_url = svc_def.get('default', 'http://localhost')
-            lines.append(f'\t\t"{svc_name}": func() string {{ if v := os.Getenv("{env_var}"); v != "" {{ return v }}; return "{default_url}" }}(),')
-        lines.append("\t}")
-
-    if uses_events_go:
-        lines.append("\tbus := NewEventBus()")
-        for h_name, h_def in event_handlers_go:
-            evt = h_def.get('event') or h_name
-            fn_name = pascal_case(h_name) if h_name.startswith('on_') else 'On' + pascal_case(h_name)
-            lines.append(f'\tbus.Subscribe("{evt}", {fn_name})')
-
-    router_fields = []
-    if bc.stores:
-        router_fields.append("store: store")
-    if uses_call_service_anywhere:
-        router_fields.append("serviceURLs: serviceURLs")
-    if uses_events_go:
-        router_fields.append("bus: bus")
-    lines.append(f"\trouter := &Router{{{', '.join(router_fields)}}}")
-    lines.append("\thandler := corsMiddleware(tracingMiddleware(router.mux()))")
+        lines.append("\thandler := buildHandler()")
     lines.append("")
     lines.append(f'\tfmt.Println("[SERVICE] {service_name} STARTED on :{port}")')
     lines.append(f'\tfmt.Println("[READY]")')
@@ -3306,6 +3397,13 @@ def generate_store_go(schema: str, schema_def: dict) -> list[str]:
     lines.append("\tdelete(s.data, id)")
     lines.append("\treturn true")
     lines.append("}")
+    lines.append("")
+
+    # Reset — test seam for RESET_STORE in (tests ... (clean ...))
+    lines.append(f"func (s *{schema}Store) Reset() {{")
+    lines.append("\ts.mu.Lock(); defer s.mu.Unlock()")
+    lines.append(f"\ts.data = make(map[string]{schema})")
+    lines.append("}")
 
     return lines
 
@@ -3494,6 +3592,8 @@ def compile_instruction_go(inst: dict, indent: int, ctx: dict = None) -> list[st
         lines.append(f'{pad}\trespondError(w, ErrInvalidBody("{schema}", "invalid JSON"))')
         lines.append(f"{pad}\treturn")
         lines.append(f"{pad}}}")
+        # Enforce the AILang contract: schema validations run automatically after READ_BODY.
+        lines.append(f"{pad}if _verr := {assign}.Validate(); _verr != nil {{ respondError(w, _verr); return }}")
 
     elif op == 'STORE_LIST_ALL':
         assign = inst['assign']
@@ -4155,6 +4255,529 @@ def compile_branch_go(inst: dict, indent: int, ctx: dict = None) -> list[str]:
 
 
 # ============================================================================
+# TEST GENERATORS — xUnit (C#) and httptest (Go) from (tests ...) section
+# ============================================================================
+
+def _test_name_to_ident(name: str) -> str:
+    """Normalize a test's quoted name to a valid identifier for C# / Go."""
+    import re
+    n = str(name).strip('"')
+    n = re.sub(r'[^A-Za-z0-9_]', '_', n)
+    if n and n[0].isdigit():
+        n = '_' + n
+    return n or 'unnamed'
+
+
+def _primary_store_from_bc(bc):
+    """Return (store_name, store_def) for the store targeted by RESET_STORE, or first store."""
+    if not bc.stores:
+        return None, None
+    return next(iter(bc.stores.items()))
+
+
+def _json_literal_from_body_form(body_form: list) -> str:
+    """Turn a `['body', ['name', 'Widget'], ['price', 9.99]]` tail into a JSON string literal.
+
+    Values are emitted as-is: numbers stay numeric; non-numeric atoms become JSON strings.
+    The returned string is a JSON document (no surrounding C#/Go quoting)."""
+    parts = []
+    for pair in body_form:
+        if not (isinstance(pair, list) and len(pair) >= 2):
+            continue
+        key = str(pair[0])
+        val = pair[1]
+        if isinstance(val, bool):
+            parts.append(f'"{key}":{"true" if val else "false"}')
+        elif isinstance(val, (int, float)):
+            parts.append(f'"{key}":{val}')
+        elif isinstance(val, str) and val.lower() in ('true', 'false'):
+            parts.append(f'"{key}":{val.lower()}')
+        else:
+            # Escape embedded quotes & backslashes for JSON safety.
+            s = str(val).replace('\\', '\\\\').replace('"', '\\"')
+            parts.append(f'"{key}":"{s}"')
+    return '{' + ','.join(parts) + '}'
+
+
+def _assert_is_length_op(target: str) -> bool:
+    return target.endswith('.length') or target == 'length'
+
+
+def _split_json_path(target: str) -> list[str]:
+    """'body.error.type' → ['error', 'type']. Strips the leading 'body.'."""
+    segs = target.split('.')
+    if segs and segs[0] == 'body':
+        segs = segs[1:]
+    return segs
+
+
+def _interpolate_path_csharp(path: str, captures: set) -> str:
+    """Replace `{var}` in a path with `{capVar}` (C# interpolated-string placeholders),
+    but only when `var` was previously CAPTURE-d. Returns a C#-quoted expression."""
+    import re
+    used = []
+    def repl(m):
+        v = m.group(1)
+        if v in captures:
+            used.append(v)
+            return '{' + v + '}'
+        return m.group(0)
+    new_path = re.sub(r'\{(\w+)\}', repl, path)
+    # If no interpolation, emit as plain string. Otherwise as $"...".
+    if used:
+        return '$"' + new_path + '"'
+    return '"' + new_path + '"'
+
+
+def _interpolate_path_go(path: str, captures: set):
+    """Return (fmt_string, args) for fmt.Sprintf; or (literal, None) if no captures."""
+    import re
+    used = []
+    def repl(m):
+        v = m.group(1)
+        if v in captures:
+            used.append(v)
+            return '%s'
+        return m.group(0)
+    new_path = re.sub(r'\{(\w+)\}', repl, path)
+    if used:
+        return new_path, used
+    return new_path, None
+
+
+def _group_ops_by_request(run_ops: list) -> list[list]:
+    """Group (run ...) ops into per-REQUEST steps: each REQUEST begins a new step,
+    and all following ASSERT/CAPTURE ops attach to it. A leading block without a
+    REQUEST stays empty (unusual but tolerated)."""
+    groups: list[list] = []
+    current: list = []
+    for op in run_ops:
+        if not (isinstance(op, list) and op):
+            continue
+        if op[0] == 'REQUEST':
+            if current:
+                groups.append(current)
+            current = [op]
+        else:
+            current.append(op)
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _scan_captures(run_ops: list) -> list[str]:
+    """Return CAPTURE target variables in declaration order (dedup preserving order)."""
+    seen = []
+    out = []
+    for op in run_ops:
+        if isinstance(op, list) and op and op[0] == 'CAPTURE':
+            var = str(op[-1])
+            if var not in seen:
+                seen.append(var)
+                out.append(var)
+    return out
+
+
+def _compile_test_run_csharp(run_ops: list, captures: set, indent: int) -> list[str]:
+    """Compile a test's `run` sequence to C# statements.
+
+    Each REQUEST step is wrapped in its own `{ }` block to avoid redeclaring
+    `_req`/`_resp`/`_body` locals. CAPTURE targets are hoisted out so they flow
+    across blocks.
+    """
+    pad = "    " * indent
+    lines = []
+
+    # Hoist CAPTURE targets to the outer test scope.
+    for var in _scan_captures(run_ops):
+        lines.append(f'{pad}string? {var} = null;')
+        captures.add(var)
+
+    inner_pad = pad + "    "
+    for step in _group_ops_by_request(run_ops):
+        if not step:
+            continue
+        if step[0][0] != 'REQUEST':
+            # Standalone ASSERT/CAPTURE with no request — unlikely, but handle.
+            lines.extend(_compile_test_step_body_csharp(step, captures, inner_pad))
+            continue
+        lines.append(f'{pad}{{')
+        lines.extend(_compile_test_step_body_csharp(step, captures, inner_pad))
+        lines.append(f'{pad}}}')
+    return lines
+
+
+def _compile_test_step_body_csharp(step: list, captures: set, pad: str) -> list[str]:
+    """Emit the body of a single REQUEST-step block (the REQUEST + its trailing asserts)."""
+    lines = []
+    req_op = step[0]
+    method = str(req_op[1]).upper()
+    path = str(req_op[2]).strip('"')
+    auth = False
+    body_form = None
+    for sub in req_op[3:]:
+        if isinstance(sub, list) and sub:
+            if sub[0] == 'auth':
+                auth = str(sub[1]).lower() == 'true'
+            elif sub[0] == 'body':
+                body_form = sub[1:]
+    url_expr = _interpolate_path_csharp(path, captures)
+    method_enum = {
+        'GET': 'Get', 'POST': 'Post', 'PUT': 'Put',
+        'DELETE': 'Delete', 'PATCH': 'Patch', 'HEAD': 'Head',
+    }.get(method, 'Get')
+    lines.append(f'{pad}var _req = new HttpRequestMessage(HttpMethod.{method_enum}, {url_expr});')
+    if auth:
+        lines.append(f'{pad}_req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", TestToken());')
+    if body_form:
+        json_str = _json_literal_from_body_form(body_form).replace('\\', '\\\\').replace('"', '\\"')
+        lines.append(f'{pad}_req.Content = new StringContent("{json_str}", Encoding.UTF8, "application/json");')
+    lines.append(f'{pad}var _resp = await _client.SendAsync(_req);')
+    lines.append(f'{pad}var _status = (int)_resp.StatusCode;')
+    lines.append(f'{pad}var _bodyStr = await _resp.Content.ReadAsStringAsync();')
+    lines.append(f'{pad}JsonElement _body = default;')
+    lines.append(f'{pad}if (!string.IsNullOrWhiteSpace(_bodyStr)) {{ _body = JsonDocument.Parse(_bodyStr).RootElement; }}')
+
+    for op in step[1:]:
+        head = op[0]
+        if head == 'ASSERT':
+            target = str(op[1])
+            if target == 'status':
+                want = op[2]
+                lines.append(f'{pad}Assert.Equal({want}, _status);')
+            elif _assert_is_length_op(target):
+                if len(op) >= 4:
+                    cmp_op, val = str(op[2]), op[3]
+                else:
+                    cmp_op, val = '==', op[2]
+                cs_cmp = {'==': '==', '!=': '!=', '<': '<', '<=': '<=', '>': '>', '>=': '>='}.get(cmp_op, '==')
+                lines.append(f'{pad}Assert.True(_body.GetArrayLength() {cs_cmp} {val}, $"body.length = {{_body.GetArrayLength()}}");')
+            else:
+                segs = _split_json_path(target)
+                walk = '_body'
+                for s in segs:
+                    walk += f'.GetProperty("{s}")'
+                expected = op[2] if len(op) > 2 else None
+                if str(expected) == 'exists':
+                    probe = '_body'
+                    for s in segs[:-1]:
+                        probe += f'.GetProperty("{s}")'
+                    last = segs[-1] if segs else ''
+                    lines.append(f'{pad}Assert.True({probe}.TryGetProperty("{last}", out _));')
+                elif isinstance(expected, (int, float)) and not isinstance(expected, bool):
+                    lines.append(f'{pad}Assert.Equal({expected}M, {walk}.GetDecimal());')
+                else:
+                    val_str = str(expected).strip('"')
+                    lines.append(f'{pad}Assert.Equal("{val_str}", {walk}.GetString());')
+        elif head == 'CAPTURE':
+            target = str(op[1])
+            var = str(op[-1])
+            segs = _split_json_path(target)
+            walk = '_body'
+            for s in segs:
+                walk += f'.GetProperty("{s}")'
+            # Assign to the hoisted outer variable (no `var` prefix).
+            lines.append(f'{pad}{var} = {walk}.GetString();')
+    return lines
+
+
+def _compile_test_run_go(run_ops: list, captures: set, indent: int) -> list[str]:
+    """Compile a test's `run` sequence to Go statements inside a *testing.T.
+
+    Each REQUEST step lives in its own `{ ... }` block so `_req`/`_resp`/`_body`
+    stay redeclarable. CAPTURE targets are hoisted to the outer scope.
+    """
+    pad = "\t" * indent
+    lines = []
+
+    cap_vars = _scan_captures(run_ops)
+    for var in cap_vars:
+        lines.append(f'{pad}var {var} string')
+        captures.add(var)
+    if cap_vars:
+        # Keep Go happy if a capture is never read.
+        refs = '; '.join(f'_ = {v}' for v in cap_vars)
+        lines.append(f'{pad}defer func() {{ {refs} }}()')
+
+    inner_pad = pad + "\t"
+    for step in _group_ops_by_request(run_ops):
+        if not step:
+            continue
+        if step[0][0] != 'REQUEST':
+            lines.extend(_compile_test_step_body_go(step, captures, inner_pad))
+            continue
+        lines.append(f'{pad}{{')
+        lines.extend(_compile_test_step_body_go(step, captures, inner_pad))
+        lines.append(f'{pad}}}')
+    return lines
+
+
+def _compile_test_step_body_go(step: list, captures: set, pad: str) -> list[str]:
+    lines = []
+    req_op = step[0]
+    method = str(req_op[1]).upper()
+    path = str(req_op[2]).strip('"')
+    auth = False
+    body_form = None
+    for sub in req_op[3:]:
+        if isinstance(sub, list) and sub:
+            if sub[0] == 'auth':
+                auth = str(sub[1]).lower() == 'true'
+            elif sub[0] == 'body':
+                body_form = sub[1:]
+    fmt_path, args = _interpolate_path_go(path, captures)
+    if args:
+        args_str = ', '.join(args)
+        lines.append(f'{pad}_url := ts.URL + fmt.Sprintf("{fmt_path}", {args_str})')
+    else:
+        lines.append(f'{pad}_url := ts.URL + "{fmt_path}"')
+    if body_form:
+        json_str = _json_literal_from_body_form(body_form)
+        lines.append(f'{pad}_reqBody := strings.NewReader(`{json_str}`)')
+        lines.append(f'{pad}_req, _ := http.NewRequest("{method}", _url, _reqBody)')
+        lines.append(f'{pad}_req.Header.Set("Content-Type", "application/json")')
+    else:
+        lines.append(f'{pad}_req, _ := http.NewRequest("{method}", _url, nil)')
+    if auth:
+        lines.append(f'{pad}_req.Header.Set("Authorization", "Bearer testtoken")')
+    lines.append(f'{pad}_resp, _err := ts.Client().Do(_req)')
+    lines.append(f'{pad}if _err != nil {{ t.Fatalf("request failed: %v", _err) }}')
+    lines.append(f'{pad}_status := _resp.StatusCode')
+    lines.append(f'{pad}_rawBody, _ := io.ReadAll(_resp.Body)')
+    lines.append(f'{pad}_resp.Body.Close()')
+    lines.append(f'{pad}var _body map[string]any')
+    lines.append(f'{pad}var _bodyArr []any')
+    lines.append(f'{pad}if len(_rawBody) > 0 {{')
+    lines.append(f"{pad}\tif _rawBody[0] == '[' {{ _ = json.Unmarshal(_rawBody, &_bodyArr) }} else {{ _ = json.Unmarshal(_rawBody, &_body) }}")
+    lines.append(f'{pad}}}')
+    lines.append(f'{pad}_ = _body; _ = _bodyArr; _ = _status; _ = _rawBody')
+
+    for op in step[1:]:
+        head = op[0]
+        if head == 'ASSERT':
+            target = str(op[1])
+            if target == 'status':
+                want = op[2]
+                lines.append(f'{pad}if _status != {want} {{ t.Fatalf("want status {want}, got %d (body=%s)", _status, string(_rawBody)) }}')
+            elif _assert_is_length_op(target):
+                cmp_op, val = ('==', op[2]) if len(op) < 4 else (str(op[2]), op[3])
+                lines.append(f'{pad}if !(len(_bodyArr) {cmp_op} {val}) {{ t.Errorf("body.length = %d, want {cmp_op} {val}", len(_bodyArr)) }}')
+            else:
+                segs = _split_json_path(target)
+                walk = '_body'
+                for s in segs[:-1]:
+                    walk = f'({walk}["{s}"].(map[string]any))'
+                last = segs[-1]
+                expected = op[2] if len(op) > 2 else None
+                if str(expected) == 'exists':
+                    lines.append(f'{pad}if _, _ok := {walk}["{last}"]; !_ok {{ t.Errorf("missing field: {target}") }}')
+                elif isinstance(expected, (int, float)) and not isinstance(expected, bool):
+                    lines.append(f'{pad}if v, _ := {walk}["{last}"].(float64); v != {float(expected)} {{ t.Errorf("{target} = %v, want {expected}", {walk}["{last}"]) }}')
+                else:
+                    val_str = str(expected).strip('"')
+                    lines.append(f'{pad}if v, _ := {walk}["{last}"].(string); v != "{val_str}" {{ t.Errorf("{target} = %v, want {val_str}", {walk}["{last}"]) }}')
+        elif head == 'CAPTURE':
+            target = str(op[1])
+            var = str(op[-1])
+            segs = _split_json_path(target)
+            walk = '_body'
+            for s in segs[:-1]:
+                walk = f'({walk}["{s}"].(map[string]any))'
+            last = segs[-1]
+            # Assign to the hoisted outer variable (type already declared as string).
+            lines.append(f'{pad}if _v, _ok := {walk}["{last}"].(string); _ok {{ {var} = _v }}')
+    return lines
+
+
+def generate_csharp_tests(bc, main_output_dir: str):
+    """Emit an xUnit test project that exercises the generated C# API.
+
+    Structure: sibling `Tests/` folder inside `main_output_dir`. The test project
+    references the main .csproj by relative path. One `[Fact]` per `(test ...)`.
+    """
+    if not bc.tests:
+        return
+    # Postgres-backed services need testcontainers / a live DB — out of scope here.
+    pg_stores = {n: s for n, s in bc.stores.items() if s.get('provider') == 'PostgreSQL'}
+    if pg_stores:
+        print("  ⤷ skipping xUnit test project (PostgreSQL store — post-MVP)")
+        return
+
+    service_name = bc.service['name']
+    main_proj_name = pascal_case(service_name)
+    tests_dir = os.path.join(main_output_dir, "Tests")
+    os.makedirs(tests_dir, exist_ok=True)
+
+    # Primary in-memory store — used by the RESET_STORE in (clean ...).
+    primary_store_name, primary_store_def = _primary_store_from_bc(bc)
+    primary_schema = primary_store_def['schema'] if primary_store_def else None
+
+    # .csproj
+    csproj = (
+        '<Project Sdk="Microsoft.NET.Sdk">\n'
+        '  <PropertyGroup>\n'
+        '    <TargetFramework>net10.0</TargetFramework>\n'
+        '    <Nullable>enable</Nullable>\n'
+        '    <ImplicitUsings>enable</ImplicitUsings>\n'
+        '    <IsPackable>false</IsPackable>\n'
+        '  </PropertyGroup>\n'
+        '  <ItemGroup>\n'
+        '    <PackageReference Include="Microsoft.AspNetCore.Mvc.Testing" Version="10.0.0" />\n'
+        '    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />\n'
+        '    <PackageReference Include="xunit" Version="2.9.2" />\n'
+        '    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />\n'
+        '  </ItemGroup>\n'
+        '  <ItemGroup>\n'
+        f'    <ProjectReference Include="..\\{main_proj_name}.csproj" />\n'
+        '  </ItemGroup>\n'
+        '</Project>'
+    )
+    with open(os.path.join(tests_dir, f"{main_proj_name}.Tests.csproj"), 'w') as f:
+        f.write(csproj)
+
+    # ApiTests.cs
+    jwt_env_default = "dev-secret-key-min-32-characters!!"
+    lines = []
+    lines.append("// ═══════════════════════════════════════════════════════════════")
+    lines.append(f"// AILang Transpiler Output — C# xUnit Tests for {service_name}")
+    lines.append("// Auto-generated from (tests ...) section — DO NOT EDIT")
+    lines.append("// ═══════════════════════════════════════════════════════════════")
+    lines.append("using System.IdentityModel.Tokens.Jwt;")
+    lines.append("using System.Net.Http;")
+    lines.append("using System.Net.Http.Headers;")
+    lines.append("using System.Security.Claims;")
+    lines.append("using System.Text;")
+    lines.append("using System.Text.Json;")
+    lines.append("using Microsoft.AspNetCore.Mvc.Testing;")
+    lines.append("using Microsoft.Extensions.DependencyInjection;")
+    lines.append("using Microsoft.IdentityModel.Tokens;")
+    lines.append("using Xunit;")
+    lines.append("")
+    lines.append("public class ApiTests : IDisposable")
+    lines.append("{")
+    lines.append("    // A fresh WebApplicationFactory per test: each test gets its own DI graph")
+    lines.append("    // and in-memory store, so RESET_STORE in (clean ...) is mostly a safety net.")
+    lines.append("    private readonly WebApplicationFactory<Program> _factory = new();")
+    lines.append("    private readonly HttpClient _client;")
+    lines.append("")
+    lines.append("    public ApiTests()")
+    lines.append("    {")
+    lines.append("        _client = _factory.CreateClient();")
+    lines.append("    }")
+    lines.append("")
+    lines.append("    public void Dispose()")
+    lines.append("    {")
+    lines.append("        _client.Dispose();")
+    lines.append("        _factory.Dispose();")
+    lines.append("    }")
+    lines.append("")
+    lines.append("    // Mints a JWT signed with the dev secret. The server disables issuer/audience/lifetime")
+    lines.append("    // validation, so only the HMAC signature matters.")
+    lines.append("    private static string TestToken()")
+    lines.append("    {")
+    lines.append(f'        var secret = Environment.GetEnvironmentVariable("JWT_SECRET") ?? "{jwt_env_default}";')
+    lines.append("        var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(secret));")
+    lines.append("        var creds = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);")
+    lines.append("        var token = new JwtSecurityToken(")
+    lines.append('            claims: new[] { new Claim("sub", "test-user") },')
+    lines.append("            signingCredentials: creds);")
+    lines.append("        return new JwtSecurityTokenHandler().WriteToken(token);")
+    lines.append("    }")
+    lines.append("")
+    if primary_schema:
+        lines.append(f"    private void ResetStore()")
+        lines.append("    {")
+        lines.append("        using var scope = _factory.Services.CreateScope();")
+        lines.append(f"        var svc = scope.ServiceProvider.GetRequiredService<I{primary_schema}Store>();")
+        lines.append("        svc.Reset();")
+        lines.append("    }")
+        lines.append("")
+
+    for test in bc.tests:
+        ident = _test_name_to_ident(test['name'])
+        run_ops = test.get('run') or []
+        captures: set = set()
+        lines.append("    [Fact]")
+        lines.append(f"    public async Task {ident}()")
+        lines.append("    {")
+        lines.append("        try")
+        lines.append("        {")
+        lines.extend(_compile_test_run_csharp(run_ops, captures, indent=3))
+        lines.append("        }")
+        lines.append("        finally")
+        lines.append("        {")
+        if primary_schema:
+            lines.append("            ResetStore();")
+        lines.append("        }")
+        lines.append("    }")
+        lines.append("")
+    lines.append("}")
+
+    with open(os.path.join(tests_dir, "ApiTests.cs"), 'w') as f:
+        f.write('\n'.join(lines))
+
+    print(f"  ✓ C# xUnit tests generated in {tests_dir}/")
+
+
+def generate_go_tests(bc, output_dir: str):
+    """Emit main_test.go using httptest.NewServer(buildHandler())."""
+    if not bc.tests:
+        return
+    pg_stores = {n: s for n, s in bc.stores.items() if s.get('provider') == 'PostgreSQL'}
+    if pg_stores:
+        print("  ⤷ skipping Go httptest (PostgreSQL store — post-MVP)")
+        return
+
+    lines = []
+    lines.append("// ═══════════════════════════════════════════════════════════════")
+    lines.append(f"// AILang Transpiler Output — Go httptest for {bc.service['name']}")
+    lines.append("// Auto-generated from (tests ...) section — DO NOT EDIT")
+    lines.append("// ═══════════════════════════════════════════════════════════════")
+    lines.append("package main")
+    lines.append("")
+    lines.append("import (")
+    lines.append('\t"encoding/json"')
+    lines.append('\t"fmt"')
+    lines.append('\t"io"')
+    lines.append('\t"net/http"')
+    lines.append('\t"net/http/httptest"')
+    lines.append('\t"strings"')
+    lines.append('\t"testing"')
+    lines.append(")")
+    lines.append("")
+    lines.append("// newTestServer spins a fresh service graph per test — full isolation.")
+    lines.append("// Closes automatically when the test finishes.")
+    lines.append("func newTestServer(t *testing.T) *httptest.Server {")
+    lines.append("\tt.Helper()")
+    lines.append("\tts := httptest.NewServer(buildHandler())")
+    lines.append("\tt.Cleanup(ts.Close)")
+    lines.append("\treturn ts")
+    lines.append("}")
+    lines.append("")
+    # silence-unused to keep imports in single-test edge cases
+    lines.append("var _ = strings.HasPrefix")
+    lines.append("var _ = fmt.Sprintf")
+    lines.append("var _ io.Reader = nil")
+    lines.append("var _ = json.Unmarshal")
+    lines.append("")
+
+    for test in bc.tests:
+        ident = 'Test' + pascal_case(_test_name_to_ident(test['name']))
+        run_ops = test.get('run') or []
+        captures: set = set()
+        lines.append(f"func {ident}(t *testing.T) {{")
+        lines.append("\tts := newTestServer(t)")
+        lines.extend(_compile_test_run_go(run_ops, captures, indent=1))
+        lines.append("}")
+        lines.append("")
+
+    with open(os.path.join(output_dir, "main_test.go"), 'w') as f:
+        f.write('\n'.join(lines))
+
+    print(f"  ✓ Go httptest generated in {output_dir}/main_test.go")
+
+
+# ============================================================================
 # MAIN
 # ============================================================================
 
@@ -4202,10 +4825,12 @@ def main():
     if target in ('csharp', 'all'):
         output_dir = os.path.join(base_dir, f"generated-csharp-{service_name}")
         generate_csharp(bc, output_dir)
+        generate_csharp_tests(bc, output_dir)
 
     if target in ('go', 'all'):
         output_dir = os.path.join(base_dir, f"generated-go-{service_name}")
         generate_go(bc, output_dir)
+        generate_go_tests(bc, output_dir)
 
     print()
     print("  Done!")
