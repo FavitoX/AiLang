@@ -31,11 +31,11 @@
   (field percentage decimal))
 (schema Coupon
   (field code string)
-  (field discount_pct decimal (gt 0) (lte 50))
-  (field min_quantity int (gte 0))
+  (field discount_pct decimal (required) (gt 0) (lte 50))
+  (field min_quantity int (required) (gte 0))
   (field valid_until timestamp)
   (field customer_types (list string))
-  (field active bool))
+  (field active bool (required)))
 
 ;; ── Stores ──
 (store coupon_store

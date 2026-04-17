@@ -6,54 +6,112 @@
     "on_fiber_crash": "RESTART_FIBER",
     "on_service_crash": "NOTIFY_RESTART"
   },
-
   "schemas": {
     "PriceRequest": {
       "fields": {
-        "product_id": { "type": "uuid", "required": true },
-        "quantity": { "type": "int", "required": true, "gt": 0 },
-        "customer_type": { "type": "enum", "values": ["regular", "premium", "wholesale"], "required": true },
-        "coupon_code": { "type": "string", "required": false }
+        "product_id": {
+          "type": "uuid",
+          "required": true
+        },
+        "quantity": {
+          "type": "int",
+          "required": true,
+          "gt": 0
+        },
+        "customer_type": {
+          "type": "enum",
+          "values": [
+            "regular",
+            "premium",
+            "wholesale"
+          ],
+          "required": true
+        },
+        "coupon_code": {
+          "type": "string",
+          "required": false
+        }
       }
     },
     "PriceResponse": {
       "fields": {
-        "product_id": { "type": "uuid" },
-        "base_price": { "type": "decimal" },
-        "quantity": { "type": "int" },
-        "subtotal": { "type": "decimal" },
-        "discounts_applied": { "type": "list", "of": "DiscountDetail" },
-        "total_discount_pct": { "type": "decimal" },
-        "final_price": { "type": "decimal" }
+        "product_id": {
+          "type": "uuid"
+        },
+        "base_price": {
+          "type": "decimal"
+        },
+        "quantity": {
+          "type": "int"
+        },
+        "subtotal": {
+          "type": "decimal"
+        },
+        "discounts_applied": {
+          "type": "list",
+          "of": "DiscountDetail"
+        },
+        "total_discount_pct": {
+          "type": "decimal"
+        },
+        "final_price": {
+          "type": "decimal"
+        }
       }
     },
     "DiscountDetail": {
       "fields": {
-        "type": { "type": "string" },
-        "reason": { "type": "string" },
-        "percentage": { "type": "decimal" }
+        "type": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "percentage": {
+          "type": "decimal"
+        }
       }
     },
     "Coupon": {
       "fields": {
-        "code": { "type": "string" },
-        "discount_pct": { "type": "decimal", "gt": 0, "lte": 50 },
-        "min_quantity": { "type": "int", "gte": 0 },
-        "valid_until": { "type": "timestamp" },
-        "customer_types": { "type": "list", "of": "string" },
-        "active": { "type": "bool" }
+        "code": {
+          "type": "string"
+        },
+        "discount_pct": {
+          "type": "decimal",
+          "gt": 0,
+          "lte": 50,
+          "required": true
+        },
+        "min_quantity": {
+          "type": "int",
+          "gte": 0,
+          "required": true
+        },
+        "valid_until": {
+          "type": "timestamp"
+        },
+        "customer_types": {
+          "type": "list",
+          "of": "string"
+        },
+        "active": {
+          "type": "bool",
+          "required": true
+        }
       }
     }
   },
-
   "stores": {
     "coupon_store": {
       "type": "IN_MEMORY",
       "schema": "Coupon",
-      "index": { "field": "code", "type": "PRIMARY" }
+      "index": {
+        "field": "code",
+        "type": "PRIMARY"
+      }
     }
   },
-
   "dependencies": {
     "coupon_store": "coupon_store",
     "product_service": {
@@ -64,141 +122,304 @@
       "resilience": "product_service_policy"
     }
   },
-
   "resilience": {
     "policies": {
       "product_service_policy": {
-        "timeout": { "duration_ms": 2000, "on_timeout": "ERR_TIMEOUT" },
+        "timeout": {
+          "duration_ms": 2000,
+          "on_timeout": "ERR_TIMEOUT"
+        },
         "circuit_breaker": {
           "failure_threshold": 5,
           "success_threshold": 3,
           "half_open_max_calls": 1,
           "reset_timeout_ms": 30000,
-          "on_open": { "emit_event": "circuit_open", "fallback": "ERR_UNAVAILABLE" },
-          "on_half_open": { "emit_event": "circuit_half_open" },
-          "on_close": { "emit_event": "circuit_closed" }
+          "on_open": {
+            "emit_event": "circuit_open",
+            "fallback": "ERR_UNAVAILABLE"
+          },
+          "on_half_open": {
+            "emit_event": "circuit_half_open"
+          },
+          "on_close": {
+            "emit_event": "circuit_closed"
+          }
         },
         "retry": {
           "max_attempts": 2,
-          "backoff": { "type": "exponential", "initial_ms": 50, "max_ms": 500 },
-          "retryable_errors": ["ERR_TIMEOUT", "ERR_CONNECTION"],
-          "non_retryable_errors": ["ERR_NOT_FOUND", "ERR_VALIDATION"]
+          "backoff": {
+            "type": "exponential",
+            "initial_ms": 50,
+            "max_ms": 500
+          },
+          "retryable_errors": [
+            "ERR_TIMEOUT",
+            "ERR_CONNECTION"
+          ],
+          "non_retryable_errors": [
+            "ERR_NOT_FOUND",
+            "ERR_VALIDATION"
+          ]
         }
       }
     }
   },
-
   "cors": {
-    "origins": ["*"],
-    "methods": ["GET", "POST"],
-    "headers": ["Content-Type", "Authorization"],
+    "origins": [
+      "*"
+    ],
+    "methods": [
+      "GET",
+      "POST"
+    ],
+    "headers": [
+      "Content-Type",
+      "Authorization"
+    ],
     "max_age": 3600
   },
-
   "auth": {
     "provider": "jwt",
     "secret_ref": "ENV.JWT_SECRET"
   },
-
   "discount_rules": {
     "_comment": "Business rules for discount calculation. Discounts stack additively up to max_total_discount_pct.",
     "max_total_discount_pct": 40,
-
     "volume_discounts": [
-      { "min_quantity": 100, "discount_pct": 15, "reason": "volume 100+" },
-      { "min_quantity": 50,  "discount_pct": 10, "reason": "volume 50+" },
-      { "min_quantity": 20,  "discount_pct": 5,  "reason": "volume 20+" }
+      {
+        "min_quantity": 100,
+        "discount_pct": 15,
+        "reason": "volume 100+"
+      },
+      {
+        "min_quantity": 50,
+        "discount_pct": 10,
+        "reason": "volume 50+"
+      },
+      {
+        "min_quantity": 20,
+        "discount_pct": 5,
+        "reason": "volume 20+"
+      }
     ],
-
     "customer_discounts": {
-      "premium":   { "discount_pct": 10, "reason": "premium customer" },
-      "wholesale": { "discount_pct": 15, "reason": "wholesale customer" },
-      "regular":   { "discount_pct": 0,  "reason": null }
+      "premium": {
+        "discount_pct": 10,
+        "reason": "premium customer"
+      },
+      "wholesale": {
+        "discount_pct": 15,
+        "reason": "wholesale customer"
+      },
+      "regular": {
+        "discount_pct": 0,
+        "reason": null
+      }
     },
-
     "day_of_week_discounts": {
-      "tuesday":  { "discount_pct": 5, "reason": "Tuesday promo" },
-      "thursday": { "discount_pct": 3, "reason": "Thursday promo" }
+      "tuesday": {
+        "discount_pct": 5,
+        "reason": "Tuesday promo"
+      },
+      "thursday": {
+        "discount_pct": 3,
+        "reason": "Thursday promo"
+      }
     }
   },
-
   "custom_errors": {
     "ERR_COUPON_INVALID": {
       "http_status": 422,
-      "params": ["code", "reason"],
+      "params": [
+        "code",
+        "reason"
+      ],
       "message_template": "coupon {code} is invalid: {reason}"
     },
     "ERR_COUPON_EXPIRED": {
       "http_status": 422,
-      "params": ["code"],
+      "params": [
+        "code"
+      ],
       "message_template": "coupon {code} has expired"
     },
     "ERR_COUPON_NOT_ELIGIBLE": {
       "http_status": 422,
-      "params": ["code", "customer_type"],
+      "params": [
+        "code",
+        "customer_type"
+      ],
       "message_template": "coupon {code} is not available for {customer_type} customers"
     },
     "ERR_COUPON_MIN_QUANTITY": {
       "http_status": 422,
-      "params": ["code", "min_quantity", "actual_quantity"],
+      "params": [
+        "code",
+        "min_quantity",
+        "actual_quantity"
+      ],
       "message_template": "coupon {code} requires minimum quantity of {min_quantity} (got {actual_quantity})"
     }
   },
-
   "routes": [
-    { "method": "POST", "path": "/pricing/calculate", "handler": "handler_calculate_price" },
-    { "method": "GET",  "path": "/pricing/coupons/:code", "handler": "handler_get_coupon" }
+    {
+      "method": "POST",
+      "path": "/pricing/calculate",
+      "handler": "handler_calculate_price"
+    },
+    {
+      "method": "GET",
+      "path": "/pricing/coupons/:code",
+      "handler": "handler_get_coupon"
+    }
   ],
-
   "handlers": {
     "handler_calculate_price": {
       "auth": "PUBLIC",
       "returns": "RESULT(PriceResponse, Error)",
       "instructions": [
-        { "op": "READ_BODY", "schema": "PriceRequest", "assign": "request" },
-        { "op": "MATCH", "value": "request", "cases": {
-            "ERR": [{ "op": "ERR_INVALID_BODY", "schema": "PriceRequest" }],
+        {
+          "op": "READ_BODY",
+          "schema": "PriceRequest",
+          "assign": "request"
+        },
+        {
+          "op": "MATCH",
+          "value": "request",
+          "cases": {
+            "ERR": [
+              {
+                "op": "ERR_INVALID_BODY",
+                "schema": "PriceRequest"
+              }
+            ],
             "OK": [
-
-              { "op": "CALL_SERVICE", "service": "product_service",
-                "method": "GET", "path": "/products/{request.product_id}",
+              {
+                "op": "CALL_SERVICE",
+                "service": "product_service",
+                "method": "GET",
+                "path": "/products/{request.product_id}",
                 "idempotent": true,
-                "assign": "product_result" },
-
-              { "op": "MATCH", "value": "product_result", "cases": {
-                  "ERR": [{ "op": "ERR_NOT_FOUND", "entity": "product", "id": "request.product_id" }],
+                "assign": "product_result"
+              },
+              {
+                "op": "MATCH",
+                "value": "product_result",
+                "cases": {
+                  "ERR": [
+                    {
+                      "op": "ERR_NOT_FOUND",
+                      "entity": "product",
+                      "id": "request.product_id"
+                    }
+                  ],
                   "OK": [
-
-                    { "op": "COMPUTE", "assign": "subtotal",
-                      "left": "product_result.price", "operator": "*", "right": "request.quantity",
-                      "result_type": "decimal" },
-
-                    { "op": "DEFINE_VAR", "name": "discounts", "type": "List<DiscountDetail>", "value": [] },
-                    { "op": "DEFINE_VAR", "name": "total_discount_pct", "type": "decimal", "value": 0 },
-
-                    { "op": "COMMENT", "text": "── Rule 1: Volume discount (first match wins) ──" },
-                    { "op": "BRANCH", "condition": { "left": "request.quantity", "op": ">=", "right": 100 }, "cases": {
+                    {
+                      "op": "COMPUTE",
+                      "assign": "subtotal",
+                      "left": "product_result.price",
+                      "operator": "*",
+                      "right": "request.quantity",
+                      "result_type": "decimal"
+                    },
+                    {
+                      "op": "DEFINE_VAR",
+                      "name": "discounts",
+                      "type": "List<DiscountDetail>",
+                      "value": []
+                    },
+                    {
+                      "op": "DEFINE_VAR",
+                      "name": "total_discount_pct",
+                      "type": "decimal",
+                      "value": 0
+                    },
+                    {
+                      "op": "COMMENT",
+                      "text": "\u2500\u2500 Rule 1: Volume discount (first match wins) \u2500\u2500"
+                    },
+                    {
+                      "op": "BRANCH",
+                      "condition": {
+                        "left": "request.quantity",
+                        "op": ">=",
+                        "right": 100
+                      },
+                      "cases": {
                         "TRUE": [
-                          { "op": "APPEND", "target": "discounts", "value": {
-                              "type": "volume", "reason": "volume 100+", "percentage": 15 }},
-                          { "op": "COMPUTE", "assign": "total_discount_pct",
-                            "left": "total_discount_pct", "operator": "+", "right": 15, "result_type": "decimal" }
+                          {
+                            "op": "APPEND",
+                            "target": "discounts",
+                            "value": {
+                              "type": "volume",
+                              "reason": "volume 100+",
+                              "percentage": 15
+                            }
+                          },
+                          {
+                            "op": "COMPUTE",
+                            "assign": "total_discount_pct",
+                            "left": "total_discount_pct",
+                            "operator": "+",
+                            "right": 15,
+                            "result_type": "decimal"
+                          }
                         ],
                         "FALSE": [
-                          { "op": "BRANCH", "condition": { "left": "request.quantity", "op": ">=", "right": 50 }, "cases": {
+                          {
+                            "op": "BRANCH",
+                            "condition": {
+                              "left": "request.quantity",
+                              "op": ">=",
+                              "right": 50
+                            },
+                            "cases": {
                               "TRUE": [
-                                { "op": "APPEND", "target": "discounts", "value": {
-                                    "type": "volume", "reason": "volume 50+", "percentage": 10 }},
-                                { "op": "COMPUTE", "assign": "total_discount_pct",
-                                  "left": "total_discount_pct", "operator": "+", "right": 10, "result_type": "decimal" }
+                                {
+                                  "op": "APPEND",
+                                  "target": "discounts",
+                                  "value": {
+                                    "type": "volume",
+                                    "reason": "volume 50+",
+                                    "percentage": 10
+                                  }
+                                },
+                                {
+                                  "op": "COMPUTE",
+                                  "assign": "total_discount_pct",
+                                  "left": "total_discount_pct",
+                                  "operator": "+",
+                                  "right": 10,
+                                  "result_type": "decimal"
+                                }
                               ],
                               "FALSE": [
-                                { "op": "BRANCH", "condition": { "left": "request.quantity", "op": ">=", "right": 20 }, "cases": {
+                                {
+                                  "op": "BRANCH",
+                                  "condition": {
+                                    "left": "request.quantity",
+                                    "op": ">=",
+                                    "right": 20
+                                  },
+                                  "cases": {
                                     "TRUE": [
-                                      { "op": "APPEND", "target": "discounts", "value": {
-                                          "type": "volume", "reason": "volume 20+", "percentage": 5 }},
-                                      { "op": "COMPUTE", "assign": "total_discount_pct",
-                                        "left": "total_discount_pct", "operator": "+", "right": 5, "result_type": "decimal" }
+                                      {
+                                        "op": "APPEND",
+                                        "target": "discounts",
+                                        "value": {
+                                          "type": "volume",
+                                          "reason": "volume 20+",
+                                          "percentage": 5
+                                        }
+                                      },
+                                      {
+                                        "op": "COMPUTE",
+                                        "assign": "total_discount_pct",
+                                        "left": "total_discount_pct",
+                                        "operator": "+",
+                                        "right": 5,
+                                        "result_type": "decimal"
+                                      }
                                     ],
                                     "FALSE": []
                                   }
@@ -209,41 +430,118 @@
                         ]
                       }
                     },
-
-                    { "op": "COMMENT", "text": "── Rule 2: Customer type discount ──" },
-                    { "op": "MATCH", "value": "request.customer_type", "cases": {
+                    {
+                      "op": "COMMENT",
+                      "text": "\u2500\u2500 Rule 2: Customer type discount \u2500\u2500"
+                    },
+                    {
+                      "op": "MATCH",
+                      "value": "request.customer_type",
+                      "cases": {
                         "premium": [
-                          { "op": "APPEND", "target": "discounts", "value": {
-                              "type": "customer", "reason": "premium customer", "percentage": 10 }},
-                          { "op": "COMPUTE", "assign": "total_discount_pct",
-                            "left": "total_discount_pct", "operator": "+", "right": 10, "result_type": "decimal" }
+                          {
+                            "op": "APPEND",
+                            "target": "discounts",
+                            "value": {
+                              "type": "customer",
+                              "reason": "premium customer",
+                              "percentage": 10
+                            }
+                          },
+                          {
+                            "op": "COMPUTE",
+                            "assign": "total_discount_pct",
+                            "left": "total_discount_pct",
+                            "operator": "+",
+                            "right": 10,
+                            "result_type": "decimal"
+                          }
                         ],
                         "wholesale": [
-                          { "op": "APPEND", "target": "discounts", "value": {
-                              "type": "customer", "reason": "wholesale customer", "percentage": 15 }},
-                          { "op": "COMPUTE", "assign": "total_discount_pct",
-                            "left": "total_discount_pct", "operator": "+", "right": 15, "result_type": "decimal" }
+                          {
+                            "op": "APPEND",
+                            "target": "discounts",
+                            "value": {
+                              "type": "customer",
+                              "reason": "wholesale customer",
+                              "percentage": 15
+                            }
+                          },
+                          {
+                            "op": "COMPUTE",
+                            "assign": "total_discount_pct",
+                            "left": "total_discount_pct",
+                            "operator": "+",
+                            "right": 15,
+                            "result_type": "decimal"
+                          }
                         ],
                         "regular": []
                       }
                     },
-
-                    { "op": "COMMENT", "text": "── Rule 3: Day of week discount ──" },
-                    { "op": "GET_CURRENT", "what": "day_of_week", "assign": "today" },
-                    { "op": "BRANCH", "condition": { "left": "today", "op": "==", "right": "tuesday" }, "cases": {
+                    {
+                      "op": "COMMENT",
+                      "text": "\u2500\u2500 Rule 3: Day of week discount \u2500\u2500"
+                    },
+                    {
+                      "op": "GET_CURRENT",
+                      "what": "day_of_week",
+                      "assign": "today"
+                    },
+                    {
+                      "op": "BRANCH",
+                      "condition": {
+                        "left": "today",
+                        "op": "==",
+                        "right": "tuesday"
+                      },
+                      "cases": {
                         "TRUE": [
-                          { "op": "APPEND", "target": "discounts", "value": {
-                              "type": "promo", "reason": "Tuesday promo", "percentage": 5 }},
-                          { "op": "COMPUTE", "assign": "total_discount_pct",
-                            "left": "total_discount_pct", "operator": "+", "right": 5, "result_type": "decimal" }
+                          {
+                            "op": "APPEND",
+                            "target": "discounts",
+                            "value": {
+                              "type": "promo",
+                              "reason": "Tuesday promo",
+                              "percentage": 5
+                            }
+                          },
+                          {
+                            "op": "COMPUTE",
+                            "assign": "total_discount_pct",
+                            "left": "total_discount_pct",
+                            "operator": "+",
+                            "right": 5,
+                            "result_type": "decimal"
+                          }
                         ],
                         "FALSE": [
-                          { "op": "BRANCH", "condition": { "left": "today", "op": "==", "right": "thursday" }, "cases": {
+                          {
+                            "op": "BRANCH",
+                            "condition": {
+                              "left": "today",
+                              "op": "==",
+                              "right": "thursday"
+                            },
+                            "cases": {
                               "TRUE": [
-                                { "op": "APPEND", "target": "discounts", "value": {
-                                    "type": "promo", "reason": "Thursday promo", "percentage": 3 }},
-                                { "op": "COMPUTE", "assign": "total_discount_pct",
-                                  "left": "total_discount_pct", "operator": "+", "right": 3, "result_type": "decimal" }
+                                {
+                                  "op": "APPEND",
+                                  "target": "discounts",
+                                  "value": {
+                                    "type": "promo",
+                                    "reason": "Thursday promo",
+                                    "percentage": 3
+                                  }
+                                },
+                                {
+                                  "op": "COMPUTE",
+                                  "assign": "total_discount_pct",
+                                  "left": "total_discount_pct",
+                                  "operator": "+",
+                                  "right": 3,
+                                  "result_type": "decimal"
+                                }
                               ],
                               "FALSE": []
                             }
@@ -251,46 +549,138 @@
                         ]
                       }
                     },
-
-                    { "op": "COMMENT", "text": "── Rule 4: Coupon (optional) ──" },
-                    { "op": "BRANCH", "condition": { "left": "request.coupon_code", "op": "!=", "right": "null" }, "cases": {
+                    {
+                      "op": "COMMENT",
+                      "text": "\u2500\u2500 Rule 4: Coupon (optional) \u2500\u2500"
+                    },
+                    {
+                      "op": "BRANCH",
+                      "condition": {
+                        "left": "request.coupon_code",
+                        "op": "!=",
+                        "right": "null"
+                      },
+                      "cases": {
                         "TRUE": [
-                          { "op": "STORE_FIND", "store": "coupon_store", "key": "request.coupon_code", "assign": "coupon" },
-                          { "op": "MATCH", "value": "coupon", "cases": {
+                          {
+                            "op": "STORE_FIND",
+                            "store": "coupon_store",
+                            "key": "request.coupon_code",
+                            "assign": "coupon"
+                          },
+                          {
+                            "op": "MATCH",
+                            "value": "coupon",
+                            "cases": {
                               "NONE": [
-                                { "op": "ERR_CUSTOM", "type": "ERR_COUPON_INVALID",
-                                  "params": { "code": "request.coupon_code", "reason": "coupon not found" }}
+                                {
+                                  "op": "ERR_CUSTOM",
+                                  "type": "ERR_COUPON_INVALID",
+                                  "params": {
+                                    "code": "request.coupon_code",
+                                    "reason": "coupon not found"
+                                  }
+                                }
                               ],
                               "OK": [
-                                { "op": "BRANCH", "condition": { "left": "coupon.active", "op": "==", "right": false }, "cases": {
+                                {
+                                  "op": "BRANCH",
+                                  "condition": {
+                                    "left": "coupon.active",
+                                    "op": "==",
+                                    "right": false
+                                  },
+                                  "cases": {
                                     "TRUE": [
-                                      { "op": "ERR_CUSTOM", "type": "ERR_COUPON_INVALID",
-                                        "params": { "code": "request.coupon_code", "reason": "coupon is inactive" }}
+                                      {
+                                        "op": "ERR_CUSTOM",
+                                        "type": "ERR_COUPON_INVALID",
+                                        "params": {
+                                          "code": "request.coupon_code",
+                                          "reason": "coupon is inactive"
+                                        }
+                                      }
                                     ],
                                     "FALSE": [
-                                      { "op": "GET_CURRENT", "what": "timestamp", "assign": "now" },
-                                      { "op": "BRANCH", "condition": { "left": "now", "op": ">", "right": "coupon.valid_until" }, "cases": {
+                                      {
+                                        "op": "GET_CURRENT",
+                                        "what": "timestamp",
+                                        "assign": "now"
+                                      },
+                                      {
+                                        "op": "BRANCH",
+                                        "condition": {
+                                          "left": "now",
+                                          "op": ">",
+                                          "right": "coupon.valid_until"
+                                        },
+                                        "cases": {
                                           "TRUE": [
-                                            { "op": "ERR_CUSTOM", "type": "ERR_COUPON_EXPIRED",
-                                              "params": { "code": "request.coupon_code" }}
+                                            {
+                                              "op": "ERR_CUSTOM",
+                                              "type": "ERR_COUPON_EXPIRED",
+                                              "params": {
+                                                "code": "request.coupon_code"
+                                              }
+                                            }
                                           ],
                                           "FALSE": [
-                                            { "op": "BRANCH", "condition": { "left": "request.customer_type", "op": "NOT_IN", "right": "coupon.customer_types" }, "cases": {
+                                            {
+                                              "op": "BRANCH",
+                                              "condition": {
+                                                "left": "request.customer_type",
+                                                "op": "NOT_IN",
+                                                "right": "coupon.customer_types"
+                                              },
+                                              "cases": {
                                                 "TRUE": [
-                                                  { "op": "ERR_CUSTOM", "type": "ERR_COUPON_NOT_ELIGIBLE",
-                                                    "params": { "code": "request.coupon_code", "customer_type": "request.customer_type" }}
+                                                  {
+                                                    "op": "ERR_CUSTOM",
+                                                    "type": "ERR_COUPON_NOT_ELIGIBLE",
+                                                    "params": {
+                                                      "code": "request.coupon_code",
+                                                      "customer_type": "request.customer_type"
+                                                    }
+                                                  }
                                                 ],
                                                 "FALSE": [
-                                                  { "op": "BRANCH", "condition": { "left": "request.quantity", "op": "<", "right": "coupon.min_quantity" }, "cases": {
+                                                  {
+                                                    "op": "BRANCH",
+                                                    "condition": {
+                                                      "left": "request.quantity",
+                                                      "op": "<",
+                                                      "right": "coupon.min_quantity"
+                                                    },
+                                                    "cases": {
                                                       "TRUE": [
-                                                        { "op": "ERR_CUSTOM", "type": "ERR_COUPON_MIN_QUANTITY",
-                                                          "params": { "code": "request.coupon_code", "min_quantity": "coupon.min_quantity", "actual_quantity": "request.quantity" }}
+                                                        {
+                                                          "op": "ERR_CUSTOM",
+                                                          "type": "ERR_COUPON_MIN_QUANTITY",
+                                                          "params": {
+                                                            "code": "request.coupon_code",
+                                                            "min_quantity": "coupon.min_quantity",
+                                                            "actual_quantity": "request.quantity"
+                                                          }
+                                                        }
                                                       ],
                                                       "FALSE": [
-                                                        { "op": "APPEND", "target": "discounts", "value": {
-                                                            "type": "coupon", "reason": "request.coupon_code", "percentage": "coupon.discount_pct" }},
-                                                        { "op": "COMPUTE", "assign": "total_discount_pct",
-                                                          "left": "total_discount_pct", "operator": "+", "right": "coupon.discount_pct", "result_type": "decimal" }
+                                                        {
+                                                          "op": "APPEND",
+                                                          "target": "discounts",
+                                                          "value": {
+                                                            "type": "coupon",
+                                                            "reason": "request.coupon_code",
+                                                            "percentage": "coupon.discount_pct"
+                                                          }
+                                                        },
+                                                        {
+                                                          "op": "COMPUTE",
+                                                          "assign": "total_discount_pct",
+                                                          "left": "total_discount_pct",
+                                                          "operator": "+",
+                                                          "right": "coupon.discount_pct",
+                                                          "result_type": "decimal"
+                                                        }
                                                       ]
                                                     }
                                                   }
@@ -310,26 +700,59 @@
                         "FALSE": []
                       }
                     },
-
-                    { "op": "COMMENT", "text": "── Cap discount at max ──" },
-                    { "op": "COMPUTE_FN", "assign": "total_discount_pct",
-                      "function": "min", "args": ["total_discount_pct", 40],
-                      "result_type": "decimal" },
-
-                    { "op": "COMMENT", "text": "── Calculate final price ──" },
-                    { "op": "COMPUTE", "assign": "discount_multiplier",
-                      "left": 1, "operator": "-", "right": { "op": "/", "left": "total_discount_pct", "right": 100 },
-                      "result_type": "decimal" },
-
-                    { "op": "COMPUTE", "assign": "final_price",
-                      "left": "subtotal", "operator": "*", "right": "discount_multiplier",
-                      "result_type": "decimal" },
-
-                    { "op": "COMPUTE_FN", "assign": "final_price",
-                      "function": "round", "args": ["final_price", 2],
-                      "result_type": "decimal" },
-
-                    { "op": "CONSTRUCT", "schema": "PriceResponse", "assign": "response", "data": {
+                    {
+                      "op": "COMMENT",
+                      "text": "\u2500\u2500 Cap discount at max \u2500\u2500"
+                    },
+                    {
+                      "op": "COMPUTE_FN",
+                      "assign": "total_discount_pct",
+                      "function": "min",
+                      "args": [
+                        "total_discount_pct",
+                        40
+                      ],
+                      "result_type": "decimal"
+                    },
+                    {
+                      "op": "COMMENT",
+                      "text": "\u2500\u2500 Calculate final price \u2500\u2500"
+                    },
+                    {
+                      "op": "COMPUTE",
+                      "assign": "discount_multiplier",
+                      "left": 1,
+                      "operator": "-",
+                      "right": {
+                        "op": "/",
+                        "left": "total_discount_pct",
+                        "right": 100
+                      },
+                      "result_type": "decimal"
+                    },
+                    {
+                      "op": "COMPUTE",
+                      "assign": "final_price",
+                      "left": "subtotal",
+                      "operator": "*",
+                      "right": "discount_multiplier",
+                      "result_type": "decimal"
+                    },
+                    {
+                      "op": "COMPUTE_FN",
+                      "assign": "final_price",
+                      "function": "round",
+                      "args": [
+                        "final_price",
+                        2
+                      ],
+                      "result_type": "decimal"
+                    },
+                    {
+                      "op": "CONSTRUCT",
+                      "schema": "PriceResponse",
+                      "assign": "response",
+                      "data": {
                         "product_id": "request.product_id",
                         "base_price": "product_result.price",
                         "quantity": "request.quantity",
@@ -339,8 +762,11 @@
                         "final_price": "final_price"
                       }
                     },
-
-                    { "op": "RESPOND", "status": 200, "body": "response" }
+                    {
+                      "op": "RESPOND",
+                      "status": 200,
+                      "body": "response"
+                    }
                   ]
                 }
               }
@@ -349,23 +775,50 @@
         }
       ]
     },
-
     "handler_get_coupon": {
-      "auth": { "requires": "authenticated" },
-      "params": { "code": "string" },
+      "auth": {
+        "requires": "authenticated"
+      },
+      "params": {
+        "code": "string"
+      },
       "returns": "RESULT(Coupon, Error)",
       "instructions": [
-        { "op": "READ_PARAM", "name": "code", "type": "string", "assign": "code" },
-        { "op": "STORE_FIND", "store": "coupon_store", "key": "code", "assign": "coupon" },
-        { "op": "MATCH", "value": "coupon", "cases": {
-            "OK": [{ "op": "RESPOND", "status": 200, "body": "coupon" }],
-            "NONE": [{ "op": "ERR_NOT_FOUND", "entity": "coupon", "id": "code" }]
+        {
+          "op": "READ_PARAM",
+          "name": "code",
+          "type": "string",
+          "assign": "code"
+        },
+        {
+          "op": "STORE_FIND",
+          "store": "coupon_store",
+          "key": "code",
+          "assign": "coupon"
+        },
+        {
+          "op": "MATCH",
+          "value": "coupon",
+          "cases": {
+            "OK": [
+              {
+                "op": "RESPOND",
+                "status": 200,
+                "body": "coupon"
+              }
+            ],
+            "NONE": [
+              {
+                "op": "ERR_NOT_FOUND",
+                "entity": "coupon",
+                "id": "code"
+              }
+            ]
           }
         }
       ]
     }
   },
-
   "tests": {
     "cases": [
       {
@@ -373,20 +826,56 @@
         "setup": {
           "mock_services": {
             "product_service": [
-              { "method": "GET", "path": "/products/prod-001",
-                "response": { "status": 200, "body": {"id": "prod-001", "name": "Widget", "price": 10.00, "stock": 100} }}
+              {
+                "method": "GET",
+                "path": "/products/prod-001",
+                "response": {
+                  "status": 200,
+                  "body": {
+                    "id": "prod-001",
+                    "name": "Widget",
+                    "price": 10.0,
+                    "stock": 100
+                  }
+                }
+              }
             ]
           },
-          "override_time": { "day_of_week": "monday" }
+          "override_time": {
+            "day_of_week": "monday"
+          }
         },
         "run": [
-          { "action": "REQUEST", "method": "POST", "path": "/pricing/calculate",
-            "body": { "product_id": "prod-001", "quantity": 5, "customer_type": "regular" }},
-          { "assert": "status", "equals": 200 },
-          { "assert": "body.subtotal", "equals": 50.00 },
-          { "assert": "body.total_discount_pct", "equals": 0 },
-          { "assert": "body.final_price", "equals": 50.00 },
-          { "assert": "body.discounts_applied.length", "equals": 0 }
+          {
+            "action": "REQUEST",
+            "method": "POST",
+            "path": "/pricing/calculate",
+            "body": {
+              "product_id": "prod-001",
+              "quantity": 5,
+              "customer_type": "regular"
+            }
+          },
+          {
+            "assert": "status",
+            "equals": 200
+          },
+          {
+            "assert": "body.subtotal",
+            "equals": 50.0
+          },
+          {
+            "assert": "body.total_discount_pct",
+            "equals": 0
+          },
+          {
+            "assert": "body.final_price",
+            "equals": 50.0
+          },
+          {
+            "assert": "body.discounts_applied.length",
+            "equals": 0
+          }
         ]
       },
       {
@@ -394,21 +883,60 @@
         "setup": {
           "mock_services": {
             "product_service": [
-              { "method": "GET", "path": "/products/prod-001",
-                "response": { "status": 200, "body": {"id": "prod-001", "name": "Widget", "price": 10.00, "stock": 200} }}
+              {
+                "method": "GET",
+                "path": "/products/prod-001",
+                "response": {
+                  "status": 200,
+                  "body": {
+                    "id": "prod-001",
+                    "name": "Widget",
+                    "price": 10.0,
+                    "stock": 200
+                  }
+                }
+              }
             ]
           },
-          "override_time": { "day_of_week": "monday" }
+          "override_time": {
+            "day_of_week": "monday"
+          }
         },
         "run": [
-          { "action": "REQUEST", "method": "POST", "path": "/pricing/calculate",
-            "body": { "product_id": "prod-001", "quantity": 50, "customer_type": "regular" }},
-          { "assert": "status", "equals": 200 },
-          { "assert": "body.subtotal", "equals": 500.00 },
-          { "assert": "body.total_discount_pct", "equals": 10 },
-          { "assert": "body.final_price", "equals": 450.00 },
-          { "assert": "body.discounts_applied.length", "equals": 1 },
-          { "assert": "body.discounts_applied[0].type", "equals": "volume" }
+          {
+            "action": "REQUEST",
+            "method": "POST",
+            "path": "/pricing/calculate",
+            "body": {
+              "product_id": "prod-001",
+              "quantity": 50,
+              "customer_type": "regular"
+            }
+          },
+          {
+            "assert": "status",
+            "equals": 200
+          },
+          {
+            "assert": "body.subtotal",
+            "equals": 500.0
+          },
+          {
+            "assert": "body.total_discount_pct",
+            "equals": 10
+          },
+          {
+            "assert": "body.final_price",
+            "equals": 450.0
+          },
+          {
+            "assert": "body.discounts_applied.length",
+            "equals": 1
+          },
+          {
+            "assert": "body.discounts_applied[0].type",
+            "equals": "volume"
+          }
         ]
       },
       {
@@ -416,20 +944,56 @@
         "setup": {
           "mock_services": {
             "product_service": [
-              { "method": "GET", "path": "/products/prod-001",
-                "response": { "status": 200, "body": {"id": "prod-001", "name": "Widget", "price": 10.00, "stock": 500} }}
+              {
+                "method": "GET",
+                "path": "/products/prod-001",
+                "response": {
+                  "status": 200,
+                  "body": {
+                    "id": "prod-001",
+                    "name": "Widget",
+                    "price": 10.0,
+                    "stock": 500
+                  }
+                }
+              }
             ]
           },
-          "override_time": { "day_of_week": "tuesday" }
+          "override_time": {
+            "day_of_week": "tuesday"
+          }
         },
         "run": [
-          { "action": "REQUEST", "method": "POST", "path": "/pricing/calculate",
-            "body": { "product_id": "prod-001", "quantity": 100, "customer_type": "premium" }},
-          { "assert": "status", "equals": 200 },
-          { "assert": "body.subtotal", "equals": 1000.00 },
-          { "assert": "body.total_discount_pct", "equals": 30 },
-          { "assert": "body.final_price", "equals": 700.00 },
-          { "assert": "body.discounts_applied.length", "equals": 3 }
+          {
+            "action": "REQUEST",
+            "method": "POST",
+            "path": "/pricing/calculate",
+            "body": {
+              "product_id": "prod-001",
+              "quantity": 100,
+              "customer_type": "premium"
+            }
+          },
+          {
+            "assert": "status",
+            "equals": 200
+          },
+          {
+            "assert": "body.subtotal",
+            "equals": 1000.0
+          },
+          {
+            "assert": "body.total_discount_pct",
+            "equals": 30
+          },
+          {
+            "assert": "body.final_price",
+            "equals": 700.0
+          },
+          {
+            "assert": "body.discounts_applied.length",
+            "equals": 3
+          }
         ],
         "_comment": "15% volume + 10% premium + 5% tuesday = 30%"
       },
@@ -438,23 +1002,63 @@
         "setup": {
           "mock_services": {
             "product_service": [
-              { "method": "GET", "path": "/products/prod-001",
-                "response": { "status": 200, "body": {"id": "prod-001", "name": "Widget", "price": 10.00, "stock": 500} }}
+              {
+                "method": "GET",
+                "path": "/products/prod-001",
+                "response": {
+                  "status": 200,
+                  "body": {
+                    "id": "prod-001",
+                    "name": "Widget",
+                    "price": 10.0,
+                    "stock": 500
+                  }
+                }
+              }
             ]
           },
           "seed_data": {
             "coupon_store": [
-              { "code": "MEGA20", "discount_pct": 20, "min_quantity": 1, "valid_until": "2027-12-31T23:59:59Z", "customer_types": ["wholesale"], "active": true }
+              {
+                "code": "MEGA20",
+                "discount_pct": 20,
+                "min_quantity": 1,
+                "valid_until": "2027-12-31T23:59:59Z",
+                "customer_types": [
+                  "wholesale"
+                ],
+                "active": true
+              }
             ]
           },
-          "override_time": { "day_of_week": "tuesday" }
+          "override_time": {
+            "day_of_week": "tuesday"
+          }
         },
         "run": [
-          { "action": "REQUEST", "method": "POST", "path": "/pricing/calculate",
-            "body": { "product_id": "prod-001", "quantity": 100, "customer_type": "wholesale", "coupon_code": "MEGA20" }},
-          { "assert": "status", "equals": 200 },
-          { "assert": "body.total_discount_pct", "equals": 40 },
-          { "assert": "body.final_price", "equals": 600.00 }
+          {
+            "action": "REQUEST",
+            "method": "POST",
+            "path": "/pricing/calculate",
+            "body": {
+              "product_id": "prod-001",
+              "quantity": 100,
+              "customer_type": "wholesale",
+              "coupon_code": "MEGA20"
+            }
+          },
+          {
+            "assert": "status",
+            "equals": 200
+          },
+          {
+            "assert": "body.total_discount_pct",
+            "equals": 40
+          },
+          {
+            "assert": "body.final_price",
+            "equals": 600.0
+          }
         ],
         "_comment": "15% volume + 15% wholesale + 5% tuesday + 20% coupon = 55%, capped at 40%"
       },
@@ -463,21 +1067,56 @@
         "setup": {
           "seed_data": {
             "coupon_store": [
-              { "code": "EXPIRED10", "discount_pct": 10, "min_quantity": 1, "valid_until": "2020-01-01T00:00:00Z", "customer_types": ["regular"], "active": true }
+              {
+                "code": "EXPIRED10",
+                "discount_pct": 10,
+                "min_quantity": 1,
+                "valid_until": "2020-01-01T00:00:00Z",
+                "customer_types": [
+                  "regular"
+                ],
+                "active": true
+              }
             ]
           },
           "mock_services": {
             "product_service": [
-              { "method": "GET", "path": "/products/prod-001",
-                "response": { "status": 200, "body": {"id": "prod-001", "name": "Widget", "price": 10.00, "stock": 100} }}
+              {
+                "method": "GET",
+                "path": "/products/prod-001",
+                "response": {
+                  "status": 200,
+                  "body": {
+                    "id": "prod-001",
+                    "name": "Widget",
+                    "price": 10.0,
+                    "stock": 100
+                  }
+                }
+              }
             ]
           }
         },
         "run": [
-          { "action": "REQUEST", "method": "POST", "path": "/pricing/calculate",
-            "body": { "product_id": "prod-001", "quantity": 5, "customer_type": "regular", "coupon_code": "EXPIRED10" }},
-          { "assert": "status", "equals": 422 },
-          { "assert": "body.error.type", "equals": "COUPON_EXPIRED" }
+          {
+            "action": "REQUEST",
+            "method": "POST",
+            "path": "/pricing/calculate",
+            "body": {
+              "product_id": "prod-001",
+              "quantity": 5,
+              "customer_type": "regular",
+              "coupon_code": "EXPIRED10"
+            }
+          },
+          {
+            "assert": "status",
+            "equals": 422
+          },
+          {
+            "assert": "body.error.type",
+            "equals": "COUPON_EXPIRED"
+          }
         ],
         "clean": "RESET_STORE(coupon_store)"
       },
@@ -486,21 +1125,56 @@
         "setup": {
           "seed_data": {
             "coupon_store": [
-              { "code": "WHOLESALE5", "discount_pct": 5, "min_quantity": 1, "valid_until": "2027-12-31T23:59:59Z", "customer_types": ["wholesale"], "active": true }
+              {
+                "code": "WHOLESALE5",
+                "discount_pct": 5,
+                "min_quantity": 1,
+                "valid_until": "2027-12-31T23:59:59Z",
+                "customer_types": [
+                  "wholesale"
+                ],
+                "active": true
+              }
             ]
           },
           "mock_services": {
             "product_service": [
-              { "method": "GET", "path": "/products/prod-001",
-                "response": { "status": 200, "body": {"id": "prod-001", "name": "Widget", "price": 10.00, "stock": 100} }}
+              {
+                "method": "GET",
+                "path": "/products/prod-001",
+                "response": {
+                  "status": 200,
+                  "body": {
+                    "id": "prod-001",
+                    "name": "Widget",
+                    "price": 10.0,
+                    "stock": 100
+                  }
+                }
+              }
             ]
           }
         },
         "run": [
-          { "action": "REQUEST", "method": "POST", "path": "/pricing/calculate",
-            "body": { "product_id": "prod-001", "quantity": 5, "customer_type": "regular", "coupon_code": "WHOLESALE5" }},
-          { "assert": "status", "equals": 422 },
-          { "assert": "body.error.type", "equals": "COUPON_NOT_ELIGIBLE" }
+          {
+            "action": "REQUEST",
+            "method": "POST",
+            "path": "/pricing/calculate",
+            "body": {
+              "product_id": "prod-001",
+              "quantity": 5,
+              "customer_type": "regular",
+              "coupon_code": "WHOLESALE5"
+            }
+          },
+          {
+            "assert": "status",
+            "equals": 422
+          },
+          {
+            "assert": "body.error.type",
+            "equals": "COUPON_NOT_ELIGIBLE"
+          }
         ],
         "clean": "RESET_STORE(coupon_store)"
       }

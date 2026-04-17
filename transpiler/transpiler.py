@@ -1985,7 +1985,7 @@ def generate_csharp(bc, output_dir: str):
         if store_def.get('provider') == 'PostgreSQL':
             lines.extend(generate_postgres_store_csharp(store_name, store_def, schema_def))
         else:
-            lines.extend(generate_store_csharp(schema, schema_def))
+            lines.extend(generate_store_csharp(schema, schema_def, store_def))
         lines.append("")
 
     # Error model
@@ -2625,32 +2625,39 @@ def _autogen_default_csharp(ftype: str) -> str:
     return 'default!'
 
 
-def generate_store_csharp(schema: str, schema_def: dict) -> list[str]:
+def generate_store_csharp(schema: str, schema_def: dict, store_def: dict = None) -> list[str]:
     """Generate C# in-memory store from AILang store definition."""
     fields = schema_def.get('fields', {})
     dto_fields = {k: v for k, v in fields.items() if not v.get('auto_gen')}
     auto_gen_fields = {k: v for k, v in fields.items() if v.get('auto_gen')}
+
+    # Resolve the primary key from the store's index definition.
+    index = (store_def or {}).get('index', {}) or {}
+    pk_field = index.get('field', 'id')
+    pk_type_ailang = fields.get(pk_field, {}).get('type', 'uuid')
+    pk_cs_type = TypeMapper.to_csharp(pk_type_ailang)
+    pk_prop = pascal_case(pk_field)
+    pk_is_auto = fields.get(pk_field, {}).get('auto_gen', False)
 
     lines = []
     lines.append(f"// STORE: InMemory{schema}Store (from bytecode)")
     lines.append(f"public interface I{schema}Store")
     lines.append("{")
     lines.append(f"    List<{schema}> ListAll();")
-    lines.append(f"    {schema}? Find(Guid id);")
+    lines.append(f"    {schema}? Find({pk_cs_type} {pk_field});")
     lines.append(f"    {schema} Insert({schema}Dto data);")
-    lines.append(f"    {schema}? Update(Guid id, {schema}Dto data);")
-    lines.append("    bool Delete(Guid id);")
+    lines.append(f"    {schema}? Update({pk_cs_type} {pk_field}, {schema}Dto data);")
+    lines.append(f"    bool Delete({pk_cs_type} {pk_field});")
     lines.append("    void Reset();  // test seam — RESET_STORE in (tests ... (clean ...))")
     lines.append("}")
     lines.append("")
 
-    # Primary constructor keeps the file-state minimal.
     lines.append(f"public class InMemory{schema}Store : I{schema}Store")
     lines.append("{")
-    lines.append(f"    private readonly ConcurrentDictionary<Guid, {schema}> _data = new();")
+    lines.append(f"    private readonly ConcurrentDictionary<{pk_cs_type}, {schema}> _data = new();")
     lines.append("")
     lines.append(f"    public List<{schema}> ListAll() => [.. _data.Values];")
-    lines.append(f"    public {schema}? Find(Guid id) => _data.GetValueOrDefault(id);")
+    lines.append(f"    public {schema}? Find({pk_cs_type} {pk_field}) => _data.GetValueOrDefault({pk_field});")
     lines.append("")
 
     # Insert: set all auto_gen fields + DTO fields
@@ -2665,21 +2672,19 @@ def generate_store_csharp(schema: str, schema_def: dict) -> list[str]:
         prop = pascal_case(field_name)
         lines.append(f"            {prop} = data.{prop}!,")
     lines.append("        };")
-    # All auto_gen uuid fields default to NewGuid → Id is known; indexer is safe
-    lines.append("        _data[item.Id] = item;")
+    lines.append(f"        _data[item.{pk_prop}] = item;")
     lines.append("        return item;")
     lines.append("    }")
     lines.append("")
 
-    # Update: preserve original Id + created_at, regenerate updated_at
-    lines.append(f"    public {schema}? Update(Guid id, {schema}Dto data)")
+    lines.append(f"    public {schema}? Update({pk_cs_type} {pk_field}, {schema}Dto data)")
     lines.append("    {")
-    lines.append("        if (!_data.TryGetValue(id, out var existing)) return null;")
+    lines.append(f"        if (!_data.TryGetValue({pk_field}, out var existing)) return null;")
     lines.append(f"        {schema} item = new()")
     lines.append("        {")
-    lines.append("            Id = id,")
+    lines.append(f"            {pk_prop} = {pk_field},")
     for field_name, field_def in auto_gen_fields.items():
-        if field_name == 'id':
+        if field_name == pk_field:
             continue
         prop = pascal_case(field_name)
         if field_name == 'updated_at':
@@ -2687,14 +2692,16 @@ def generate_store_csharp(schema: str, schema_def: dict) -> list[str]:
         else:
             lines.append(f"            {prop} = existing.{prop},")
     for field_name in dto_fields:
+        if field_name == pk_field:
+            continue
         prop = pascal_case(field_name)
         lines.append(f"            {prop} = data.{prop}!,")
     lines.append("        };")
-    lines.append("        _data[id] = item;")
+    lines.append(f"        _data[{pk_field}] = item;")
     lines.append("        return item;")
     lines.append("    }")
     lines.append("")
-    lines.append("    public bool Delete(Guid id) => _data.TryRemove(id, out _);")
+    lines.append(f"    public bool Delete({pk_cs_type} {pk_field}) => _data.TryRemove({pk_field}, out _);")
     lines.append("    public void Reset() => _data.Clear();")
     lines.append("}")
     return lines
