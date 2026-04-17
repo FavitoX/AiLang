@@ -114,9 +114,11 @@ class TypeMapper:
 
     @staticmethod
     def to_csharp(ailang_type: str, list_of: str = None) -> str:
-        if ailang_type == 'list' and list_of:
-            inner = TypeMapper.CSHARP_TYPES.get(list_of, list_of)
-            return f"List<{inner}>"
+        if ailang_type == 'list':
+            if list_of:
+                inner = TypeMapper.CSHARP_TYPES.get(list_of, list_of)
+                return f"List<{inner}>"
+            return "List<object>"
         return TypeMapper.CSHARP_TYPES.get(ailang_type, ailang_type)
 
     @staticmethod
@@ -335,6 +337,7 @@ def ailang_type_to_csharp(t) -> str:
     m = {
         'int': 'int', 'decimal': 'decimal', 'string': 'string', 'bool': 'bool',
         'object': 'object', 'uuid': 'Guid', 'timestamp': 'DateTime',
+        'list': 'List<object>',
     }
     return m.get(t, t)
 
@@ -741,7 +744,15 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
     elif op == 'SET_VAR':
         name = inst['name']
         hint = (ctx.get('locals') or {}).get(name)
-        lines.append(f"{pad}{name} = {_cs_expr(inst.get('value'), ctx, hint=hint)};")
+        val_raw = inst.get('value')
+        val = _cs_expr(val_raw, ctx, hint=hint)
+        # String/enum vars: quote bare atoms that aren't known locals.
+        if hint in ('string', 'enum') and isinstance(val_raw, str):
+            known = (ctx.get('locals') or {})
+            if val_raw not in known and not val_raw.startswith('"') and '.' not in val_raw:
+                try: float(val_raw)
+                except ValueError: val = f'"{val_raw}"'
+        lines.append(f"{pad}{name} = {val};")
 
     elif op == 'COMPUTE':
         operator = inst.get('operator', '+')
@@ -962,6 +973,12 @@ def _cs_resolve_path(expr: str, ctx: dict, hint: str = None) -> str:
             return _cs_json_cast(inner, hint)
         # No hint: caller wants a JsonNode? — stay null-safe, no trailing `!`.
         return inner
+    # Object-typed vars (from CONSTRUCT object) need dynamic access in C#.
+    if root_type == 'object':
+        inner = f"((dynamic){parts[0]})"
+        for p in parts[1:]:
+            inner += f".{pascal_case(p)}"
+        return inner
     # Typed access — same rule as before.
     return parts[0] + ''.join('.' + pascal_case(p) for p in parts[1:])
 
@@ -995,7 +1012,7 @@ def _cs_value(v) -> str:
     if isinstance(v, (int, float)):
         return str(v)
     if isinstance(v, list):
-        return f'/* TODO nested: {v} */ default!'
+        return f'(object)null /* TODO nested: list value */'
     s = str(v)
     if s.startswith('"'):
         return s
@@ -1043,8 +1060,12 @@ def _compile_define_var_csharp(inst: dict, pad: str, ctx: dict) -> list[str]:
     # When the declared type is `string`, treat a bare atom as a string literal
     # (the parser couldn't tell — e.g. `(DEFINE_VAR x string cancelled)` with
     # the quotes stripped upstream).
-    if vtype == 'string':
-        return [f"{pad}{cs_type} {name} = {_cs_value(value)};"]
+    if vtype in ('string', 'enum'):
+        # Bare atom in string/enum context → always quote as string literal.
+        v = _cs_value(value)
+        if not v.startswith('"') and not v.startswith("'"):
+            v = f'"{value}"'
+        return [f"{pad}{cs_type} {name} = {v};"]
     if vtype == 'object' and s.startswith('{'):
         return [f"{pad}{cs_type} {name} = default!;  // TODO: object initializer {s}"]
     return [f"{pad}{cs_type} {name} = {s};"]
@@ -1423,7 +1444,6 @@ def compile_match_csharp(inst: dict, indent: int, ctx: dict = None) -> list[str]
     else:
         # Value-dispatch MATCH (integer / string arms — not RESULT pattern).
         known = (ctx.get('locals') or {})
-        # Infer value hint from arm key types: all-int → int, else string.
         all_int = all(isinstance(k, int) or (isinstance(k, str) and k.isdigit()) for k in cases if str(k) != 'DEFAULT')
         value_hint = 'int' if all_int else 'string'
         value_expr = _cs_expr(value, ctx, hint=value_hint)
@@ -1433,8 +1453,10 @@ def compile_match_csharp(inst: dict, indent: int, ctx: dict = None) -> list[str]
             if arm_str == 'DEFAULT':
                 lines.append(f"{pad}else")
             else:
+                # Arm keys are ALWAYS literal values, never variable references.
+                # Always quote non-numeric arms (even if they collide with local var names).
                 arm_val = _cs_value(arm_key)
-                if isinstance(arm_key, str) and arm_key not in known and not arm_key.startswith('"'):
+                if isinstance(arm_key, str) and not arm_key.startswith('"'):
                     try: int(arm_key)
                     except ValueError: arm_val = f'"{arm_key}"'
                 if first:
@@ -4771,7 +4793,7 @@ def compile_match_go(inst: dict, indent: int, ctx: dict = None) -> list[str]:
                 lines.append(f"{pad}}} else {{")
             else:
                 arm_val = _go_value(arm_key)
-                if isinstance(arm_key, str) and arm_key not in known and not arm_key.startswith('"'):
+                if isinstance(arm_key, str) and not arm_key.startswith('"'):
                     try: int(arm_key)
                     except ValueError: arm_val = f'"{arm_key}"'
                 if first:

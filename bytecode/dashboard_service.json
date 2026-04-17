@@ -160,7 +160,7 @@
             "OK": [
               { "op": "DEFINE_VAR", "name": "product_count", "type": "int", "value": 0 },
               { "op": "DEFINE_VAR", "name": "total_value", "type": "decimal", "value": 0 },
-              { "op": "DEFINE_VAR", "name": "low_stock_items", "type": "List<Product>", "value": [] },
+              { "op": "DEFINE_VAR", "name": "low_stock_items", "type": "list", "value": [] },
 
               { "op": "COMPUTE_FN", "assign": "product_count",
                 "function": "length", "args": ["products_response"],

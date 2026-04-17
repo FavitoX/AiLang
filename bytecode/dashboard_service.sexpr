@@ -123,7 +123,7 @@
           (OK
             (DEFINE_VAR product_count int 0)
             (DEFINE_VAR total_value decimal 0)
-            (DEFINE_VAR low_stock_items List<Product> (list))
+            (DEFINE_VAR low_stock_items list (list))
             (COMPUTE_FN length products_response → product_count)
             (ITERATE products_response p
                       (COMPUTE p.price * p.stock → item_value)
@@ -157,7 +157,7 @@
             (COMPUTE_FN length orders_response → order_count)
             (ITERATE orders_response o
                       (COMPUTE revenue + o.total → revenue)
-                      (BRANCH (== o.status "'pending'")
+                      (BRANCH (== o.status pending)
                                     (TRUE
                                       (COMPUTE pending_count + 1 → pending_count))
                                     (FALSE)))
@@ -204,15 +204,15 @@
                     → payments_section)))
     ;; ── Calculate system health ──
     (DEFINE_VAR services_up int 0)
-    (BRANCH (== products_section.status "'ok'")
+    (BRANCH (== products_section.status ok)
           (TRUE
             (COMPUTE services_up + 1 → services_up))
           (FALSE))
-    (BRANCH (== orders_section.status "'ok'")
+    (BRANCH (== orders_section.status ok)
           (TRUE
             (COMPUTE services_up + 1 → services_up))
           (FALSE))
-    (BRANCH (== payments_section.status "'ok'")
+    (BRANCH (== payments_section.status ok)
           (TRUE
             (COMPUTE services_up + 1 → services_up))
           (FALSE))
