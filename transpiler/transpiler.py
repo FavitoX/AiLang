@@ -7231,14 +7231,19 @@ def main():
     print()
 
     base_dir = os.path.dirname(filepath) or '.'
+    # Use the source filename stem for the output dir — multiple .sexpr files
+    # can declare the same (service X) name (e.g. product_service.sexpr vs
+    # product_service_pg.sexpr both with service=product_service). Keying off
+    # the stem keeps their generated dirs distinct without renaming services.
+    source_stem = os.path.splitext(os.path.basename(filepath))[0]
 
     if target in ('csharp', 'all'):
-        output_dir = os.path.join(base_dir, f"generated-csharp-{service_name}")
+        output_dir = os.path.join(base_dir, f"generated-csharp-{source_stem}")
         generate_csharp(bc, output_dir)
         generate_csharp_tests(bc, output_dir)
 
     if target in ('go', 'all'):
-        output_dir = os.path.join(base_dir, f"generated-go-{service_name}")
+        output_dir = os.path.join(base_dir, f"generated-go-{source_stem}")
         generate_go(bc, output_dir)
         generate_go_tests(bc, output_dir)
 
