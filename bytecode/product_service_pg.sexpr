@@ -509,9 +509,9 @@
       (RESET_STORE product_store)
       (SQL_SEED product_store
         "INSERT INTO products (id, sku, name, price, stock, category) VALUES
-         ('g0000000-0000-0000-0000-000000000001', 'ST-01', 'Phone',  500, 10, 'electronics'),
-         ('g0000000-0000-0000-0000-000000000002', 'ST-02', 'Laptop', 1000, 5, 'electronics'),
-         ('g0000000-0000-0000-0000-000000000003', 'ST-03', 'Shirt',  30, 100, 'clothing')"))
+         ('a1000000-0000-0000-0000-000000000001', 'ST-01', 'Phone',  500, 10, 'electronics'),
+         ('a1000000-0000-0000-0000-000000000002', 'ST-02', 'Laptop', 1000, 5, 'electronics'),
+         ('a1000000-0000-0000-0000-000000000003', 'ST-03', 'Shirt',  30, 100, 'clothing')"))
     (run
       (REQUEST GET "/products/stats"
         (auth true))

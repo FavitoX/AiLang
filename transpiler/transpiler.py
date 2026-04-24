@@ -2713,15 +2713,16 @@ def generate_postgres_store_csharp(store_name: str, store_def: dict, schema_def:
     if not mapping:
         return [f"// WARN: store {store_name} has no (mapping ...) — skipping PG generation"]
 
-    # Partition fields: auto-gen (db-managed) vs writable (come from DTO)
-    auto_fields = [
-        (f, m) for f, m in mapping
-        if schema_def.get('fields', {}).get(f, {}).get('auto_gen', False)
-    ]
-    writable_fields = [
-        (f, m) for f, m in mapping
-        if not schema_def.get('fields', {}).get(f, {}).get('auto_gen', False)
-    ]
+    # Partition fields: db-managed vs writable (come from DTO).
+    # A field is db-managed when the schema marks it auto_gen OR declares a
+    # default — letting the column DEFAULT apply (e.g. `active bool (default true)`
+    # and `created_at timestamp (auto_gen)`). Writable fields are what the
+    # INSERT actually sends; SELECT/RETURNING still reads every column.
+    def _is_db_managed(field_name: str) -> bool:
+        sfield = schema_def.get('fields', {}).get(field_name, {})
+        return bool(sfield.get('auto_gen')) or sfield.get('default') is not None
+    auto_fields = [(f, m) for f, m in mapping if _is_db_managed(f)]
+    writable_fields = [(f, m) for f, m in mapping if not _is_db_managed(f)]
 
     all_columns_sql = ", ".join(m['column'] for _, m in mapping)
     writable_column_sql = ", ".join(m['column'] for _, m in writable_fields)
@@ -2893,6 +2894,17 @@ def generate_row_mappers_csharp(bc) -> list[str]:
                 if t:
                     targets.add(t)
 
+    # Numeric aggregations in Postgres come back wider than the schema declares
+    # (COUNT → bigint, SUM(int) → bigint, ROUND(avg) → numeric), and a raw C#
+    # `(int)boxedLong` cast throws InvalidCastException. `Convert.ToXxx` coerces
+    # across the numeric tower instead, so schema `int` tolerates a bigint column.
+    _cs_convert = {
+        'int':     'Convert.ToInt32',
+        'long':    'Convert.ToInt64',
+        'decimal': 'Convert.ToDecimal',
+        'float':   'Convert.ToDouble',
+        'bool':    'Convert.ToBoolean',
+    }
     for tname in targets:
         sd = bc.schemas.get(tname)
         if not sd:
@@ -2906,8 +2918,11 @@ def generate_row_mappers_csharp(bc) -> list[str]:
             prop = pascal_case(field_name)
             ftype = field_def.get('type')
             cs_type = TypeMapper.to_csharp(ftype)
-            # Use column name = field_name by convention. Reader column name lookup.
-            lines.append(f'        {prop} = reader.IsDBNull(reader.GetOrdinal("{field_name}")) ? default : ({cs_type})reader.GetValue(reader.GetOrdinal("{field_name}")),')
+            ordinal_expr = f'reader.GetOrdinal("{field_name}")'
+            read_expr = f'reader.GetValue({ordinal_expr})'
+            conv = _cs_convert.get(ftype)
+            cast_expr = f'{conv}({read_expr})' if conv else f'({cs_type}){read_expr}'
+            lines.append(f'        {prop} = reader.IsDBNull({ordinal_expr}) ? default : {cast_expr},')
         lines.append("    };")
         lines.append("}")
         lines.append("")
@@ -3970,14 +3985,14 @@ def generate_postgres_store_go(store_name: str, store_def: dict, schema_def: dic
     if not mapping:
         return [f"// WARN: store {store_name} has no (mapping ...) — skipping PG generation"]
 
-    auto_fields = [
-        (f, m) for f, m in mapping
-        if schema_def.get('fields', {}).get(f, {}).get('auto_gen', False)
-    ]
-    writable_fields = [
-        (f, m) for f, m in mapping
-        if not schema_def.get('fields', {}).get(f, {}).get('auto_gen', False)
-    ]
+    # Partition fields like the C# side: db-managed (auto_gen or schema default)
+    # stay out of the INSERT so column DEFAULTs apply; writable fields come from
+    # the DTO. Kept in sync so Go and C# produce the same rows for the same body.
+    def _is_db_managed(field_name: str) -> bool:
+        sfield = schema_def.get('fields', {}).get(field_name, {})
+        return bool(sfield.get('auto_gen')) or sfield.get('default') is not None
+    auto_fields = [(f, m) for f, m in mapping if _is_db_managed(f)]
+    writable_fields = [(f, m) for f, m in mapping if not _is_db_managed(f)]
 
     all_columns_sql = ", ".join(m['column'] for _, m in mapping)
     writable_column_sql = ", ".join(m['column'] for _, m in writable_fields)
