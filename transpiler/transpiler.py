@@ -470,6 +470,13 @@ def generate_validation_go(field_name: str, field_def: dict, var_name: str) -> l
             lines.append(f'\t\treturn ErrValidation("{field_name}", "must be >= {gte}")')
             lines.append('\t}')
 
+    if ftype == 'list' and required:
+        min_items = field_def.get('min_items')
+        if min_items:
+            lines.append(f'\tif len({var_name}.{prop_name}) < {min_items} {{')
+            lines.append(f'\t\treturn ErrValidation("{field_name}", "required, min {min_items} items")')
+            lines.append('\t}')
+
     return lines
 
 
@@ -3150,9 +3157,11 @@ def generate_go(bc, output_dir: str):
     if is_pg or needs_http_client or needs_events or needs_sagas:
         lines.append('\t"context"')
     lines.append('\t"encoding/json"')
-    lines.append('\t"fmt"')
-    if is_pg:
+    # `errors` is used for errors.Is(context.DeadlineExceeded / gobreaker.ErrOpenState)
+    # in the resilient callService, and by PG store error mapping.
+    if is_pg or needs_resilience_go:
         lines.append('\t"errors"')
+    lines.append('\t"fmt"')
     if needs_http_client:
         lines.append('\t"io"')
     lines.append('\t"log"')
@@ -3198,6 +3207,50 @@ def generate_go(bc, output_dir: str):
 
     # Error model (shared)
     lines.extend(generate_error_model_go(bc.custom_errors))
+    lines.append("")
+
+    # ── TEST SEAMS ──
+    # These are package-level state that tests can swap in via (setup ...) ops.
+    # `buildHandler()` is responsible for resetting them to fresh defaults each
+    # call, so successive tests don't leak state across the httptest server.
+    lines.append("// ── TEST SEAMS ──")
+    lines.append("// _clock is used by GET_CURRENT clock.* — tests swap in FakeClock via (override_time …).")
+    lines.append("type AiLangClock interface {")
+    lines.append("\tNow() time.Time")
+    lines.append("\tToday() time.Time")
+    lines.append("\tDayOfWeek() time.Weekday")
+    lines.append("}")
+    lines.append("type SystemClock struct{}")
+    lines.append("func (SystemClock) Now() time.Time        { return time.Now().UTC() }")
+    lines.append("func (SystemClock) Today() time.Time      { return time.Now().UTC().Truncate(24 * time.Hour) }")
+    lines.append("func (SystemClock) DayOfWeek() time.Weekday { return time.Now().UTC().Weekday() }")
+    lines.append("")
+    lines.append("// FakeClock — used in tests via (override_time (now ISO) (day_of_week X)).")
+    lines.append("// Zero values fall through to SystemClock so tests can override only what they need.")
+    lines.append("type FakeClock struct {")
+    lines.append("\tFixedNow       time.Time")
+    lines.append("\tFixedDayOfWeek *time.Weekday")
+    lines.append("}")
+    lines.append("func (f FakeClock) Now() time.Time {")
+    lines.append("\tif !f.FixedNow.IsZero() { return f.FixedNow }")
+    lines.append("\treturn time.Now().UTC()")
+    lines.append("}")
+    lines.append("func (f FakeClock) Today() time.Time {")
+    lines.append("\tif !f.FixedNow.IsZero() { return f.FixedNow.Truncate(24 * time.Hour) }")
+    lines.append("\treturn time.Now().UTC().Truncate(24 * time.Hour)")
+    lines.append("}")
+    lines.append("func (f FakeClock) DayOfWeek() time.Weekday {")
+    lines.append("\tif f.FixedDayOfWeek != nil { return *f.FixedDayOfWeek }")
+    lines.append("\treturn time.Now().UTC().Weekday()")
+    lines.append("}")
+    lines.append("")
+    lines.append("var _clock AiLangClock = SystemClock{}")
+    lines.append("// _stores exposes in-memory stores by schema name so tests can Seed() without DI.")
+    lines.append("var _stores = map[string]any{}")
+    if (bc.resilience or {}).get('policies'):
+        lines.append("// _forcedCircuitStates[policy] = \"OPEN\" bypasses the real CB in callService —")
+        lines.append("// used by (force_circuit_state (policy_name OPEN)) in test setups.")
+        lines.append("var _forcedCircuitStates = map[string]string{}")
     lines.append("")
 
     # Stores
@@ -3389,9 +3442,17 @@ def generate_go(bc, output_dir: str):
     lines.append("// buildHandler wires the full service graph and returns the HTTP handler.")
     lines.append("// Used by main() and by main_test.go (httptest). Not for PG-backed services.")
     lines.append("func buildHandler() http.Handler {")
+    # Reset test seams so successive tests can't leak overrides into each other.
+    lines.append("\t// Reset test seams (each httptest server starts with fresh overrides).")
+    lines.append("\t_clock = SystemClock{}")
+    if (bc.resilience or {}).get('policies'):
+        lines.append("\t_forcedCircuitStates = map[string]string{}")
+    lines.append("\t_stores = map[string]any{}")
     if not is_pg:
         for store_name, store_def in bc.stores.items():
-            lines.append(f"\tstore := New{store_def['schema']}Store()")
+            schema = store_def['schema']
+            lines.append(f"\tstore := New{schema}Store()")
+            lines.append(f'\t_stores["{schema}"] = store  // test seam — Seed() reachable from main_test.go')
     if uses_call_service_anywhere:
         lines.append("\tserviceURLs := map[string]string{")
         for svc_name, svc_def in service_refs_go.items():
@@ -3658,29 +3719,34 @@ def generate_service_client_go(bc) -> list[str]:
             "// ── INTER-SERVICE HTTP HELPER (no resilience policies) ──",
             "var _httpClient = &http.Client{Timeout: 10 * time.Second}",
             "",
-            "func callService(ctx context.Context, svcName, baseURL, method, path string, body any, _idempotent bool) any {",
+            "// callService returns (body, nil) on 2xx; (nil, nil) on upstream 4xx (caller maps);",
+            "// and (nil, *AiLangError) when the call failed with a known transport error.",
+            "func callService(ctx context.Context, svcName, baseURL, method, path string, body any, _idempotent bool) (any, *AiLangError) {",
             "\tvar reqBody io.Reader",
             "\tif body != nil {",
             "\t\tb, err := json.Marshal(body)",
-            '\t\tif err != nil { slog.Error("call_service marshal", "err", err); return nil }',
+            '\t\tif err != nil { slog.Error("call_service marshal", "err", err); return nil, nil }',
             "\t\treqBody = bytes.NewReader(b)",
             "\t}",
             "\treq, err := http.NewRequestWithContext(ctx, method, baseURL+path, reqBody)",
-            '\tif err != nil { slog.Error("call_service req", "err", err); return nil }',
+            '\tif err != nil { slog.Error("call_service req", "err", err); return nil, nil }',
             '\tif body != nil { req.Header.Set("Content-Type", "application/json") }',
             "\tresp, err := _httpClient.Do(req)",
-            '\tif err != nil { slog.Error("call_service do", "err", err, "svc", svcName); return nil }',
+            "\tif err != nil {",
+            '\t\tslog.Error("call_service do", "err", err, "svc", svcName)',
+            "\t\treturn nil, nil",
+            "\t}",
             "\tdefer resp.Body.Close()",
             "\tif resp.StatusCode >= 400 {",
             '\t\tslog.Info("call_service non-2xx", "status", resp.StatusCode, "path", path)',
-            "\t\treturn nil",
+            "\t\treturn nil, nil",
             "\t}",
             "\tvar out any",
             "\tif err := json.NewDecoder(resp.Body).Decode(&out); err != nil {",
             '\t\tslog.Error("call_service decode", "err", err)',
-            "\t\treturn nil",
+            "\t\treturn nil, nil",
             "\t}",
-            "\treturn out",
+            "\treturn out, nil",
             "}",
         ]
 
@@ -3754,10 +3820,16 @@ def generate_service_client_go(bc) -> list[str]:
 
     lines.extend([
         "// callService performs a single HTTP call with (optional) circuit breaker,",
-        "// per-attempt timeout, and retry-with-backoff. Returns nil on final failure.",
-        "func callService(ctx context.Context, svcName, baseURL, method, path string, body any, idempotent bool) any {",
+        "// per-attempt timeout, and retry-with-backoff.",
+        "// Returns (body, nil) on success, (nil, nil) on generic failure or upstream 4xx,",
+        "// and (nil, ErrTimeout|ErrUnavailable) when a known transport error occurred.",
+        "func callService(ctx context.Context, svcName, baseURL, method, path string, body any, idempotent bool) (any, *AiLangError) {",
         "\tif len(_cbs) > 0 { _cbsOnce.Do(_initCBs) }",
         '\tpolicy := _svcPolicies[svcName]',
+        "\t// Test seam: force the breaker open without tripping it via failures.",
+        '\tif _forcedCircuitStates[policy] == "OPEN" {',
+        "\t\treturn nil, ErrUnavailable(svcName)",
+        "\t}",
         "\ttimeout := 10 * time.Second",
         "\tif t, ok := _timeouts[policy]; ok { timeout = t }",
         "\tmaxAttempts := 1",
@@ -3775,6 +3847,7 @@ def generate_service_client_go(bc) -> list[str]:
         "\tcb := _cbs[policy]",
         "",
         "\tvar lastBody []byte",
+        "\tvar lastErr error",
         "\tfor attempt := 0; attempt < maxAttempts; attempt++ {",
         "\t\tif attempt > 0 {",
         "\t\t\tdelay := initial",
@@ -3783,7 +3856,7 @@ def generate_service_client_go(bc) -> list[str]:
         "\t\t\tselect {",
         "\t\t\tcase <-time.After(delay):",
         "\t\t\tcase <-ctx.Done():",
-        "\t\t\t\treturn nil",
+        "\t\t\t\treturn nil, nil",
         "\t\t\t}",
         "\t\t}",
         "\t\tattemptCtx, cancel := context.WithTimeout(ctx, timeout)",
@@ -3799,17 +3872,30 @@ def generate_service_client_go(bc) -> list[str]:
         "\t\tcancel()",
         "\t\tif err == nil {",
         "\t\t\tlastBody = b",
+        "\t\t\tlastErr = nil",
         "\t\t\tbreak  // success",
         "\t\t}",
+        "\t\tlastErr = err",
         '\t\tslog.Info("call_service attempt failed", "svc", svcName, "attempt", attempt+1, "err", err.Error())',
         "\t}",
-        "\tif lastBody == nil { return nil }",
+        "\tif lastErr != nil {",
+        "\t\t// gobreaker returns ErrOpenState when the breaker is open.",
+        "\t\tif errors.Is(lastErr, gobreaker.ErrOpenState) || errors.Is(lastErr, gobreaker.ErrTooManyRequests) {",
+        "\t\t\treturn nil, ErrUnavailable(svcName)",
+        "\t\t}",
+        "\t\t// Per-attempt ctx.WithTimeout expiry surfaces as DeadlineExceeded.",
+        '\t\tif errors.Is(lastErr, context.DeadlineExceeded) || strings.Contains(lastErr.Error(), "context deadline exceeded") {',
+        "\t\t\treturn nil, ErrTimeout(svcName)",
+        "\t\t}",
+        "\t\treturn nil, nil",
+        "\t}",
+        "\tif lastBody == nil { return nil, nil }",
         "\tvar out any",
         "\tif err := json.Unmarshal(lastBody, &out); err != nil {",
         '\t\tslog.Error("call_service decode", "err", err)',
-        "\t\treturn nil",
+        "\t\treturn nil, nil",
         "\t}",
-        "\treturn out",
+        "\treturn out, nil",
         "}",
         "",
         "// _doHTTP is a single HTTP attempt, no retry/CB — those are wrapped by callService.",
@@ -4267,6 +4353,8 @@ def generate_error_model_go(custom_errors: dict = None) -> list[str]:
         ("ErrInvalidBody", "schema, detail string", 'INVALID_BODY', 'Message: fmt.Sprintf("body does not match schema %s: %s", schema, detail)'),
         ("ErrInvalidParam", "name, expected string", 'INVALID_PARAM', 'Field: name, Message: fmt.Sprintf("parameter %s must be %s", name, expected)'),
         ("ErrInternal", "detail string", 'INTERNAL', 'Message: fmt.Sprintf("internal error: %s", detail)'),
+        ("ErrTimeout", "service string", 'TIMEOUT', 'Message: fmt.Sprintf("service %s timed out", service)'),
+        ("ErrUnavailable", "service string", 'UNAVAILABLE', 'Message: fmt.Sprintf("service %s is unavailable", service)'),
     ]
 
     for fname, params, etype, init in constructors:
@@ -4629,12 +4717,32 @@ def compile_instruction_go(inst: dict, indent: int, ctx: dict = None) -> list[st
         if ctx.get('in_event_handler'):
             ctx_expr = 'ctx'
             urls_expr = f'_serviceURLs["{service}"]'
+            # Event handlers don't have an http.ResponseWriter to respond with,
+            # so we discard the call-error and leave downstream nil-check to fire.
+            lines.append(
+                f'{pad}{assign}, _ := callService({ctx_expr}, "{service}", {urls_expr}, "{method}", {path_expr}, {body_expr}, {idempotent})'
+            )
+        elif ctx.get('_in_parallel_fiber'):
+            # Inside a PARALLEL fiber we can't touch the outer ResponseWriter
+            # (racy) nor bail the handler with `return` (only exits the goroutine).
+            # Graceful degradation patterns in these handlers already branch
+            # on nil — so discard the error and let the existing nil-check
+            # handle it.
+            ctx_expr = 'r.Context()'
+            urls_expr = f'rt.serviceURLs["{service}"]'
+            lines.append(
+                f'{pad}{assign}, _ := callService({ctx_expr}, "{service}", {urls_expr}, "{method}", {path_expr}, {body_expr}, {idempotent})'
+            )
         else:
             ctx_expr = 'r.Context()'
             urls_expr = f'rt.serviceURLs["{service}"]'
-        lines.append(
-            f'{pad}{assign} := callService({ctx_expr}, "{service}", {urls_expr}, "{method}", {path_expr}, {body_expr}, {idempotent})'
-        )
+            lines.append(
+                f'{pad}{assign}, _callErr := callService({ctx_expr}, "{service}", {urls_expr}, "{method}", {path_expr}, {body_expr}, {idempotent})'
+            )
+            # Short-circuit when callService returned a typed transport error
+            # (TIMEOUT/UNAVAILABLE). Generic failures come back as (nil, nil)
+            # and are handled by the downstream `if assign == nil` check.
+            lines.append(f'{pad}if _callErr != nil {{ respondError(w, _callErr); return }}')
         # callService returns `any` — objects decode as map[string]any, arrays as
         # []any. Register as 'any_json' so downstream knows to assert per context.
         ctx.setdefault('locals', {})[assign] = 'any_json'
@@ -4794,13 +4902,9 @@ def compile_instruction_go(inst: dict, indent: int, ctx: dict = None) -> list[st
         fields = inst.get('fields', {})
         assign = inst['assign']
         if schema == 'object':
-            known = (ctx.get('locals') or {})
             parts = []
             for k, v in fields.items():
-                val = _go_expr(v, ctx)
-                if isinstance(v, str) and v not in known and not v.startswith('"') and '.' not in v:
-                    try: float(v)
-                    except ValueError: val = f'"{v}"'
+                val = _go_construct_object_value(v, ctx)
                 parts.append(f'"{k}": {val}')
             body = ", ".join(parts)
             locals_dict = ctx.setdefault('locals', {})
@@ -4844,13 +4948,13 @@ def compile_instruction_go(inst: dict, indent: int, ctx: dict = None) -> list[st
             lines.append(f'{pad}{assign} := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")')
             locals_dict[assign] = 'string'
         elif from_ == 'clock' and field == 'now':
-            lines.append(f"{pad}{assign} := time.Now().UTC()")
+            lines.append(f"{pad}{assign} := _clock.Now()")
             locals_dict[assign] = 'timestamp'
         elif from_ == 'clock' and field == 'today':
-            lines.append(f"{pad}{assign} := time.Now().UTC().Truncate(24 * time.Hour)")
+            lines.append(f"{pad}{assign} := _clock.Today()")
             locals_dict[assign] = 'timestamp'
         elif from_ == 'clock' and field == 'day_of_week':
-            lines.append(f"{pad}{assign} := time.Now().UTC().Weekday()")
+            lines.append(f"{pad}{assign} := _clock.DayOfWeek()")
             # Track the Weekday pseudo-type so BRANCH on bare `tuesday` etc.
             # resolves to `time.Tuesday` via _maybe_quote below.
             locals_dict[assign] = 'day_of_week'
@@ -4937,6 +5041,48 @@ def _go_expr(v, ctx: dict = None, hint: str = None) -> str:
         if hint == 'object' and known_type == 'any_json':
             return f'{base}.(map[string]any)'
     return base
+
+
+def _go_construct_object_value(v, ctx: dict) -> str:
+    """Render a CONSTRUCT-object field value as a Go expression.
+
+    Mirrors `_cs_construct_object_value` — scalars/identifiers pass through
+    `_go_expr` with string-atom quoting; a list-of-pairs whose first pair is
+    `['op', 'TERNARY']` or `['op', 'IS_OK']` is expanded inline so nested
+    ternary/is_ok checks don't fall through to the TODO bailout.
+    """
+    known = (ctx.get('locals') or {})
+    if isinstance(v, list) and v and all(isinstance(p, list) and len(p) >= 2 for p in v):
+        op_dict = {}
+        for pair in v:
+            key = str(pair[0])
+            op_dict[key] = pair[1] if len(pair) == 2 else pair[1:]
+        if op_dict.get('op') == 'TERNARY':
+            cond_expr = _go_construct_object_value(op_dict.get('condition'), ctx)
+            then_expr = _go_construct_object_value(op_dict.get('true'), ctx)
+            else_expr = _go_construct_object_value(op_dict.get('false'), ctx)
+            # Go has no ternary — map to an immediately-invoked func literal
+            # returning `any` so the enclosing map[string]any literal accepts it.
+            return f'func() any {{ if {cond_expr} {{ return {then_expr} }}; return {else_expr} }}()'
+        if op_dict.get('op') == 'IS_OK':
+            left = op_dict.get('left') or op_dict.get('value')
+            left_expr = _go_construct_object_value(left, ctx)
+            return f'({left_expr} != nil)'
+        # Plain nested object → map[string]any literal.
+        parts = []
+        for pair in v:
+            k = str(pair[0])
+            inner_val = pair[1] if len(pair) == 2 else pair[1:]
+            parts.append(f'"{k}": {_go_construct_object_value(inner_val, ctx)}')
+        return 'map[string]any{' + ', '.join(parts) + '}'
+    val = _go_expr(v, ctx)
+    if isinstance(v, str) and v not in known and not v.startswith('"') and '.' not in v:
+        try:
+            float(v)
+        except ValueError:
+            if v.lower() not in ('true', 'false', 'null', 'nil'):
+                val = f'"{v}"'
+    return val
 
 
 def _go_value(v, ctx: dict = None) -> str:
@@ -5187,6 +5333,10 @@ def _compile_parallel_go(inst: dict, indent: int, ctx: dict) -> list[str]:
         lines.append(f"{pad}\tdefer _wg_{assign}.Done()")
         inner_ctx = dict(ctx)
         inner_ctx['locals'] = dict(ctx.get('locals', {}))
+        # Flag used by CALL_SERVICE emission so it doesn't try to touch the
+        # outer ResponseWriter or bail the enclosing handler from inside a
+        # goroutine — leaves the nil result for AWAIT_ALL to fall through.
+        inner_ctx['_in_parallel_fiber'] = True
         for f_inst in fiber.get('instructions', []):
             lines.extend(compile_instruction_go(f_inst, indent + 1, inner_ctx))
         if result_var:
@@ -5406,11 +5556,15 @@ def compile_match_go(inst: dict, indent: int, ctx: dict = None) -> list[str]:
         #   - If value is any_json / map / JsonNode (typical CALL_SERVICE result),
         #     ERR means the call failed → the value is nil. Emit a nil-check with
         #     both branches, same shape as OK+NONE.
+        #   - PARALLEL fiber results (parallel_results.fetch_X) also land here:
+        #     the struct field holds `any`, nil when the fiber's CALL_SERVICE
+        #     returned nil. Treat as nullable.
         #   - If value is a typed struct (READ_BODY result), decode errors were
         #     already handled by READ_BODY, so ERR is dead code — emit OK inline.
         raw_root = raw_value.split('.')[0] if isinstance(raw_value, str) else None
         root_type = (ctx.get('locals') or {}).get(raw_root) if raw_root else None
-        is_nullable_value = root_type in ('any_json', 'map', 'JsonNode')
+        is_parallel_field = isinstance(raw_value, str) and '.' in raw_value and root_type == 'ParallelResults'
+        is_nullable_value = root_type in ('any_json', 'map', 'JsonNode') or is_parallel_field
         if is_nullable_value:
             err_lines = []
             for sub in cases['ERR']:
@@ -5745,6 +5899,91 @@ def _cs_seed_object(pairs: list, schema_name: str, schemas: dict) -> str:
     return f'new {schema_name} {{ {", ".join(parts)} }}'
 
 
+def _go_seed_value(raw, field_type: str, schemas: dict) -> str:
+    """Render a seed_data value as a Go literal, keyed off the schema field type.
+
+    Mirrors `_cs_seed_value` but emits Go syntax. UUIDs and timestamps
+    are strings in Go (no Guid type — uuid.UUID is aliased to string in
+    the generated stores).
+    """
+    if field_type == 'uuid':
+        s = str(raw).strip('"')
+        return f'"{s}"'
+    if field_type == 'timestamp':
+        s = str(raw).strip('"')
+        return f'_mustParseTime("{s}")'
+    if field_type == 'bool':
+        v = str(raw).lower()
+        return 'true' if v == 'true' else 'false'
+    if field_type == 'int':
+        return str(raw)
+    if field_type == 'decimal':
+        return str(raw)
+    if field_type in ('string', 'enum'):
+        s = str(raw).strip('"').replace('\\', '\\\\').replace('"', '\\"')
+        return f'"{s}"'
+    return f'"{raw}"'
+
+
+def _go_seed_object(pairs: list, schema_name: str, schemas: dict) -> str:
+    """Render a Go composite literal for an entity from a list of (key val…) pairs."""
+    schema_def = schemas.get(schema_name, {})
+    fields = schema_def.get('fields', {})
+    parts = []
+    for pair in pairs:
+        if not (isinstance(pair, list) and len(pair) >= 2):
+            continue
+        key = str(pair[0])
+        fdef = fields.get(key, {})
+        ftype = fdef.get('type')
+        prop = pascal_case(key)
+        if ftype == 'list':
+            elem_schema = fdef.get('of') or 'object'
+            item_forms = [p for p in pair[1:] if isinstance(p, list) and p and p[0] == 'item']
+            if item_forms:
+                inner = ", ".join(_go_seed_object(p[1:], elem_schema, schemas) for p in item_forms)
+                parts.append(f'{prop}: []{elem_schema}{{{inner}}}')
+            else:
+                scalars = [p for p in pair[1:] if not isinstance(p, list)]
+                elem_go = ailang_type_to_go(elem_schema) if elem_schema in ('string', 'int', 'decimal', 'bool', 'uuid') else elem_schema
+                if scalars:
+                    vals = ", ".join(_go_seed_value(s, elem_schema, schemas) for s in scalars)
+                    parts.append(f'{prop}: []{elem_go}{{{vals}}}')
+                else:
+                    parts.append(f'{prop}: []{elem_go}{{}}')
+            continue
+        raw = pair[1]
+        parts.append(f'{prop}: {_go_seed_value(raw, ftype, schemas)}')
+    return f'{schema_name}{{{", ".join(parts)}}}'
+
+
+def _emit_seed_data_go(seed_op: list, stores: dict, schemas: dict, pad: str) -> list[str]:
+    """Emit Go seeding block for one `(seed_data …)` op.
+
+    Reaches the in-memory store via the `_stores` package-level map populated
+    by `buildHandler()`, then calls `Seed([]Schema{…})`. Multiple stores in a
+    single seed_op are wired sequentially.
+    """
+    lines = []
+    if len(seed_op) < 2:
+        return lines
+    for store_ref in seed_op[1:]:
+        if not (isinstance(store_ref, list) and store_ref):
+            continue
+        store_name = str(store_ref[0])
+        store_def = stores.get(store_name)
+        if not store_def:
+            continue
+        schema = store_def['schema']
+        items = [p for p in store_ref[1:] if isinstance(p, list) and p and p[0] == 'item']
+        if not items:
+            continue
+        entities = [_go_seed_object(it[1:], schema, schemas) for it in items]
+        inner = ", ".join(entities)
+        lines.append(f'{pad}_stores["{schema}"].(*{schema}Store).Seed([]{schema}{{{inner}}})')
+    return lines
+
+
 def _emit_seed_data_csharp(seed_op: list, stores: dict, schemas: dict, pad: str, factory_var: str) -> list[str]:
     """Emit a seeding block for one `(seed_data …)` op.
 
@@ -5820,6 +6059,29 @@ def _interpolate_path_csharp(path: str, captures: set) -> str:
     if used:
         return '$"' + new_path + '"'
     return '"' + new_path + '"'
+
+
+def _go_walk_body(segs: list[str]) -> tuple[str, str]:
+    """Walk a split body path (e.g. ['items', 'length']) into Go expressions.
+
+    Mirrors `_cs_json_walk` but adapted to Go's `map[string]any` + `[]any`
+    decoding from `encoding/json`. A segment like `discounts_applied[0]`
+    becomes `(_body["discounts_applied"].([]any)[0].(map[string]any))`.
+
+    Returns (walk_expr_to_parent_map, last_segment_key) so callers can do
+    `{walk}["{last}"]` uniformly.
+    """
+    import re
+    walk = '_body'
+    for s in segs[:-1]:
+        m = re.match(r'^([^\[]+)\[(\d+)\]$', s)
+        if m:
+            name, idx = m.group(1), m.group(2)
+            walk = f'({walk}["{name}"].([]any)[{idx}].(map[string]any))'
+        else:
+            walk = f'({walk}["{s}"].(map[string]any))'
+    last = segs[-1]
+    return walk, last
 
 
 def _interpolate_path_go(path: str, captures: set):
@@ -6108,17 +6370,11 @@ def _compile_test_step_body_go(step: list, captures: set, pad: str) -> list[str]
                 if not segs:
                     lines.append(f'{pad}if !(len(_bodyArr) {cmp_op} {val}) {{ t.Errorf("{target} = %d, want {cmp_op} {val}", len(_bodyArr)) }}')
                 else:
-                    walk = '_body'
-                    for s in segs[:-1]:
-                        walk = f'({walk}["{s}"].(map[string]any))'
-                    last = segs[-1]
+                    walk, last = _go_walk_body(segs)
                     lines.append(f'{pad}if _arr, _ := {walk}["{last}"].([]any); !(len(_arr) {cmp_op} {val}) {{ t.Errorf("{target} = %d, want {cmp_op} {val}", len(_arr)) }}')
             else:
                 segs = _split_json_path(target)
-                walk = '_body'
-                for s in segs[:-1]:
-                    walk = f'({walk}["{s}"].(map[string]any))'
-                last = segs[-1]
+                walk, last = _go_walk_body(segs)
                 expected = op[2] if len(op) > 2 else None
                 expected_str = str(expected).strip('"').lower() if expected is not None else ''
                 if str(expected) == 'exists':
@@ -6135,10 +6391,7 @@ def _compile_test_step_body_go(step: list, captures: set, pad: str) -> list[str]
             target = str(op[1])
             var = str(op[-1])
             segs = _split_json_path(target)
-            walk = '_body'
-            for s in segs[:-1]:
-                walk = f'({walk}["{s}"].(map[string]any))'
-            last = segs[-1]
+            walk, last = _go_walk_body(segs)
             # Assign to the hoisted outer variable (type already declared as string).
             lines.append(f'{pad}if _v, _ok := {walk}["{last}"].(string); _ok {{ {var} = _v }}')
     return lines
@@ -6398,6 +6651,24 @@ def generate_go_tests(bc, output_dir: str):
         print("  ⤷ skipping Go httptest (PostgreSQL store — post-MVP)")
         return
 
+    # Pre-scan: do any tests actually use delay_ms / override_time / force_circuit_state / seed_data?
+    # Used to gate helpers and imports so services that don't need them don't grow
+    # unused-symbol errors.
+    any_delay_ms = False
+    any_override_time = False
+    any_force_cb = False
+    any_seed_data = False
+    for test in bc.tests:
+        for ep_list in (test.get('mock_services') or {}).values():
+            for ep in ep_list:
+                if (ep.get('delay_ms') or 0) > 0:
+                    any_delay_ms = True
+        for op in (test.get('setup_ops') or []):
+            if isinstance(op, list) and op:
+                if op[0] == 'override_time': any_override_time = True
+                elif op[0] == 'force_circuit_state': any_force_cb = True
+                elif op[0] == 'seed_data': any_seed_data = True
+
     lines = []
     lines.append("// ═══════════════════════════════════════════════════════════════")
     lines.append(f"// AILang Transpiler Output — Go httptest for {bc.service['name']}")
@@ -6413,6 +6684,7 @@ def generate_go_tests(bc, output_dir: str):
     lines.append('\t"net/http/httptest"')
     lines.append('\t"strings"')
     lines.append('\t"testing"')
+    lines.append('\t"time"')
     lines.append(")")
     lines.append("")
     lines.append("// newTestServer spins a fresh service graph per test — full isolation.")
@@ -6424,17 +6696,33 @@ def generate_go_tests(bc, output_dir: str):
     lines.append("\treturn ts")
     lines.append("}")
     lines.append("")
+    # Test helpers — only emitted when at least one test uses them, so services
+    # with trivial test suites don't drag in unused symbols.
+    if any_seed_data or any_override_time:
+        lines.append("// _mustParseTime — parse ISO-8601 timestamps in seed_data / override_time blocks.")
+        lines.append("// Any parse error panics so the test fails loudly rather than silently zeroing.")
+        lines.append("func _mustParseTime(s string) time.Time {")
+        lines.append("\tt, err := time.Parse(time.RFC3339, s)")
+        lines.append('\tif err != nil { panic("invalid timestamp literal: " + s + " — " + err.Error()) }')
+        lines.append("\treturn t")
+        lines.append("}")
+        lines.append("")
+    if any_override_time:
+        lines.append("func _ptrWeekday(w time.Weekday) *time.Weekday { return &w }")
+        lines.append("")
     # silence-unused to keep imports in single-test edge cases
     lines.append("var _ = strings.HasPrefix")
     lines.append("var _ = fmt.Sprintf")
     lines.append("var _ io.Reader = nil")
     lines.append("var _ = json.Unmarshal")
+    lines.append("var _ = time.Second")
     lines.append("")
 
     for test in bc.tests:
         ident = 'Test' + pascal_case(_test_name_to_ident(test['name']))
         run_ops = test.get('run') or []
         mocks = test.get('mock_services') or {}
+        setup_ops = test.get('setup_ops') or []
         captures: set = set()
         lines.append(f"func {ident}(t *testing.T) {{")
         # Mocks must be started and env vars set BEFORE newTestServer — buildHandler
@@ -6446,7 +6734,13 @@ def generate_go_tests(bc, output_dir: str):
             lines.append('\t\tw.Header().Set("Content-Type", "application/json")')
             for ep in endpoints:
                 json_body = _mock_body_to_json(ep.get('body'))
+                delay = ep.get('delay_ms') or 0
                 lines.append(f'\t\tif r.Method == "{ep["method"]}" && r.URL.Path == "{ep["path"]}" {{')
+                if delay > 0:
+                    # Sleep inside the mock goroutine; the client's per-attempt
+                    # ctx.WithTimeout cancels the request first, surfacing as
+                    # context.DeadlineExceeded in callService.
+                    lines.append(f'\t\t\ttime.Sleep({delay} * time.Millisecond)')
                 lines.append(f'\t\t\tw.WriteHeader({ep["status"]})')
                 lines.append(f'\t\t\tw.Write([]byte(`{json_body}`))')
                 lines.append('\t\t\treturn')
@@ -6456,6 +6750,47 @@ def generate_go_tests(bc, output_dir: str):
             lines.append(f"\tdefer {mock_var}.Close()")
             lines.append(f'\tt.Setenv("{env_var}", {mock_var}.URL)')
         lines.append("\tts := newTestServer(t)")
+        lines.append("\t_ = ts")
+        # ── setup_ops — wire AFTER buildHandler since buildHandler() resets
+        # the test-seam state on every call. ──
+        for setup_op in setup_ops:
+            if not (isinstance(setup_op, list) and setup_op):
+                continue
+            op_name = setup_op[0]
+            if op_name == 'seed_data':
+                lines.extend(_emit_seed_data_go(setup_op, bc.stores, bc.schemas, pad='\t'))
+            elif op_name == 'override_time':
+                # `(override_time (now ISO) (day_of_week tuesday))` — wire a FakeClock
+                # from the declared overrides. Unset fields fall through to SystemClock.
+                fake_parts = []
+                for spec in setup_op[1:]:
+                    if not (isinstance(spec, list) and len(spec) >= 2):
+                        continue
+                    key = str(spec[0])
+                    val = spec[1]
+                    if key == 'day_of_week':
+                        wk_map = {
+                            'sunday': 'time.Sunday', 'monday': 'time.Monday',
+                            'tuesday': 'time.Tuesday', 'wednesday': 'time.Wednesday',
+                            'thursday': 'time.Thursday', 'friday': 'time.Friday',
+                            'saturday': 'time.Saturday',
+                        }
+                        go_wk = wk_map.get(str(val).lower(), 'time.Monday')
+                        fake_parts.append(f'FixedDayOfWeek: _ptrWeekday({go_wk})')
+                    elif key == 'now':
+                        iso = str(val).strip('"')
+                        fake_parts.append(f'FixedNow: _mustParseTime("{iso}")')
+                init = ", ".join(fake_parts)
+                lines.append(f"\t_clock = FakeClock{{{init}}}")
+            elif op_name == 'force_circuit_state':
+                # `(force_circuit_state (<policy_name> OPEN))` — short-circuits
+                # callService via the package-level _forcedCircuitStates map.
+                for spec in setup_op[1:]:
+                    if not (isinstance(spec, list) and len(spec) >= 2):
+                        continue
+                    policy_name = str(spec[0])
+                    state = str(spec[1]).upper()
+                    lines.append(f'\t_forcedCircuitStates["{policy_name}"] = "{state}"')
         lines.extend(_compile_test_run_go(run_ops, captures, indent=1))
         lines.append("}")
         lines.append("")
