@@ -215,6 +215,35 @@ def where_to_sql(expr) -> str:
     return str(expr)
 
 
+def generate_postgres_ddl(store_def: dict) -> str:
+    """Build a CREATE TABLE IF NOT EXISTS statement from a PG store mapping.
+
+    Column definition per entry: `"col" TYPE [NOT NULL] [UNIQUE] [DEFAULT expr]`.
+    The `id` field (by convention) becomes the PRIMARY KEY — matches how
+    FindAsync/UpdateAsync/DeleteAsync key off `id` in the generated store.
+    """
+    table = store_def.get('table') or 'items'
+    mapping = list(store_def.get('mapping', {}).items())
+    if not mapping:
+        return f"-- WARN: no mapping for table {table}"
+    cols = []
+    pk_field = None
+    for field, m in mapping:
+        parts = [f'"{m["column"]}" {m["sql_type"]}']
+        if m.get('not_null'):
+            parts.append("NOT NULL")
+        if m.get('unique'):
+            parts.append("UNIQUE")
+        if m.get('default') is not None:
+            parts.append(f"DEFAULT {m['default']}")
+        cols.append("  " + " ".join(parts))
+        if field == 'id':
+            pk_field = m['column']
+    if pk_field:
+        cols.append(f'  PRIMARY KEY ("{pk_field}")')
+    return f"CREATE TABLE IF NOT EXISTS \"{table}\" (\n" + ",\n".join(cols) + "\n);"
+
+
 def emit_sql_literal_csharp(sql: str, indent_level: int = 1) -> str:
     """Emit a SQL literal as a C# raw string (\"\"\"...\"\"\") for multi-line SQL,
     or a plain string literal for short single-line SQL.
@@ -3245,8 +3274,12 @@ def generate_go(bc, output_dir: str):
     lines.append("}")
     lines.append("")
     lines.append("var _clock AiLangClock = SystemClock{}")
-    lines.append("// _stores exposes in-memory stores by schema name so tests can Seed() without DI.")
+    lines.append("// _stores exposes in-memory stores (or the PG store wrapper) by schema name")
+    lines.append("// so tests can Seed()/reach the datasource without DI.")
     lines.append("var _stores = map[string]any{}")
+    if is_pg:
+        lines.append("// _pgPool — shared pgx pool, lazy-init in buildHandler() on first call.")
+        lines.append("var _pgPool *pgxpool.Pool")
     if (bc.resilience or {}).get('policies'):
         lines.append("// _forcedCircuitStates[policy] = \"OPEN\" bypasses the real CB in callService —")
         lines.append("// used by (force_circuit_state (policy_name OPEN)) in test setups.")
@@ -3448,7 +3481,24 @@ def generate_go(bc, output_dir: str):
     if (bc.resilience or {}).get('policies'):
         lines.append("\t_forcedCircuitStates = map[string]string{}")
     lines.append("\t_stores = map[string]any{}")
-    if not is_pg:
+    if is_pg:
+        # Lazy-init the package-level pool from DB_CONNECTION_STRING. Shared
+        # across buildHandler() invocations so tests can re-call buildHandler
+        # without exhausting connections; main() leaks it (process exit).
+        lines.append(f'\tif _pgPool == nil {{')
+        lines.append(f'\t\tconnStr := os.Getenv("{db_conn_env}")')
+        lines.append('\t\tif connStr == "" {')
+        lines.append('\t\t\tconnStr = "postgres://postgres:postgres@localhost:5432/ailang"')
+        lines.append("\t\t}")
+        lines.append("\t\tpool, err := pgxpool.New(context.Background(), connStr)")
+        lines.append('\t\tif err != nil { log.Fatalf("pgx pool: %v", err) }')
+        lines.append("\t\t_pgPool = pool")
+        lines.append("\t}")
+        for store_name, store_def in bc.stores.items():
+            schema = store_def['schema']
+            lines.append(f"\tvar store I{schema}Store = NewPostgres{schema}Store(_pgPool)")
+            lines.append(f'\t_stores["{schema}"] = store  // test seam — PG tests reach the store for helpers')
+    else:
         for store_name, store_def in bc.stores.items():
             schema = store_def['schema']
             lines.append(f"\tstore := New{schema}Store()")
@@ -3469,7 +3519,7 @@ def generate_go(bc, output_dir: str):
             fn_name = pascal_case(h_name) if h_name.startswith('on_') else 'On' + pascal_case(h_name)
             lines.append(f'\tbus.Subscribe("{evt}", {fn_name})')
     router_fields = []
-    if bc.stores and not is_pg:
+    if bc.stores:
         router_fields.append("store: store")
     if uses_call_service_anywhere:
         router_fields.append("serviceURLs: serviceURLs")
@@ -3480,48 +3530,11 @@ def generate_go(bc, output_dir: str):
     lines.append("}")
     lines.append("")
 
-    # Main
+    # Main — always delegates to buildHandler() so PG and in-memory paths stay
+    # in sync with tests.
     lines.append("func main() {")
     lines.append(f'\t// JWT env var: {jwt_env}')
-    if is_pg:
-        lines.append(f'\tconnStr := os.Getenv("{db_conn_env}")')
-        lines.append('\tif connStr == "" {')
-        lines.append('\t\tconnStr = "postgres://postgres:postgres@localhost:5432/ailang"')
-        lines.append("\t}")
-        lines.append("\tctx := context.Background()")
-        lines.append("\tpool, err := pgxpool.New(ctx, connStr)")
-        lines.append('\tif err != nil { log.Fatalf("pgx pool: %v", err) }')
-        lines.append("\tdefer pool.Close()")
-        for store_name, store_def in bc.stores.items():
-            schema = store_def['schema']
-            lines.append(f"\tvar store I{schema}Store = NewPostgres{schema}Store(pool)")
-        # PG path keeps the old inline wiring — buildHandler() is in-memory only.
-        if uses_call_service_anywhere:
-            lines.append("\tserviceURLs := map[string]string{")
-            for svc_name, svc_def in service_refs_go.items():
-                env_var = svc_def.get('base_url_ref', '').replace('ENV.', '') or 'UNSET'
-                default_url = svc_def.get('default', 'http://localhost')
-                lines.append(f'\t\t"{svc_name}": func() string {{ if v := os.Getenv("{env_var}"); v != "" {{ return v }}; return "{default_url}" }}(),')
-            lines.append("\t}")
-            lines.append("\t_serviceURLs = serviceURLs")
-        if uses_events_go:
-            lines.append("\tbus := NewEventBus()")
-            lines.append("\t_bus = bus")
-            for h_name, h_def in event_handlers_go:
-                evt = h_def.get('event') or h_name
-                fn_name = pascal_case(h_name) if h_name.startswith('on_') else 'On' + pascal_case(h_name)
-                lines.append(f'\tbus.Subscribe("{evt}", {fn_name})')
-        router_fields = []
-        if bc.stores:
-            router_fields.append("store: store")
-        if uses_call_service_anywhere:
-            router_fields.append("serviceURLs: serviceURLs")
-        if uses_events_go:
-            router_fields.append("bus: bus")
-        lines.append(f"\trouter := &Router{{{', '.join(router_fields)}}}")
-        lines.append("\thandler := corsMiddleware(tracingMiddleware(router.mux()))")
-    else:
-        lines.append("\thandler := buildHandler()")
+    lines.append("\thandler := buildHandler()")
     lines.append("")
     lines.append(f'\tfmt.Println("[SERVICE] {service_name} STARTED on :{port}")')
     lines.append(f'\tfmt.Println("[READY]")')
@@ -3531,12 +3544,17 @@ def generate_go(bc, output_dir: str):
     with open(os.path.join(output_dir, "main.go"), 'w') as f:
         f.write('\n'.join(lines))
 
-    # go.mod — bump to 1.22 for the new ServeMux patterns; add pgx when needed
+    # go.mod — bump to 1.22 for the new ServeMux patterns; add pgx when needed.
+    # Test-only deps (testcontainers) go in the same require block — `go mod tidy`
+    # would classify them correctly; keeping them here keeps the file stable.
     requires = ['\tgithub.com/google/uuid v1.6.0']
     if is_pg:
         requires.append('\tgithub.com/jackc/pgx/v5 v5.7.5')
     if needs_resilience_go:
         requires.append('\tgithub.com/sony/gobreaker/v2 v2.0.0')
+    if is_pg and bc.tests:
+        requires.append('\tgithub.com/testcontainers/testcontainers-go v0.34.0')
+        requires.append('\tgithub.com/testcontainers/testcontainers-go/modules/postgres v0.34.0')
     go_mod = (
         f"module ailang-{service_name.replace('_', '-')}\n\n"
         f"go 1.25\n\n"
@@ -6397,6 +6415,218 @@ def _compile_test_step_body_go(step: list, captures: set, pad: str) -> list[str]
     return lines
 
 
+def generate_csharp_pg_tests(bc, main_output_dir: str, pg_stores: dict):
+    """Emit an xUnit test project backed by a Testcontainers PostgreSQL instance.
+
+    Layout:
+      - `PgFixture.cs`: ICollectionFixture starting a `postgres:16-alpine`
+        container once per test collection; runs the CREATE TABLE DDL against
+        it and hands connection info to tests. Sets `DB_CONNECTION_STRING` so
+        the service under test (Program.cs) reads the same container.
+      - `ApiTests.cs`: `[Collection("pg")]` tests that get the fixture by DI,
+        TRUNCATE before and after each test, honor `(SQL_SEED store "INSERT …")`
+        and `(RESET_STORE store)` via raw Npgsql commands.
+
+    Requires Docker at test time. Build passes without Docker; only `dotnet test`
+    actually needs the daemon.
+    """
+    service_name = bc.service['name']
+    main_proj_name = pascal_case(service_name)
+    tests_dir = os.path.join(main_output_dir, "Tests")
+    os.makedirs(tests_dir, exist_ok=True)
+
+    # Only one PG store per service is supported for now (the 4 legacy services
+    # that hit this path all use a single primary store). Mirror the Go side.
+    primary_store_name, primary_store_def = next(iter(pg_stores.items()))
+    primary_schema = primary_store_def['schema']
+    primary_table = primary_store_def.get('table') or primary_schema.lower() + 's'
+    ddl = generate_postgres_ddl(primary_store_def)
+
+    csproj = (
+        '<Project Sdk="Microsoft.NET.Sdk">\n'
+        '  <PropertyGroup>\n'
+        '    <TargetFramework>net10.0</TargetFramework>\n'
+        '    <Nullable>enable</Nullable>\n'
+        '    <ImplicitUsings>enable</ImplicitUsings>\n'
+        '    <IsPackable>false</IsPackable>\n'
+        '  </PropertyGroup>\n'
+        '  <ItemGroup>\n'
+        '    <PackageReference Include="Microsoft.AspNetCore.Mvc.Testing" Version="10.0.0" />\n'
+        '    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />\n'
+        '    <PackageReference Include="xunit" Version="2.9.2" />\n'
+        '    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />\n'
+        '    <PackageReference Include="Testcontainers.PostgreSql" Version="4.7.0" />\n'
+        '    <PackageReference Include="Npgsql" Version="10.0.0" />\n'
+        '  </ItemGroup>\n'
+        '  <ItemGroup>\n'
+        f'    <ProjectReference Include="..\\{main_proj_name}.csproj" />\n'
+        '  </ItemGroup>\n'
+        '</Project>'
+    )
+    with open(os.path.join(tests_dir, f"{main_proj_name}.Tests.csproj"), 'w') as f:
+        f.write(csproj)
+
+    # ── PgFixture.cs — Collection-scoped container ──
+    fixture = []
+    fixture.append("// ═══════════════════════════════════════════════════════════════")
+    fixture.append("// AILang Transpiler Output — Testcontainers PG fixture")
+    fixture.append("// Auto-generated — DO NOT EDIT")
+    fixture.append("// ═══════════════════════════════════════════════════════════════")
+    fixture.append("using Npgsql;")
+    fixture.append("using Testcontainers.PostgreSql;")
+    fixture.append("using Xunit;")
+    fixture.append("")
+    fixture.append("public sealed class PgFixture : IAsyncLifetime")
+    fixture.append("{")
+    fixture.append("    // postgres:16-alpine keeps pulls small and matches production Alpine images.")
+    fixture.append("    private readonly PostgreSqlContainer _container = new PostgreSqlBuilder()")
+    fixture.append('        .WithImage("postgres:16-alpine")')
+    fixture.append('        .WithDatabase("ailang_test")')
+    fixture.append('        .WithUsername("postgres")')
+    fixture.append('        .WithPassword("postgres")')
+    fixture.append("        .Build();")
+    fixture.append("")
+    fixture.append("    public string ConnectionString => _container.GetConnectionString();")
+    fixture.append("")
+    fixture.append(f'    private const string Ddl = @"{ddl.replace(chr(34), chr(34)*2)}";')
+    fixture.append("")
+    fixture.append("    public async Task InitializeAsync()")
+    fixture.append("    {")
+    fixture.append("        await _container.StartAsync();")
+    fixture.append('        // Program.cs reads DB_CONNECTION_STRING at WebApplicationFactory bootstrap;')
+    fixture.append('        // setting it here (before any test builds a factory) routes every')
+    fixture.append('        // Npgsql call at the shared container.')
+    fixture.append(f'        Environment.SetEnvironmentVariable("DB_CONNECTION_STRING", ConnectionString);')
+    fixture.append("        await using var conn = new NpgsqlConnection(ConnectionString);")
+    fixture.append("        await conn.OpenAsync();")
+    fixture.append("        await using var cmd = new NpgsqlCommand(Ddl, conn);")
+    fixture.append("        await cmd.ExecuteNonQueryAsync();")
+    fixture.append("    }")
+    fixture.append("")
+    fixture.append("    public async Task DisposeAsync()")
+    fixture.append("    {")
+    fixture.append("        await _container.DisposeAsync();")
+    fixture.append("    }")
+    fixture.append("")
+    fixture.append("    public async Task ExecAsync(string sql)")
+    fixture.append("    {")
+    fixture.append("        await using var conn = new NpgsqlConnection(ConnectionString);")
+    fixture.append("        await conn.OpenAsync();")
+    fixture.append("        await using var cmd = new NpgsqlCommand(sql, conn);")
+    fixture.append("        await cmd.ExecuteNonQueryAsync();")
+    fixture.append("    }")
+    fixture.append("}")
+    fixture.append("")
+    fixture.append('[CollectionDefinition("pg")]')
+    fixture.append("public class PgCollection : ICollectionFixture<PgFixture> { }")
+    with open(os.path.join(tests_dir, "PgFixture.cs"), 'w') as f:
+        f.write("\n".join(fixture))
+
+    # ── ApiTests.cs ──
+    lines = []
+    lines.append("// ═══════════════════════════════════════════════════════════════")
+    lines.append(f"// AILang Transpiler Output — xUnit Tests (PG) for {service_name}")
+    lines.append("// Auto-generated from (tests ...) section — DO NOT EDIT")
+    lines.append("// ═══════════════════════════════════════════════════════════════")
+    lines.append("using System.IdentityModel.Tokens.Jwt;")
+    lines.append("using System.Net.Http;")
+    lines.append("using System.Net.Http.Headers;")
+    lines.append("using System.Security.Claims;")
+    lines.append("using System.Text;")
+    lines.append("using System.Text.Json;")
+    lines.append("using Microsoft.AspNetCore.Mvc.Testing;")
+    lines.append("using Microsoft.IdentityModel.Tokens;")
+    lines.append("using Xunit;")
+    lines.append("")
+    lines.append('[Collection("pg")]')
+    lines.append("public class ApiTests : IAsyncLifetime")
+    lines.append("{")
+    lines.append("    private readonly PgFixture _pg;")
+    lines.append("    private readonly WebApplicationFactory<Program> _factory;")
+    lines.append("    private readonly HttpClient _client;")
+    lines.append("")
+    lines.append("    public ApiTests(PgFixture pg)")
+    lines.append("    {")
+    lines.append("        _pg = pg;")
+    lines.append("        _factory = new WebApplicationFactory<Program>();")
+    lines.append("        _client = _factory.CreateClient();")
+    lines.append("    }")
+    lines.append("")
+    lines.append("    public Task InitializeAsync() => Task.CompletedTask;")
+    lines.append("    public async Task DisposeAsync()")
+    lines.append("    {")
+    lines.append("        _client.Dispose();")
+    lines.append("        await _factory.DisposeAsync();")
+    lines.append("    }")
+    lines.append("")
+    lines.append("    private static string TestToken()")
+    lines.append("    {")
+    lines.append('        var secret = Environment.GetEnvironmentVariable("JWT_SECRET") ?? "dev-secret-key-min-32-characters!!";')
+    lines.append("        var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(secret));")
+    lines.append("        var creds = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);")
+    lines.append("        var token = new JwtSecurityToken(")
+    lines.append('            claims: new[] { new Claim("sub", "test-user") },')
+    lines.append("            signingCredentials: creds);")
+    lines.append("        return new JwtSecurityTokenHandler().WriteToken(token);")
+    lines.append("    }")
+    lines.append("")
+
+    for test in bc.tests:
+        ident = _test_name_to_ident(test['name'])
+        run_ops = test.get('run') or []
+        setup_ops = test.get('setup_ops') or []
+        clean_ops = test.get('clean') or []
+        captures: set = set()
+        lines.append("    [Fact]")
+        lines.append(f"    public async Task {ident}()")
+        lines.append("    {")
+        # Setup ops — RESET_STORE / SQL_SEED translate to raw SQL against the fixture.
+        # Multi-line SQL from the bytecode (INSERT INTO … VALUES …) requires C#
+        # verbatim strings so embedded newlines stay legal.
+        for op in setup_ops:
+            if not (isinstance(op, list) and op):
+                continue
+            head = str(op[0]).upper()
+            if head == 'RESET_STORE':
+                lines.append(f'        await _pg.ExecAsync(@"TRUNCATE TABLE ""{primary_table}"" CASCADE");')
+            elif head == 'SQL_SEED':
+                raw_sql = str(op[2]) if len(op) > 2 else ''
+                safe = raw_sql.replace('"', '""')
+                lines.append(f'        await _pg.ExecAsync(@"{safe}");')
+        lines.append("        try")
+        lines.append("        {")
+        lines.extend(_compile_test_run_csharp(run_ops, captures, indent=3))
+        lines.append("        }")
+        lines.append("        finally")
+        lines.append("        {")
+        # Clean ops — same translation as setup but in the finally.
+        for op in clean_ops:
+            if isinstance(op, str):
+                # Legacy string form (e.g. "RESET_STORE(product_store)") — normalize.
+                if op.strip().upper().startswith('RESET_STORE'):
+                    lines.append(f'            await _pg.ExecAsync(@"TRUNCATE TABLE ""{primary_table}"" CASCADE");')
+                continue
+            if not (isinstance(op, list) and op):
+                continue
+            head = str(op[0]).upper()
+            if head == 'RESET_STORE':
+                lines.append(f'            await _pg.ExecAsync(@"TRUNCATE TABLE ""{primary_table}"" CASCADE");')
+            elif head == 'SQL_SEED':
+                raw_sql = str(op[2]) if len(op) > 2 else ''
+                safe = raw_sql.replace('"', '""')
+                lines.append(f'            await _pg.ExecAsync(@"{safe}");')
+        lines.append("        }")
+        lines.append("    }")
+        lines.append("")
+
+    lines.append("}")
+
+    with open(os.path.join(tests_dir, "ApiTests.cs"), 'w') as f:
+        f.write("\n".join(lines))
+
+    print(f"  ✓ C# xUnit (PG/Testcontainers) tests generated in {tests_dir}/")
+
+
 def generate_csharp_tests(bc, main_output_dir: str):
     """Emit an xUnit test project that exercises the generated C# API.
 
@@ -6405,10 +6635,10 @@ def generate_csharp_tests(bc, main_output_dir: str):
     """
     if not bc.tests:
         return
-    # Postgres-backed services need testcontainers / a live DB — out of scope here.
+    # Postgres-backed services run against a real PG provisioned via Testcontainers.
     pg_stores = {n: s for n, s in bc.stores.items() if s.get('provider') == 'PostgreSQL'}
     if pg_stores:
-        print("  ⤷ skipping xUnit test project (PostgreSQL store — post-MVP)")
+        generate_csharp_pg_tests(bc, main_output_dir, pg_stores)
         return
 
     service_name = bc.service['name']
@@ -6642,13 +6872,169 @@ def generate_csharp_tests(bc, main_output_dir: str):
     print(f"  ✓ C# xUnit tests generated in {tests_dir}/")
 
 
+def generate_go_pg_tests(bc, output_dir: str, pg_stores: dict):
+    """Emit a Go test file that boots a PostgreSQL container via testcontainers-go
+    before running the test binary.
+
+    - `TestMain` starts `postgres:16-alpine`, runs the schema DDL, sets the
+      service's `DB_CONNECTION_STRING` env var so buildHandler() points at the
+      container, then calls `m.Run()`.
+    - `_pgExec(t, sql)` and `_pgTruncate(t)` are helpers used by (setup …) and
+      (clean …) ops to TRUNCATE / run SQL_SEED between tests.
+    - Each test then uses the existing `newTestServer(t)` helper — the same one
+      in-memory tests use — so run ops don't need a different emitter.
+    """
+    primary_store_name, primary_store_def = next(iter(pg_stores.items()))
+    primary_schema = primary_store_def['schema']
+    primary_table = primary_store_def.get('table') or primary_schema.lower() + 's'
+    ddl = generate_postgres_ddl(primary_store_def)
+    # Escape backticks so the raw-string DDL constant stays a single Go literal.
+    ddl_go = ddl.replace('`', '` + "`" + `')
+
+    lines = []
+    lines.append("// ═══════════════════════════════════════════════════════════════")
+    lines.append(f"// AILang Transpiler Output — Go Testcontainers PG tests for {bc.service['name']}")
+    lines.append("// Auto-generated from (tests ...) section — DO NOT EDIT")
+    lines.append("// ═══════════════════════════════════════════════════════════════")
+    lines.append("package main")
+    lines.append("")
+    lines.append("import (")
+    lines.append('\t"context"')
+    lines.append('\t"encoding/json"')
+    lines.append('\t"fmt"')
+    lines.append('\t"io"')
+    lines.append('\t"log"')
+    lines.append('\t"net/http"')
+    lines.append('\t"net/http/httptest"')
+    lines.append('\t"os"')
+    lines.append('\t"strings"')
+    lines.append('\t"testing"')
+    lines.append("")
+    lines.append('\t"github.com/jackc/pgx/v5"')
+    lines.append('\t"github.com/testcontainers/testcontainers-go"')
+    lines.append('\t"github.com/testcontainers/testcontainers-go/modules/postgres"')
+    lines.append('\t"github.com/testcontainers/testcontainers-go/wait"')
+    lines.append(")")
+    lines.append("")
+    lines.append("var _ = strings.HasPrefix")
+    lines.append("var _ = fmt.Sprintf")
+    lines.append("var _ io.Reader = nil")
+    lines.append("var _ = json.Unmarshal")
+    lines.append("")
+    lines.append("var _pgConnStr string  // set by TestMain before m.Run()")
+    lines.append("")
+    lines.append("// DDL runs once at container start. The service's buildHandler() connects")
+    lines.append("// to the same container via DB_CONNECTION_STRING set below.")
+    lines.append(f"const _ddl = `{ddl_go}`")
+    lines.append("")
+    lines.append("func TestMain(m *testing.M) {")
+    lines.append("\tctx := context.Background()")
+    lines.append("\tcontainer, err := postgres.Run(ctx, \"postgres:16-alpine\",")
+    lines.append('\t\tpostgres.WithDatabase("ailang_test"),')
+    lines.append('\t\tpostgres.WithUsername("postgres"),')
+    lines.append('\t\tpostgres.WithPassword("postgres"),')
+    lines.append('\t\ttestcontainers.WithWaitStrategy(wait.ForLog("database system is ready to accept connections").WithOccurrence(2)),')
+    lines.append("\t)")
+    lines.append('\tif err != nil { log.Fatalf("postgres container start: %v", err) }')
+    lines.append("\tdefer func() {")
+    lines.append("\t\tif err := testcontainers.TerminateContainer(container); err != nil {")
+    lines.append('\t\t\tlog.Printf("postgres container terminate: %v", err)')
+    lines.append("\t\t}")
+    lines.append("\t}()")
+    lines.append('\t_pgConnStr, err = container.ConnectionString(ctx, "sslmode=disable")')
+    lines.append('\tif err != nil { log.Fatalf("postgres connection string: %v", err) }')
+    lines.append('\tos.Setenv("DB_CONNECTION_STRING", _pgConnStr)')
+    lines.append("")
+    lines.append("\tconn, err := pgx.Connect(ctx, _pgConnStr)")
+    lines.append('\tif err != nil { log.Fatalf("pgx connect for DDL: %v", err) }')
+    lines.append("\tif _, err := conn.Exec(ctx, _ddl); err != nil {")
+    lines.append('\t\tlog.Fatalf("pgx DDL exec: %v", err)')
+    lines.append("\t}")
+    lines.append("\tconn.Close(ctx)")
+    lines.append("")
+    lines.append("\tos.Exit(m.Run())")
+    lines.append("}")
+    lines.append("")
+    lines.append("// newTestServer wraps buildHandler() in httptest — buildHandler() connects")
+    lines.append("// to the testcontainer via DB_CONNECTION_STRING set in TestMain.")
+    lines.append("func newTestServer(t *testing.T) *httptest.Server {")
+    lines.append("\tt.Helper()")
+    lines.append("\tts := httptest.NewServer(buildHandler())")
+    lines.append("\tt.Cleanup(ts.Close)")
+    lines.append("\treturn ts")
+    lines.append("}")
+    lines.append("")
+    lines.append("// _pgExec runs a single raw SQL statement against the testcontainer.")
+    lines.append("// Used by (setup (SQL_SEED …)) and by RESET_STORE's TRUNCATE.")
+    lines.append("func _pgExec(t *testing.T, sql string) {")
+    lines.append("\tt.Helper()")
+    lines.append("\tctx := context.Background()")
+    lines.append("\tconn, err := pgx.Connect(ctx, _pgConnStr)")
+    lines.append('\tif err != nil { t.Fatalf("pgx connect: %v", err) }')
+    lines.append("\tdefer conn.Close(ctx)")
+    lines.append("\tif _, err := conn.Exec(ctx, sql); err != nil {")
+    lines.append('\t\tt.Fatalf("pgx exec %q: %v", sql, err)')
+    lines.append("\t}")
+    lines.append("}")
+    lines.append("")
+
+    for test in bc.tests:
+        ident = 'Test' + pascal_case(_test_name_to_ident(test['name']))
+        run_ops = test.get('run') or []
+        setup_ops = test.get('setup_ops') or []
+        clean_ops = test.get('clean') or []
+        captures: set = set()
+        lines.append(f"func {ident}(t *testing.T) {{")
+        # Setup (SQL_SEED, RESET_STORE) — pg variants run raw SQL.
+        for op in setup_ops:
+            if not (isinstance(op, list) and op):
+                continue
+            head = str(op[0]).upper()
+            if head == 'RESET_STORE':
+                lines.append(f'\t_pgExec(t, `TRUNCATE TABLE "{primary_table}" CASCADE`)')
+            elif head == 'SQL_SEED':
+                raw_sql = str(op[2]) if len(op) > 2 else ''
+                # Use backtick raw literal to avoid escaping the inline INSERT.
+                safe_sql = raw_sql.replace('`', '` + "`" + `')
+                lines.append(f'\t_pgExec(t, `{safe_sql}`)')
+        lines.append("\tts := newTestServer(t)")
+        lines.append("\t_ = ts")
+        lines.extend(_compile_test_run_go(run_ops, captures, indent=1))
+        # Clean ops — most tests duplicate RESET_STORE in clean; mirror that
+        # with a deferred exec so a failing REQUEST doesn't skip the cleanup.
+        cleanup_sql = []
+        for op in clean_ops:
+            if isinstance(op, str):
+                if op.strip().upper().startswith('RESET_STORE'):
+                    cleanup_sql.append(f'TRUNCATE TABLE "{primary_table}" CASCADE')
+                continue
+            if not (isinstance(op, list) and op):
+                continue
+            head = str(op[0]).upper()
+            if head == 'RESET_STORE':
+                cleanup_sql.append(f'TRUNCATE TABLE "{primary_table}" CASCADE')
+            elif head == 'SQL_SEED':
+                raw_sql = str(op[2]) if len(op) > 2 else ''
+                cleanup_sql.append(raw_sql)
+        for sql in cleanup_sql:
+            safe_sql = sql.replace('`', '` + "`" + `')
+            lines.append(f'\t_pgExec(t, `{safe_sql}`)')
+        lines.append("}")
+        lines.append("")
+
+    with open(os.path.join(output_dir, "main_test.go"), 'w') as f:
+        f.write('\n'.join(lines))
+
+    print(f"  ✓ Go Testcontainers (PG) tests generated in {output_dir}/main_test.go")
+
+
 def generate_go_tests(bc, output_dir: str):
     """Emit main_test.go using httptest.NewServer(buildHandler())."""
     if not bc.tests:
         return
     pg_stores = {n: s for n, s in bc.stores.items() if s.get('provider') == 'PostgreSQL'}
     if pg_stores:
-        print("  ⤷ skipping Go httptest (PostgreSQL store — post-MVP)")
+        generate_go_pg_tests(bc, output_dir, pg_stores)
         return
 
     # Pre-scan: do any tests actually use delay_ms / override_time / force_circuit_state / seed_data?
