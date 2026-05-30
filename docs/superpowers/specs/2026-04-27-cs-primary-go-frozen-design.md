@@ -85,7 +85,7 @@ Anchored to .NET 10 LTS (Context7 confirms 10.0.8 May 2026, EOL 2028-11-14; .NET
    - Npgsql 10.x: vendor docs document AOT support; verify by ensuring our emitted code avoids `dynamic` (it already does) and re-running the probe project.
    - ASP.NET Minimal APIs: officially AOT-ready since .NET 8; .NET 10 expands coverage.
    - xUnit: AOT support is partial (test discovery uses reflection); the AOT path is the *published binary*, not the test process. Tests can stay non-AOT.
-   - EF Core: known AOT-flaky. Not in our dependency surface (we use Npgsql/Dapper). No change.
+   - EF Core: known AOT-flaky. Not in our dependency surface (we use Npgsql). No change.
    Implementation plan owns the verification: spin up a minimal AOT probe project that imports each dependency, build with AOT warnings as errors, document failures or workarounds.
 
 3. **No reflection in emitted handler code.** Today's codegen does not use reflection at runtime (only in Python during emission). Maintain.
