@@ -2,7 +2,7 @@
 
 **Date:** 2026-04-27
 **Author:** Brainstormed with Claude (AILang project)
-**Status:** Approved by user, pending spec review
+**Status:** Approved by user; spec review passed (round 2)
 
 ---
 
@@ -69,6 +69,7 @@ Two coupled choices:
 - Default (no `--aot`) emits a classic .NET project — exactly what we emit today, untouched.
 - With `--aot`, the emitted .csproj sets `<PublishAot>true</PublishAot>` and additional codegen is required (see §4).
 - Existing services do not change. AOT is elected per regeneration, per service.
+- `--target go --aot` is rejected with a clear error message — AOT is a C#-only concept here.
 
 ## 4. NativeAOT path — codegen requirements
 
@@ -78,12 +79,14 @@ Anchored to .NET 10 LTS (Context7 confirms 10.0.8 May 2026, EOL 2028-11-14; .NET
 
 1. **JSON source generation.** `JsonSerializer.Deserialize<T>` without a generated context is not AOT-safe (relies on reflection). For each service emit one `partial class XJsonContext : JsonSerializerContext` with a `[JsonSerializable(typeof(T))]` attribute per DTO and per response type, and route all serialization through it.
 
-2. **Dependency surface verified AOT-compatible:**
-   - Polly 8.x: ✅ (no reflection on hot paths)
-   - Npgsql 10.x: ✅ partial (avoid `dynamic`; tested patterns in this codebase already comply)
-   - ASP.NET Minimal APIs: ✅
-   - xUnit: ✅ for tests
-   - EF Core: ❌ AOT-flaky — we use Npgsql/Dapper, no change needed
+2. **Dependency AOT-compatibility — to be verified during implementation, not assumed.**
+   This spec does *not* certify any vendor as AOT-clean. Vendor stances at time of writing:
+   - Polly 8.x: vendor docs claim AOT support; verify with `-warnaserror PublishTrimAnalysisWarnings;PublishAotAnalysisWarnings` on a probe project.
+   - Npgsql 10.x: vendor docs document AOT support; verify by ensuring our emitted code avoids `dynamic` (it already does) and re-running the probe project.
+   - ASP.NET Minimal APIs: officially AOT-ready since .NET 8; .NET 10 expands coverage.
+   - xUnit: AOT support is partial (test discovery uses reflection); the AOT path is the *published binary*, not the test process. Tests can stay non-AOT.
+   - EF Core: known AOT-flaky. Not in our dependency surface (we use Npgsql/Dapper). No change.
+   Implementation plan owns the verification: spin up a minimal AOT probe project that imports each dependency, build with AOT warnings as errors, document failures or workarounds.
 
 3. **No reflection in emitted handler code.** Today's codegen does not use reflection at runtime (only in Python during emission). Maintain.
 
@@ -117,7 +120,11 @@ The following edits apply atomically when this spec lands:
 - **Closed and removed**: "Runtime: ¿nativo propio? ¿LLVM? ¿BEAM?" — resolved to NativeAOT.
 - **Closed and removed**: "Modelo de memoria: ¿GC? ¿Ownership? ¿Híbrido?" — resolved to .NET server GC.
 - **Closed and removed**: "Interop: ¿FFI? ¿WASM?" — resolved to P/Invoke (built-in) for FFI; WASM via wasi-experimental if a future spec needs it.
-- **Kept open**: GUARD/VALIDATE_CHAIN instruction, hot-reload de config v2, linter con colores.
+- **Kept open (no change in this spec)**:
+  - "Transaccionalidad cross-service: ¿Sagas + dead letter queue?" — orthogonal to target choice.
+  - "GUARD/VALIDATE_CHAIN: instrucción para evitar BRANCH anidados".
+  - "Hot-reload de config (v2)".
+  - "Linter con colores para S-expressions".
 
 ### New section "Targets"
 
@@ -136,7 +143,7 @@ No changes — user profile remains accurate.
 
 After this spec lands, the immediate roadmap is:
 
-1. **NativeAOT path** (1–2 weeks): `--aot` flag, JSON source-gen codegen, AOT-warning sweep on dependencies, one reference service published as a native binary end-to-end and added to a smoke check.
+1. **NativeAOT path** (1–2 weeks): `--aot` flag, JSON source-gen codegen, AOT-warning sweep on dependencies, **one reference service** (likely `product_service` in-memory) published as a native binary end-to-end and added to a smoke check. The other five services stay on the classic emit path until a follow-up spec decides which to migrate. `--target go --aot` is rejected with an error at the CLI layer.
 2. **Investigar .NET 10 Minimal API enhanced validation** (separate spec): evaluate whether built-in validation can replace per-DTO `Validate()` emission in the C# codegen.
 3. **GUARD / VALIDATE_CHAIN instruction** (was already pending).
 4. **Hot-reload de config v2** (was already pending).
@@ -160,12 +167,16 @@ This spec is considered delivered when:
 
 - `CLAUDE.md` is updated with the changes in §5.
 - This design doc is committed to `docs/superpowers/specs/`.
-- The full regression suite (30 legacy + 6 in-memory + 14 PG = 50 tests) remains green on both targets — verified post-edit.
+- The full regression suite remains green on both targets — verified post-edit by running:
+  - **Legacy services (30 per target)**: `dotnet test` / `go test ./...` under each `bytecode/generated-{csharp,go}-{order,pricing,payment,dashboard}_service/`. Expected counts confirmed by `[Fact]` / `func Test` audit in 2026-04-27: order 11, pricing 6, payment 7, dashboard 6.
+  - **product_service in-memory (6 per target)**: same commands under `bytecode/generated-{csharp,go}-product_service/`.
+  - **product_service_pg (14 per target)**: requires Docker. Last verified 2026-04-24 (commit `40d36f1`) — 14/14 green on both sides. Skipped without Docker.
+  - **Total per target: 30 legacy + 6 in-memory + 14 PG = 50.** Confirmed against test files (`[Fact]` count in `ApiTests.cs`, `func Test*` count in `main_test.go`), not commit messages.
 - A follow-up implementation plan for the NativeAOT path (§6 item 1) exists and is approved.
 
 ## 9. Open questions for future revisits
 
 - **When to upgrade to .NET 11 LTS?** Likely once it ships GA (estimated Nov 2027 per cadence) and is the LTS line. Tracked separately.
-- **At what point does Go drop from maintenance to deleted?** Soft target: 12 months from this spec, contingent on engagement signal (PRs, issues, downloads).
+- **At what point does Go drop from maintenance to deleted?** Soft target: 2027-04-27 (12 months from this spec). Concrete trigger: zero external PRs against `generate_go*` codegen *and* no issues filed against generated Go output in that window → drop. Any engagement extends the maintenance window by another 6 months.
 - **Does C# remain the only target, or does a second target emerge?** Possible candidates if a real need shows up: WASM via wasi-experimental, or a JVM target (Kotlin) for the Spring Boot crowd. Speculative; not committed.
 - **Validation rewrite via .NET 10 Minimal APIs.** May significantly reduce codegen surface for `Validate()`. Investigated in its own spec.
