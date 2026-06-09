@@ -1,0 +1,5 @@
+# Shell scripts must keep LF line endings even when checked out on Windows.
+# Without this, core.autocrlf=true would store .sh as LF in the index but
+# write CRLF to the working tree, and a Linux CI runner reading the same
+# repo could see `bad interpreter: /usr/bin/env^M`.
+*.sh text eol=lf
