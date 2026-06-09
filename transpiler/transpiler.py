@@ -1792,7 +1792,7 @@ def _aot_json_types(bc) -> list[str]:
         types.append(s)
         types.append(f"{s}Dto")
         types.append(f"List<{s}>")
-    types += ["AiLangError", "ErrorDetail"]
+    types += ["AiLangError", "ErrorDetail", "TokenResponse"]
     return types
 
 
@@ -2238,7 +2238,7 @@ def generate_csharp(bc, output_dir: str, aot: bool = False):
     lines.append('    var token = new System.IdentityModel.Tokens.Jwt.JwtSecurityToken(')
     lines.append('        claims: [new System.Security.Claims.Claim("sub", "test-user")],')
     lines.append('        expires: DateTime.UtcNow.AddHours(1), signingCredentials: creds);')
-    lines.append('    return Results.Ok(new { token = new System.IdentityModel.Tokens.Jwt.JwtSecurityTokenHandler().WriteToken(token) });')
+    lines.append('    return Results.Ok(new TokenResponse(new System.IdentityModel.Tokens.Jwt.JwtSecurityTokenHandler().WriteToken(token)));')
     lines.append('});')
     lines.append("")
 
@@ -2275,6 +2275,13 @@ def generate_csharp(bc, output_dir: str, aot: bool = False):
     # requires a reachable Program type — the top-level Program class is internal
     # by default, so we expose it via a partial declaration.
     lines.append("public partial class Program { }")
+    lines.append("")
+
+    # Dev-token endpoint response — concrete record (not anonymous) so it can be
+    # added to the source-gen JsonSerializerContext under --aot. Always emitted
+    # to keep AOT and non-AOT output identical; wire format {"token":"..."} is
+    # unchanged from the previous anonymous-type version.
+    lines.append('public record TokenResponse([property: System.Text.Json.Serialization.JsonPropertyName("token")] string Token);')
     lines.append("")
 
     # Schemas
