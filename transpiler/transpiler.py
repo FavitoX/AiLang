@@ -1791,7 +1791,7 @@ def _build_route_params(path: str, handler_def: dict) -> tuple:
     return cs_params, new_path, typed
 
 
-def generate_csharp(bc, output_dir: str):
+def generate_csharp(bc, output_dir: str, aot: bool = False):
     """Generate a complete C# Minimal API project from bytecode."""
     os.makedirs(output_dir, exist_ok=True)
 
@@ -7208,17 +7208,27 @@ def generate_go_tests(bc, output_dir: str):
 
 def main():
     if len(sys.argv) < 2:
-        print("AILang Transpiler v0.1")
-        print("Usage: python transpiler.py <bytecode.json> [--target csharp|go|all]")
+        print("AILang Transpiler v0.2")
+        print("Usage: python transpiler.py <bytecode.json> [--target csharp|go|all] [--aot]")
+        print()
+        print("  --aot    Emit C# project with <PublishAot>true</PublishAot> and a")
+        print("           source-generated JSON context. Implies single-binary publish.")
+        print("           Rejected with --target go (Go does not support NativeAOT in this transpiler).")
         sys.exit(1)
 
     filepath = sys.argv[1]
     target = "all"
+    aot = "--aot" in sys.argv
 
     if "--target" in sys.argv:
         idx = sys.argv.index("--target")
         if idx + 1 < len(sys.argv):
             target = sys.argv[idx + 1]
+
+    if aot and target in ("go", "all"):
+        print(f"ERROR: --aot is only supported with --target csharp (got --target {target}).", file=sys.stderr)
+        print("       NativeAOT is a .NET concept; the Go codegen does not produce AOT output.", file=sys.stderr)
+        sys.exit(2)
 
     print(f"AILang Transpiler v0.2")
     print(f"  Source: {filepath}")
@@ -7254,7 +7264,7 @@ def main():
 
     if target in ('csharp', 'all'):
         output_dir = os.path.join(base_dir, f"generated-csharp-{source_stem}")
-        generate_csharp(bc, output_dir)
+        generate_csharp(bc, output_dir, aot=aot)
         generate_csharp_tests(bc, output_dir)
 
     if target in ('go', 'all'):
