@@ -2269,12 +2269,19 @@ def generate_csharp(bc, output_dir: str, aot: bool = False):
     if needs_resilience:
         pkg_refs.append('    <PackageReference Include="Microsoft.Extensions.Http.Resilience" Version="9.0.0" />')
 
+    aot_props = (
+        '    <PublishAot>true</PublishAot>\n'
+        '    <InvariantGlobalization>true</InvariantGlobalization>\n'
+        '    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>\n'
+        '    <TrimmerSingleWarn>false</TrimmerSingleWarn>\n'
+    ) if aot else ''
     csproj = (
         '<Project Sdk="Microsoft.NET.Sdk.Web">\n'
         '  <PropertyGroup>\n'
         '    <TargetFramework>net10.0</TargetFramework>\n'
         '    <Nullable>enable</Nullable>\n'
         '    <ImplicitUsings>enable</ImplicitUsings>\n'
+        + aot_props +
         '  </PropertyGroup>\n'
         '  <ItemGroup>\n'
         '    <!-- Tests/ is its own project; ASP.NET would otherwise auto-include it. -->\n'
