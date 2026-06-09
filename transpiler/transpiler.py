@@ -702,7 +702,11 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
         schema = inst['schema']
         assign = inst['assign']
         lines.append(f"{pad}{schema}Dto? {assign} = null;")
-        lines.append(f"{pad}try {{ {assign} = await ctx.Request.ReadFromJsonAsync<{schema}Dto>(); }}")
+        if ctx.get('aot'):
+            service_pascal = pascal_case(ctx['service_name'])
+            lines.append(f"{pad}try {{ {assign} = await ctx.Request.ReadFromJsonAsync({service_pascal}JsonContext.Default.{schema}Dto); }}")
+        else:
+            lines.append(f"{pad}try {{ {assign} = await ctx.Request.ReadFromJsonAsync<{schema}Dto>(); }}")
         lines.append(f"{pad}catch (System.Text.Json.JsonException _je)")
         lines.append(f"{pad}{{ return Results.BadRequest(AiLangError.InvalidBody(\"{schema}\", _je.Message)); }}")
         lines.append(f"{pad}if ({assign} is null)")
@@ -732,13 +736,17 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
     elif op in ('ERR_NOT_FOUND', 'ERR_VALIDATION', 'ERR_BUSINESS_RULE',
                 'ERR_INVALID_BODY', 'ERR_INVALID_PARAM', 'ERR_UNAUTHORIZED',
                 'ERR_UNAVAILABLE', 'ERR_TIMEOUT'):
-        lines.extend(compile_error_csharp(inst, pad))
+        lines.extend(compile_error_csharp(inst, pad, ctx))
 
     elif op == 'ERR_CUSTOM':
         err_type = inst['type']
         params = inst.get('params', {}) or {}
         custom_errors = ctx.get('custom_errors', {}) or {}
         entry = custom_errors.get(err_type)
+        type_info_arg = (
+            f", {pascal_case(ctx['service_name'])}JsonContext.Default.AiLangError"
+            if ctx.get('aot') else ""
+        )
         if entry:
             factory = err_name_to_factory(err_type)
             declared = entry.get('params', []) or []
@@ -746,10 +754,10 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
             # Pass params in the declared order so the factory signature matches.
             # Use _cs_expr so JsonNode-typed roots get indexer access (Phase 3b).
             args = [_cs_expr(params.get(p, ""), ctx) for p in declared]
-            lines.append(f'{pad}return Results.Json(AiLangError.{factory}({", ".join(args)}), statusCode: {status});')
+            lines.append(f'{pad}return Results.Json(AiLangError.{factory}({", ".join(args)}){type_info_arg}, statusCode: {status});')
         else:
             tag = err_type_tag(err_type)
-            lines.append(f'{pad}return Results.Json(AiLangError.BusinessRule("{tag}", ""), statusCode: 422);')
+            lines.append(f'{pad}return Results.Json(AiLangError.BusinessRule("{tag}", ""){type_info_arg}, statusCode: 422);')
 
     elif op == 'SAGA_COMPENSATE':
         saga = inst.get('saga', '')
@@ -808,10 +816,14 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
                 f'{pad}    {assign} = await CallServiceAsync(httpClientFactory, "{client_name}", "{method}", {path_expr}, {body_expr});'
             )
             lines.append(f'{pad}}}')
+            type_info_arg = (
+                f", {pascal_case(ctx['service_name'])}JsonContext.Default.AiLangError"
+                if ctx.get('aot') else ""
+            )
             lines.append(f'{pad}catch (Polly.Timeout.TimeoutRejectedException)')
-            lines.append(f'{pad}{{ return Results.Json(AiLangError.Timeout("{service}"), statusCode: 504); }}')
+            lines.append(f'{pad}{{ return Results.Json(AiLangError.Timeout("{service}"){type_info_arg}, statusCode: 504); }}')
             lines.append(f'{pad}catch (Polly.CircuitBreaker.BrokenCircuitException)')
-            lines.append(f'{pad}{{ return Results.Json(AiLangError.Unavailable("{service}"), statusCode: 503); }}')
+            lines.append(f'{pad}{{ return Results.Json(AiLangError.Unavailable("{service}"){type_info_arg}, statusCode: 503); }}')
         elif policy and in_fiber:
             lines.append(f'{pad}System.Text.Json.Nodes.JsonNode? {assign} = null;')
             lines.append(f'{pad}try {{ {assign} = await CallServiceAsync(httpClientFactory, "{client_name}", "{method}", {path_expr}, {body_expr}); }}')
@@ -1569,10 +1581,23 @@ def _compile_stream_respond_csharp(inst: dict, indent: int, ctx: dict) -> list[s
     return lines
 
 
-def compile_error_csharp(inst: dict, pad: str) -> list[str]:
-    """Compile error instructions to C#."""
+def compile_error_csharp(inst: dict, pad: str, ctx: dict = None) -> list[str]:
+    """Compile error instructions to C#.
+
+    AOT note: Results.Json<T>() is reflection-based and trips IL2026/IL3050
+    under PublishAot + TreatWarningsAsErrors. When ctx['aot'] is True we route
+    these through the source-gen JsonTypeInfo<AiLangError> overload. The
+    Results.NotFound / Results.BadRequest sites don't need the explicit
+    JsonTypeInfo because Minimal APIs resolves through the wired
+    ConfigureHttpJsonOptions chain (no IL warnings).
+    """
     op = inst['op']
     lines = []
+    ctx = ctx or {}
+    type_info_arg = (
+        f", {pascal_case(ctx['service_name'])}JsonContext.Default.AiLangError"
+        if ctx.get('aot') else ""
+    )
 
     if op == 'ERR_NOT_FOUND':
         id_expr = _cs_value(inst["id"])
@@ -1583,13 +1608,13 @@ def compile_error_csharp(inst: dict, pad: str) -> list[str]:
     elif op == 'ERR_VALIDATION':
         lines.append(f'{pad}return Results.BadRequest(AiLangError.Validation("{inst["field"]}", "{inst["reason"]}"));')
     elif op == 'ERR_BUSINESS_RULE':
-        lines.append(f'{pad}return Results.Json(AiLangError.BusinessRule("{inst["rule"]}", "{inst["detail"]}"), statusCode: 422);')
+        lines.append(f'{pad}return Results.Json(AiLangError.BusinessRule("{inst["rule"]}", "{inst["detail"]}"){type_info_arg}, statusCode: 422);')
     elif op == 'ERR_INVALID_BODY':
         lines.append(f'{pad}return Results.BadRequest(AiLangError.InvalidBody("{inst["schema"]}", "invalid"));')
     elif op == 'ERR_UNAUTHORIZED':
-        lines.append(f'{pad}return Results.Json(AiLangError.Unauthorized(), statusCode: 401);')
+        lines.append(f'{pad}return Results.Json(AiLangError.Unauthorized(){type_info_arg}, statusCode: 401);')
     elif op == 'ERR_UNAVAILABLE':
-        lines.append(f'{pad}return Results.Json(AiLangError.Unavailable("{inst.get("service", "")}"), statusCode: 503);')
+        lines.append(f'{pad}return Results.Json(AiLangError.Unavailable("{inst.get("service", "")}"){type_info_arg}, statusCode: 503);')
 
     return lines
 
@@ -2168,7 +2193,10 @@ def generate_csharp(bc, output_dir: str, aot: bool = False):
 
         if auth != 'PUBLIC':
             lines.append("    if (!(ctx.User.Identity?.IsAuthenticated ?? false))")
-            lines.append("        return Results.Json(AiLangError.Unauthorized(), statusCode: 401);")
+            if aot:
+                lines.append(f"        return Results.Json(AiLangError.Unauthorized(), {pascal_case(service_name)}JsonContext.Default.AiLangError, statusCode: 401);")
+            else:
+                lines.append("        return Results.Json(AiLangError.Unauthorized(), statusCode: 401);")
             lines.append("")
 
         ctx = {
@@ -2180,6 +2208,12 @@ def generate_csharp(bc, output_dir: str, aot: bool = False):
             'service_refs': service_refs,
             'resilience_policies': policies,
             'schemas': bc.schemas,  # For Phase 3b — CONSTRUCT uses field types as JsonNode-cast hints.
+            # AOT: handler-level emission switches reflection-based JSON sites
+            # (ReadFromJsonAsync<T>, Results.Json<T>) to the source-gen context
+            # overload when 'aot' is True. service_name supplies the context
+            # class prefix (<Service>JsonContext.Default.<Type>).
+            'aot': aot,
+            'service_name': service_name,
         }
         for inst in instructions:
             lines.extend(compile_instruction_csharp(inst, 1, ctx))
