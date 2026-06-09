@@ -284,19 +284,23 @@ La industria converge hacia hacer nativas las cosas que antes eran librerías (C
 
 ---
 
+## Targets
+
+- **C# (.NET 10 LTS)** — primary target. Todas las features nuevas del lenguaje aterrizan acá primero.
+- **Go (1.25)** — frozen, en mantenimiento. Bug fixes sí, features nuevas no se backportean. PRs externos bienvenidos.
+
+---
+
 ## Próximos Pasos
 
 1. **Transpilador para PostgreSQL** — generar C# con Npgsql y Go con pgx desde product_service_pg.sexpr
 2. **Convertir order/pricing/payment/dashboard a S-expressions** 
-3. **Compilador real** — de S-expressions a binario nativo (probablemente vía LLVM)
+3. **NativeAOT como modo opt-in del C# codegen** — flag `--aot`, JSON source-generation, single-binary publish. Verificado AOT-compat con Polly / Npgsql / Minimal APIs via `bytecode/probes/aot-probe/`. Reemplaza el item "runtime nativo propio".
 
 ---
 
 ## Decisiones Pendientes
 
-- Runtime: ¿nativo propio? ¿LLVM? ¿BEAM?
-- Modelo de memoria: ¿GC? ¿Ownership? ¿Híbrido?
-- Interop: ¿FFI? ¿WASM?
 - Transaccionalidad cross-service: ¿Sagas + dead letter queue?
 - GUARD/VALIDATE_CHAIN: instrucción para evitar BRANCH anidados
 - Hot-reload de config (v2)
