@@ -2,7 +2,7 @@
 
 **Date:** 2026-04-27
 **Author:** Brainstormed with Claude (AILang project)
-**Status:** Approved by user; spec review passed (round 2)
+**Status:** Approved by user; implemented in plan `docs/superpowers/plans/2026-04-27-nativeaot-path.md`
 
 ---
 
