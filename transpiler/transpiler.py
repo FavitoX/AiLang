@@ -1568,6 +1568,11 @@ def _compile_stream_respond_csharp(inst: dict, indent: int, ctx: dict) -> list[s
     stream = inst.get('stream')
     status = inst.get('status', 200)
     content_type = inst.get('content_type', 'application/x-ndjson')
+    # NOTE (NativeAOT): JsonSerializer.SerializeAsync(stream, value) is the
+    # reflection-based overload. A service using STREAM_RESPOND under --aot
+    # will trip IL2026/IL3050 at publish time. Fix when a STREAM_RESPOND
+    # service needs AOT: switch to the JsonTypeInfo<T> overload sourced from
+    # the JsonContext.
     lines = [
         f'{pad}ctx.Response.StatusCode = {status};',
         f'{pad}ctx.Response.ContentType = "{content_type}";',
@@ -1790,7 +1795,13 @@ def _aot_json_types(bc) -> list[str]:
     types: list[str] = []
     for s in schema_names:
         types.append(s)
-        types.append(f"{s}Dto")
+        # Match the `if dto_fields:` guard in generate_schema_csharp — a
+        # schema whose fields are all auto_gen does not get a {Schema}Dto
+        # record emitted, so listing it here would reference a missing type.
+        schema_def = bc.schemas.get(s) or {}
+        fields = schema_def.get('fields', {}) or {}
+        if any(not f.get('auto_gen') for f in fields.values()):
+            types.append(f"{s}Dto")
         types.append(f"List<{s}>")
     types += ["AiLangError", "ErrorDetail", "TokenResponse"]
     return types
@@ -2573,6 +2584,11 @@ def _emit_event_handler_csharp(handler_name: str, handler_def: dict, bc) -> list
     # Cast eventData to JsonNode so `event.data.X` paths resolve via Phase 3b
     # indexer access. AILang's `event.data` IS the full payload — the `.data`
     # segment is stripped by registering the root as `event.data` → `_evtData`.
+    # NOTE (NativeAOT): JsonSerializer.Serialize(eventData) where eventData is
+    # typed `object?` is reflection-based — a service using EVENT_HANDLER under
+    # --aot will trip IL2026/IL3050 at publish time. Fix when needed: dispatch
+    # on runtime type via the JsonContext's TypeInfoResolverChain instead of
+    # round-tripping object→string→JsonNode.
     lines.append('    var _evtData = System.Text.Json.Nodes.JsonNode.Parse(')
     lines.append('        System.Text.Json.JsonSerializer.Serialize(eventData));')
     ctx['locals']['_evtData'] = 'JsonNode'
