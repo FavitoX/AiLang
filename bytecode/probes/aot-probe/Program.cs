@@ -1,7 +1,9 @@
 using System.IdentityModel.Tokens.Jwt;
+using System.Net.Http;
 using System.Security.Claims;
 using System.Text;
 using AotProbe;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.IdentityModel.Tokens;
 using Npgsql;
 using Polly;
@@ -28,10 +30,45 @@ var nb = new NpgsqlConnectionStringBuilder
 };
 _ = nb.ToString();
 
+// Npgsql data source builder — this is where pool/multiplexer types instantiate
+// (mirrors transpiler PG codegen). Do not open a real connection.
+var ds = new NpgsqlDataSourceBuilder(nb.ConnectionString).Build();
+_ = ds.ConnectionString;
+
 // Minimal APIs + source-gen JSON.
 var builder = WebApplication.CreateSlimBuilder(args);
 builder.Services.ConfigureHttpJsonOptions(o =>
     o.SerializerOptions.TypeInfoResolverChain.Insert(0, AotProbeJsonContext.Default));
+
+// JWT validation path — mirrors transpiler.py JwtBearer wiring. This is where
+// JwtBearer historically surfaces AOT analyzer warnings.
+builder.Services.AddAuthentication("Bearer").AddJwtBearer("Bearer", options =>
+{
+    options.TokenValidationParameters = new TokenValidationParameters
+    {
+        ValidateIssuer = false,
+        ValidateAudience = false,
+        ValidateLifetime = false,
+        IssuerSigningKey = key
+    };
+});
+builder.Services.AddAuthorization();
+
+// HTTP resilience — mirrors transpiler.py CALL_SERVICE wiring
+// (Microsoft.Extensions.Http.Resilience + Polly strategy options).
+builder.Services.AddHttpClient("probe", c => c.BaseAddress = new Uri("http://localhost"))
+    .AddResilienceHandler("probe-pipeline", b =>
+    {
+        b.AddRetry(new Polly.Retry.RetryStrategyOptions<HttpResponseMessage>
+        {
+            MaxRetryAttempts = 1,
+            ShouldHandle = new Polly.PredicateBuilder<HttpResponseMessage>()
+                .Handle<HttpRequestException>()
+                .HandleResult(r => (int)r.StatusCode >= 500),
+        });
+        b.AddTimeout(TimeSpan.FromSeconds(1));
+    });
+
 var app = builder.Build();
 app.MapGet("/probe", () => new ProbeDto("probe", 1));
 
