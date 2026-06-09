@@ -20,6 +20,25 @@ ailang/
 └── README.md
 ```
 
+## Transpilar
+
+```bash
+# Transpilar a C# y Go
+python transpiler.py product_service.sexpr --target all
+
+# Solo C#
+python transpiler.py product_service.sexpr --target csharp
+
+# Solo Go
+python transpiler.py product_service.sexpr --target go
+
+# NativeAOT opt-in: emit csproj with <PublishAot>true</PublishAot>
+# and a source-generated JSON context. Only valid with --target csharp.
+python transpiler.py product_service.sexpr --target csharp --aot
+```
+
+The `--aot` flag is opt-in. Without it, the C# codegen emits the same project layout as before — classic JIT, reflection-based JSON, standard publish. With `--aot`, the emitted csproj enables `<PublishAot>true</PublishAot>` and a source-generated `JsonSerializerContext`; `dotnet publish -c Release -r <rid>` produces a single self-contained native binary (~5–20 MB) that boots in milliseconds.
+
 ## Cómo correr
 
 ### C# (.NET 8+)
