@@ -1754,6 +1754,23 @@ def camel_case(s: str) -> str:
     return parts[0] + ''.join(w.capitalize() for w in parts[1:])
 
 
+def _aot_json_types(bc) -> list[str]:
+    """Types the source-gen JsonSerializerContext must cover for NativeAOT.
+
+    Schemas drive the list (each schema → T, TDto, List<T>); the native error
+    model is always included so RESPOND/RESPOND_STATUS paths work without
+    reflection.
+    """
+    schema_names = sorted(bc.schemas.keys())
+    types: list[str] = []
+    for s in schema_names:
+        types.append(s)
+        types.append(f"{s}Dto")
+        types.append(f"List<{s}>")
+    types += ["AiLangError", "ErrorDetail"]
+    return types
+
+
 # ── C# Generator ──
 
 def _resolve_env_var(bc, config_key: str, fallback: str) -> str:
@@ -1845,6 +1862,16 @@ def generate_csharp(bc, output_dir: str, aot: bool = False):
         lines.append('        };')
         lines.append('    });')
         lines.append('builder.Services.AddAuthorization();')
+        lines.append('')
+
+    # AOT: wire the source-generated JsonSerializerContext into Http JSON options
+    # so Minimal API request/response (de)serialization uses the metadata graph
+    # emitted by [JsonSerializable(...)] instead of runtime reflection.
+    if aot:
+        service_pascal = pascal_case(service_name)
+        lines.append('// ── AOT: register source-gen JSON context ──')
+        lines.append('builder.Services.ConfigureHttpJsonOptions(o =>')
+        lines.append(f'    o.SerializerOptions.TypeInfoResolverChain.Insert(0, {service_pascal}JsonContext.Default));')
         lines.append('')
 
     # PostgreSQL datasource + DI
@@ -2250,6 +2277,20 @@ def generate_csharp(bc, output_dir: str, aot: bool = False):
     if uses_clock_cs:
         lines.append("")
         lines.extend(generate_clock_csharp())
+
+    # AOT: emit the source-generated JsonSerializerContext at the END of the file,
+    # AFTER every record/class it references (typeof(Product/ProductDto/...) must
+    # resolve). The class is partial so the source generator can fill in the
+    # per-type metadata at build time.
+    if aot:
+        service_pascal = pascal_case(service_name)
+        json_types = _aot_json_types(bc)
+        lines.append("")
+        lines.append("// ── AOT: source-generated JSON context ──")
+        lines.append("[System.Text.Json.Serialization.JsonSourceGenerationOptions(WriteIndented = false)]")
+        for t in json_types:
+            lines.append(f"[System.Text.Json.Serialization.JsonSerializable(typeof({t}))]")
+        lines.append(f"internal partial class {service_pascal}JsonContext : System.Text.Json.Serialization.JsonSerializerContext;")
 
     with open(os.path.join(output_dir, "Program.cs"), 'w') as f:
         f.write('\n'.join(lines))
