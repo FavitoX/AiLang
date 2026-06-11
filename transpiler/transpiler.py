@@ -660,11 +660,11 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
         assign = inst['assign']
         if ptype == 'uuid':
             lines.append(f'{pad}if (!Guid.TryParse({name}__raw, out var {assign}_tmp))')
-            lines.append(f'{pad}    return Results.BadRequest(AiLangError.InvalidParam("{name}", "uuid"));')
+            lines.append(f'{pad}    return AiLangProblems.InvalidParam("{name}", "uuid");')
             lines.append(f"{pad}var {assign} = {assign}_tmp;")
         elif ptype == 'int':
             lines.append(f'{pad}if (!int.TryParse({name}__raw, out var {assign}_tmp))')
-            lines.append(f'{pad}    return Results.BadRequest(AiLangError.InvalidParam("{name}", "int"));')
+            lines.append(f'{pad}    return AiLangProblems.InvalidParam("{name}", "int");')
             lines.append(f"{pad}var {assign} = {assign}_tmp;")
         else:
             if assign != name:
@@ -708,9 +708,9 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
         else:
             lines.append(f"{pad}try {{ {assign} = await ctx.Request.ReadFromJsonAsync<{schema}Dto>(); }}")
         lines.append(f"{pad}catch (System.Text.Json.JsonException _je)")
-        lines.append(f"{pad}{{ return Results.BadRequest(AiLangError.InvalidBody(\"{schema}\", _je.Message)); }}")
+        lines.append(f"{pad}{{ return AiLangProblems.InvalidBody(\"{schema}\", _je.Message); }}")
         lines.append(f"{pad}if ({assign} is null)")
-        lines.append(f"{pad}    return Results.BadRequest(AiLangError.InvalidBody(\"{schema}\", \"body is null\"));")
+        lines.append(f"{pad}    return AiLangProblems.InvalidBody(\"{schema}\", \"body is null\");")
         lines.append(f"{pad}{{")
         lines.append(f"{pad}    var _verr = {assign}.Validate();")
         lines.append(f"{pad}    if (_verr != null) return Results.BadRequest(_verr);")
@@ -743,21 +743,16 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
         params = inst.get('params', {}) or {}
         custom_errors = ctx.get('custom_errors', {}) or {}
         entry = custom_errors.get(err_type)
-        type_info_arg = (
-            f", {pascal_case(ctx['service_name'])}JsonContext.Default.AiLangError"
-            if ctx.get('aot') else ""
-        )
         if entry:
             factory = err_name_to_factory(err_type)
             declared = entry.get('params', []) or []
-            status = entry.get('http_status', 422)
             # Pass params in the declared order so the factory signature matches.
             # Use _cs_expr so JsonNode-typed roots get indexer access (Phase 3b).
             args = [_cs_expr(params.get(p, ""), ctx) for p in declared]
-            lines.append(f'{pad}return Results.Json(AiLangError.{factory}({", ".join(args)}){type_info_arg}, statusCode: {status});')
+            lines.append(f'{pad}return AiLangProblems.{factory}({", ".join(args)});')
         else:
             tag = err_type_tag(err_type)
-            lines.append(f'{pad}return Results.Json(AiLangError.BusinessRule("{tag}", ""){type_info_arg}, statusCode: 422);')
+            lines.append(f'{pad}return AiLangProblems.BusinessRule("{tag}", "");')
 
     elif op == 'SAGA_COMPENSATE':
         saga = inst.get('saga', '')
@@ -816,14 +811,10 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
                 f'{pad}    {assign} = await CallServiceAsync(httpClientFactory, "{client_name}", "{method}", {path_expr}, {body_expr});'
             )
             lines.append(f'{pad}}}')
-            type_info_arg = (
-                f", {pascal_case(ctx['service_name'])}JsonContext.Default.AiLangError"
-                if ctx.get('aot') else ""
-            )
             lines.append(f'{pad}catch (Polly.Timeout.TimeoutRejectedException)')
-            lines.append(f'{pad}{{ return Results.Json(AiLangError.Timeout("{service}"){type_info_arg}, statusCode: 504); }}')
+            lines.append(f'{pad}{{ return AiLangProblems.Timeout("{service}"); }}')
             lines.append(f'{pad}catch (Polly.CircuitBreaker.BrokenCircuitException)')
-            lines.append(f'{pad}{{ return Results.Json(AiLangError.Unavailable("{service}"){type_info_arg}, statusCode: 503); }}')
+            lines.append(f'{pad}{{ return AiLangProblems.Unavailable("{service}"); }}')
         elif policy and in_fiber:
             lines.append(f'{pad}System.Text.Json.Nodes.JsonNode? {assign} = null;')
             lines.append(f'{pad}try {{ {assign} = await CallServiceAsync(httpClientFactory, "{client_name}", "{method}", {path_expr}, {body_expr}); }}')
@@ -1599,27 +1590,30 @@ def compile_error_csharp(inst: dict, pad: str, ctx: dict = None) -> list[str]:
     op = inst['op']
     lines = []
     ctx = ctx or {}
-    type_info_arg = (
-        f", {pascal_case(ctx['service_name'])}JsonContext.Default.AiLangError"
-        if ctx.get('aot') else ""
-    )
 
     if op == 'ERR_NOT_FOUND':
         id_expr = _cs_value(inst["id"])
         # Convert.ToString handles both value types (Guid, int) and reference
         # types — and safely returns "" for null refs — so the member access
         # doesn't need a `?.` that would reject non-nullable value types.
-        lines.append(f'{pad}return Results.NotFound(AiLangError.NotFound("{inst["entity"]}", Convert.ToString({id_expr}) ?? ""));')
+        lines.append(f'{pad}return AiLangProblems.NotFound("{inst["entity"]}", Convert.ToString({id_expr}) ?? "");')
     elif op == 'ERR_VALIDATION':
-        lines.append(f'{pad}return Results.BadRequest(AiLangError.Validation("{inst["field"]}", "{inst["reason"]}"));')
+        # Emit a ValidationProblemDetails-shaped response so the handler-side
+        # ERR_VALIDATION matches the wire shape AddValidation() produces
+        # automatically (errors dict keyed by field).
+        lines.append(f'{pad}return Results.Problem(')
+        lines.append(f'{pad}    type: "https://ailang.dev/errors/validation",')
+        lines.append(f'{pad}    title: "Validation failed",')
+        lines.append(f'{pad}    statusCode: 400,')
+        lines.append(f'{pad}    extensions: new Dictionary<string, object?> {{ ["errors"] = new Dictionary<string, string[]> {{ ["{inst["field"]}"] = new[] {{ "{inst["reason"]}" }} }} }});')
     elif op == 'ERR_BUSINESS_RULE':
-        lines.append(f'{pad}return Results.Json(AiLangError.BusinessRule("{inst["rule"]}", "{inst["detail"]}"){type_info_arg}, statusCode: 422);')
+        lines.append(f'{pad}return AiLangProblems.BusinessRule("{inst["rule"]}", "{inst["detail"]}");')
     elif op == 'ERR_INVALID_BODY':
-        lines.append(f'{pad}return Results.BadRequest(AiLangError.InvalidBody("{inst["schema"]}", "invalid"));')
+        lines.append(f'{pad}return AiLangProblems.InvalidBody("{inst["schema"]}", "invalid");')
     elif op == 'ERR_UNAUTHORIZED':
-        lines.append(f'{pad}return Results.Json(AiLangError.Unauthorized(){type_info_arg}, statusCode: 401);')
+        lines.append(f'{pad}return AiLangProblems.Unauthorized();')
     elif op == 'ERR_UNAVAILABLE':
-        lines.append(f'{pad}return Results.Json(AiLangError.Unavailable("{inst.get("service", "")}"){type_info_arg}, statusCode: 503);')
+        lines.append(f'{pad}return AiLangProblems.Unavailable("{inst.get("service", "")}");')
 
     return lines
 
@@ -2223,10 +2217,7 @@ def generate_csharp(bc, output_dir: str, aot: bool = False):
 
         if auth != 'PUBLIC':
             lines.append("    if (!(ctx.User.Identity?.IsAuthenticated ?? false))")
-            if aot:
-                lines.append(f"        return Results.Json(AiLangError.Unauthorized(), {pascal_case(service_name)}JsonContext.Default.AiLangError, statusCode: 401);")
-            else:
-                lines.append("        return Results.Json(AiLangError.Unauthorized(), statusCode: 401);")
+            lines.append("        return AiLangProblems.Unauthorized();")
             lines.append("")
 
         ctx = {
@@ -2801,7 +2792,7 @@ def generate_service_client_csharp() -> list[str]:
         "        return System.Text.Json.Nodes.JsonNode.Parse(json);",
         "    }",
         "    // Polly-specific exceptions propagate so the caller can map them to",
-        "    // 504/503 via the AiLangError.Timeout / Unavailable factories.",
+        "    // 504/503 via the AiLangProblems.Timeout / Unavailable factories.",
         "    catch (Polly.Timeout.TimeoutRejectedException) { throw; }",
         "    catch (Polly.CircuitBreaker.BrokenCircuitException) { throw; }",
         "    catch (Exception) { return null; }  // Everything else — treat as upstream NONE.",
