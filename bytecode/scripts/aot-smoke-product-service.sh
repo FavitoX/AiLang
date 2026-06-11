@@ -80,16 +80,16 @@ if [ "$LIST" != "[]" ]; then
 fi
 echo "[smoke] GET /products/ → [] ✓"
 
-# Public GET on missing UUID — 404 with AiLangError shape
+# Public GET on missing UUID — 404 with ProblemDetails shape
 HTTP=$(curl -s -o /tmp/aot-smoke-resp -w "%{http_code}" \
     http://127.0.0.1:8080/products/00000000-0000-0000-0000-000000000000)
 if [ "$HTTP" != "404" ]; then
   echo "[smoke] FAIL: expected 404 on missing GUID, got $HTTP"
   cat /tmp/aot-smoke-resp; exit 1
 fi
-grep -q '"type":"NOT_FOUND"' /tmp/aot-smoke-resp \
-  || { echo "[smoke] FAIL: 404 body missing NOT_FOUND"; cat /tmp/aot-smoke-resp; exit 1; }
-echo "[smoke] GET /products/<missing> → 404 NOT_FOUND ✓"
+grep -q '"type":"https://ailang.dev/errors/not-found"' /tmp/aot-smoke-resp \
+  || { echo "[smoke] FAIL: 404 body missing not-found ProblemDetails type"; cat /tmp/aot-smoke-resp; exit 1; }
+echo "[smoke] GET /products/<missing> → 404 not-found ProblemDetails ✓"
 
 # Get a token and POST a product
 TOKEN=$(curl -fsS -X POST http://127.0.0.1:8080/auth/token | grep -o '"token":"[^"]*"' | cut -d'"' -f4)

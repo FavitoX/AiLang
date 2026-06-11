@@ -675,16 +675,10 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
         lines.append(f"{pad}{{ return AiLangProblems.InvalidBody(\"{schema}\", _je.Message); }}")
         lines.append(f"{pad}if ({assign} is null)")
         lines.append(f"{pad}    return AiLangProblems.InvalidBody(\"{schema}\", \"body is null\");")
-        # Run DataAnnotations + IValidatableObject via Validator.TryValidateObject.
-        # Failures aggregate into a ValidationProblemDetails (errors keyed by field).
-        lines.append(f"{pad}{{")
-        lines.append(f"{pad}    var _vErrs = new System.Collections.Generic.List<System.ComponentModel.DataAnnotations.ValidationResult>();")
-        lines.append(f"{pad}    if (!System.ComponentModel.DataAnnotations.Validator.TryValidateObject({assign}, new System.ComponentModel.DataAnnotations.ValidationContext({assign}), _vErrs, validateAllProperties: true))")
-        lines.append(f"{pad}    {{")
-        lines.append(f"{pad}        var _vDict = _vErrs.GroupBy(e => e.MemberNames.FirstOrDefault() ?? \"\").ToDictionary(g => g.Key, g => g.Select(r => r.ErrorMessage ?? \"\").ToArray());")
-        lines.append(f"{pad}        return Results.ValidationProblem(_vDict, type: \"https://ailang.dev/errors/validation\");")
-        lines.append(f"{pad}    }}")
-        lines.append(f"{pad}}}")
+        # AiLangValidator wraps Validator.TryValidateObject with the trim/AOT
+        # suppressions justified by our codegen contract (DTOs are concrete and
+        # referenced via the source-gen JsonSerializerContext).
+        lines.append(f"{pad}{{ var _vErr = AiLangValidator.Validate({assign}); if (_vErr is not null) return _vErr; }}")
         # Track as DTO so STORE_INSERT pass-through skips it. Also register
         # schema so BRANCH field-type lookups work.
         ctx.setdefault('locals', {})[assign] = schema
@@ -3199,6 +3193,26 @@ def generate_error_model_csharp(custom_errors: dict) -> list[str]:
         lines.append(f'        statusCode: {status},')
         lines.append(f'        detail: $"{msg_body}");')
         lines.append("")
+    lines.append("}")
+    lines.append("")
+
+    # ── AiLangValidator: trim-/AOT-safe wrapper around Validator.TryValidateObject ──
+    lines.append("// ── AiLangValidator: trim-/AOT-safe wrapper around Validator.TryValidateObject ──")
+    lines.append("// DTOs validated here are concrete types referenced via the source-gen")
+    lines.append("// JsonSerializerContext and DI, so the trim graph already preserves the")
+    lines.append("// metadata Validator needs.")
+    lines.append("public static class AiLangValidator")
+    lines.append("{")
+    lines.append('    [System.Diagnostics.CodeAnalysis.UnconditionalSuppressMessage("Trimming", "IL2026", Justification = "DTOs are concrete; their metadata is preserved by source-gen JsonContext.")]')
+    lines.append('    [System.Diagnostics.CodeAnalysis.UnconditionalSuppressMessage("AOT", "IL3050", Justification = "DTOs are concrete; their metadata is preserved by source-gen JsonContext.")]')
+    lines.append("    public static IResult? Validate<T>(T instance) where T : notnull")
+    lines.append("    {")
+    lines.append("        var errs = new System.Collections.Generic.List<System.ComponentModel.DataAnnotations.ValidationResult>();")
+    lines.append("        if (System.ComponentModel.DataAnnotations.Validator.TryValidateObject(instance, new System.ComponentModel.DataAnnotations.ValidationContext(instance), errs, validateAllProperties: true))")
+    lines.append("            return null;")
+    lines.append('        var dict = errs.GroupBy(e => e.MemberNames.FirstOrDefault() ?? "").ToDictionary(g => g.Key, g => g.Select(r => r.ErrorMessage ?? "").ToArray());')
+    lines.append('        return Results.ValidationProblem(dict, type: "https://ailang.dev/errors/validation");')
+    lines.append("    }")
     lines.append("}")
     lines.append("")
 
