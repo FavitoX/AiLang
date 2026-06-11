@@ -52,12 +52,22 @@ Migrado de JSON a S-expressions en v0.7 por:
 - Background workloads explícitos (no implícitos)
 
 ### Errores
+- Wire format estándar: **RFC 7807 ProblemDetails** (`application/problem+json` Content-Type) en el target C#. Go sigue con AiLangError (frozen).
+- Cada response de error C# contiene `type` (URI identificador), `title`, `status`, `traceId` (extension, inyectado por middleware) y `detail` opcional.
+- Catálogo de tipos AILang → URIs ProblemDetails (status code entre paréntesis):
+  - `NOT_FOUND` (404) → `https://ailang.dev/errors/not-found` + ext `entity`, `entityId`
+  - `VALIDATION` (400) → `https://ailang.dev/errors/validation` + ext `errors` (Dict<string, string[]>)
+  - `BUSINESS_RULE` (422) → `https://ailang.dev/errors/business-rule` + ext `rule`
+  - `UNAUTHORIZED` (401) → `https://ailang.dev/errors/unauthorized`
+  - `TIMEOUT` (504) → `https://ailang.dev/errors/timeout` + ext `service`
+  - `UNAVAILABLE` (503) → `https://ailang.dev/errors/unavailable` + ext `service`
+  - `INTERNAL` (500) → `https://ailang.dev/errors/internal`
+  - `INVALID_PARAM` (400) → `https://ailang.dev/errors/invalid-param` + ext `field`
+  - `INVALID_BODY` (400) → `https://ailang.dev/errors/invalid-body` + ext `schema`
 - RESULT types obligatorios (inspirado en Rust) — si no hacés MATCH, no compila
 - Supervisión "let it crash" (inspirado en Erlang/OTP) — fiber muere, supervisor reinicia
-- Catálogo nativo de errores con mapeo automático a HTTP status codes
-- Errores custom extensibles con `define_error`
-- Formato de error estandarizado (todos los servicios, mismo formato)
-- Propagación de errores entre servicios con contexto
+- Errores custom extensibles con `define_error`; cada uno produce su propia URI bajo `https://ailang.dev/errors/{slug}` con el `http_status` declarado en el bytecode
+- Propagación de errores entre servicios preserva el `traceId` para correlación cross-service
 
 ### Seguridad
 - Auth es OBLIGATORIO en cada handler — PUBLIC o REQUIRES, si no está no compila
@@ -112,9 +122,10 @@ Migrado de JSON a S-expressions en v0.7 por:
 - Impacto en throughput controlado (sampling, buffer async)
 
 ### Validación
-- Nivel 1: campo individual desde schema (required, min, max, gt, gte)
-- Nivel 2: cross-field (COMPARE, NOT_EQUAL, CONDITIONAL_REQUIRED, MUTUAL_EXCLUSIVE, AT_LEAST_ONE, SUM_MAX)
-- READ_BODY ejecuta TODAS las validaciones automáticamente
+- Nivel 1 (field-level): schema → DataAnnotations en el DTO C# (`[Required]`, `[StringLength]`, custom `[GreaterThan]`/`[LessThan]` para strict bounds). Validado por `Validator.TryValidateObject` en READ_BODY (envuelto en `AiLangValidator.Validate<T>` con `[UnconditionalSuppressMessage]` para AOT)
+- Nivel 2 (cross-field): especificado en CLAUDE.md (COMPARE, NOT_EQUAL, CONDITIONAL_REQUIRED, MUTUAL_EXCLUSIVE, AT_LEAST_ONE, SUM_MAX). **Codegen pendiente**: la 2026-06-10 spec lo difirió porque ningún servicio actual lo usa y requiere extender `sexpr_bytecode_parser.py`. Se implementa cuando aparezca el primer servicio que lo necesite (vía `IValidatableObject.Validate`)
+- Wire response de validación: `ValidationProblemDetails` (RFC 7807) con TODOS los errores (no first-fail-and-bail), keyed por field name
+- READ_BODY corre la validación automáticamente después del parse JSON
 
 ### Rate Limiting
 - Local por instancia (core) — cada instancia protege su capacidad
