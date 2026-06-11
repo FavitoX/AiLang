@@ -39,6 +39,8 @@ python transpiler.py product_service.sexpr --target csharp --aot
 
 The `--aot` flag is opt-in. Without it, the C# codegen emits the same project layout as before — classic JIT, reflection-based JSON, standard publish. With `--aot`, the emitted csproj enables `<PublishAot>true</PublishAot>` and a source-generated `JsonSerializerContext`; `dotnet publish -c Release -r <rid>` produces a single self-contained native binary (~5–20 MB) that boots in milliseconds.
 
+**Error responses**: AILang's generated C# services emit RFC 7807 `application/problem+json` responses for every error path. The wire shape uses URIs like `https://ailang.dev/errors/not-found` and includes a `traceId` extension for correlation with structured logs. Validation errors are collected by `Validator.TryValidateObject` (wrapped in an AOT-safe helper) and returned as `ValidationProblemDetails` — all violations in one response, keyed by field name.
+
 ## Cómo correr
 
 ### C# (.NET 8+)
