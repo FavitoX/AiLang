@@ -2374,6 +2374,7 @@ def generate_csharp(bc, output_dir: str, aot: bool = False):
         '    <TargetFramework>net10.0</TargetFramework>\n'
         '    <Nullable>enable</Nullable>\n'
         '    <ImplicitUsings>enable</ImplicitUsings>\n'
+        '    <InterceptorsNamespaces>$(InterceptorsNamespaces);Microsoft.AspNetCore.Http.Validation.Generated</InterceptorsNamespaces>\n'
         + aot_props +
         '  </PropertyGroup>\n'
         '  <ItemGroup>\n'
