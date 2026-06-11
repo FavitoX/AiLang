@@ -711,10 +711,8 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
         lines.append(f"{pad}{{ return AiLangProblems.InvalidBody(\"{schema}\", _je.Message); }}")
         lines.append(f"{pad}if ({assign} is null)")
         lines.append(f"{pad}    return AiLangProblems.InvalidBody(\"{schema}\", \"body is null\");")
-        lines.append(f"{pad}{{")
-        lines.append(f"{pad}    var _verr = {assign}.Validate();")
-        lines.append(f"{pad}    if (_verr != null) return Results.BadRequest(_verr);")
-        lines.append(f"{pad}}}")
+        # AddValidation() runs DataAnnotations validators before the handler executes;
+        # no manual Validate() call needed here.
         # Track as DTO so STORE_INSERT pass-through skips it. Also register
         # schema so BRANCH field-type lookups work.
         ctx.setdefault('locals', {})[assign] = schema
