@@ -383,8 +383,8 @@
           (assert status)
           (equals 422))
         (item
-          (assert body.error.type)
-          (equals INSUFFICIENT_STOCK)))
+          (assert body.type)
+          (equals "https://ailang.dev/errors/insufficient-stock")))
       (clean "RESET_STORE(order_store)"))
     (item
       (name create_order_product_not_found)
@@ -415,8 +415,8 @@
           (assert status)
           (equals 404))
         (item
-          (assert body.error.type)
-          (equals NOT_FOUND)))
+          (assert body.type)
+          (equals "https://ailang.dev/errors/not-found")))
       (clean "RESET_STORE(order_store)"))
     (item
       (name cancel_order_success)
@@ -477,8 +477,8 @@
           (assert status)
           (equals 422))
         (item
-          (assert body.error.type)
-          (equals ORDER_NOT_CANCELLABLE)))
+          (assert body.type)
+          (equals "https://ailang.dev/errors/order-not-cancellable")))
       (clean "RESET_STORE(order_store)"))
     (item
       (name create_order_unauthorized)
@@ -542,8 +542,8 @@
           (assert status)
           (equals 504))
         (item
-          (assert body.error.type)
-          (equals TIMEOUT)))
+          (assert body.type)
+          (equals "https://ailang.dev/errors/timeout")))
       (clean "RESET_STORE(order_store)"))
     (item
       (name create_order_circuit_breaker_open)
@@ -566,8 +566,8 @@
           (assert status)
           (equals 503))
         (item
-          (assert body.error.type)
-          (equals UNAVAILABLE)))
+          (assert body.type)
+          (equals "https://ailang.dev/errors/unavailable")))
       (clean "RESET_STORE(order_store)" "RESET_CIRCUIT(product_service_policy)"))
     (item
       (name get_order_not_found)
@@ -580,8 +580,8 @@
           (assert status)
           (equals 404))
         (item
-          (assert body.error.type)
-          (equals NOT_FOUND))))
+          (assert body.type)
+          (equals "https://ailang.dev/errors/not-found"))))
     (item
       (name list_orders_empty)
       (run

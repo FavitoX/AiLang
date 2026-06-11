@@ -507,8 +507,8 @@
           (assert status)
           (equals 422))
         (item
-          (assert body.error.type)
-          (equals COUPON_EXPIRED)))
+          (assert body.type)
+          (equals "https://ailang.dev/errors/coupon-expired")))
       (clean "RESET_STORE(coupon_store)"))
     (item
       (name coupon_wrong_customer_type)
@@ -548,6 +548,6 @@
           (assert status)
           (equals 422))
         (item
-          (assert body.error.type)
-          (equals COUPON_NOT_ELIGIBLE)))
+          (assert body.type)
+          (equals "https://ailang.dev/errors/coupon-not-eligible")))
       (clean "RESET_STORE(coupon_store)"))))

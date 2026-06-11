@@ -387,7 +387,7 @@
     (run
       (REQUEST GET "/products/00000000-0000-0000-0000-000000000000")
       (ASSERT status 404)
-      (ASSERT body.error.type "NOT_FOUND")))
+      (ASSERT body.type "https://ailang.dev/errors/not-found")))
 
   ;; ── STORE_FIND_BY: buscar por SKU ──
 
@@ -409,7 +409,7 @@
     (run
       (REQUEST GET "/products/sku/NONEXISTENT")
       (ASSERT status 404)
-      (ASSERT body.error.type "NOT_FOUND"))
+      (ASSERT body.type "https://ailang.dev/errors/not-found"))
     (clean (RESET_STORE product_store)))
 
   ;; ── STORE_FILTER: por categoría con paginación ──
@@ -484,7 +484,7 @@
       (REQUEST DELETE "/products/e0000000-0000-0000-0000-000000000001"
         (auth true))
       (ASSERT status 422)
-      (ASSERT body.error.type "BUSINESS_RULE"))
+      (ASSERT body.type "https://ailang.dev/errors/business-rule"))
     (clean (RESET_STORE product_store)))
 
   (test "delete_success"

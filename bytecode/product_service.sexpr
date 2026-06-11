@@ -157,7 +157,7 @@
     (run
       (REQUEST GET "/products/00000000-0000-0000-0000-000000000000")
       (ASSERT status 404)
-      (ASSERT body.error.type "NOT_FOUND"))
+      (ASSERT body.type "https://ailang.dev/errors/not-found"))
     (clean (RESET_STORE product_store)))
 
   (test "create_negative_price"
@@ -181,7 +181,7 @@
       (REQUEST DELETE "/products/{id}"
         (auth true))
       (ASSERT status 422)
-      (ASSERT body.error.type "BUSINESS_RULE"))
+      (ASSERT body.type "https://ailang.dev/errors/business-rule"))
     (clean (RESET_STORE product_store)))
 
   (test "unauthorized_create"

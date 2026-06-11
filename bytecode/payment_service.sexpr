@@ -456,8 +456,8 @@
           (assert status)
           (equals 422))
         (item
-          (assert body.error.type)
-          (equals FRAUD_REJECTED)))
+          (assert body.type)
+          (equals "https://ailang.dev/errors/fraud-rejected")))
       (clean "RESET_STORE(payment_store)"))
     (item
       (name payment_charge_declined)
@@ -499,8 +499,8 @@
           (assert status)
           (equals 422))
         (item
-          (assert body.error.type)
-          (equals CHARGE_DECLINED)))
+          (assert body.type)
+          (equals "https://ailang.dev/errors/charge-declined")))
       (clean "RESET_STORE(payment_store)"))
     (item
       (name payment_gateway_timeout_no_retry)
@@ -602,8 +602,8 @@
           (assert status)
           (equals 422))
         (item
-          (assert body.error.type)
-          (equals BUSINESS_RULE)))
+          (assert body.type)
+          (equals "https://ailang.dev/errors/business-rule")))
       (clean "RESET_STORE(payment_store)"))
     (item
       (name payment_unauthorized)

@@ -675,8 +675,16 @@ def compile_instruction_csharp(inst: dict, indent: int = 2, ctx: dict = None) ->
         lines.append(f"{pad}{{ return AiLangProblems.InvalidBody(\"{schema}\", _je.Message); }}")
         lines.append(f"{pad}if ({assign} is null)")
         lines.append(f"{pad}    return AiLangProblems.InvalidBody(\"{schema}\", \"body is null\");")
-        # AddValidation() runs DataAnnotations validators before the handler executes;
-        # no manual Validate() call needed here.
+        # Run DataAnnotations + IValidatableObject via Validator.TryValidateObject.
+        # Failures aggregate into a ValidationProblemDetails (errors keyed by field).
+        lines.append(f"{pad}{{")
+        lines.append(f"{pad}    var _vErrs = new System.Collections.Generic.List<System.ComponentModel.DataAnnotations.ValidationResult>();")
+        lines.append(f"{pad}    if (!System.ComponentModel.DataAnnotations.Validator.TryValidateObject({assign}, new System.ComponentModel.DataAnnotations.ValidationContext({assign}), _vErrs, validateAllProperties: true))")
+        lines.append(f"{pad}    {{")
+        lines.append(f"{pad}        var _vDict = _vErrs.GroupBy(e => e.MemberNames.FirstOrDefault() ?? \"\").ToDictionary(g => g.Key, g => g.Select(r => r.ErrorMessage ?? \"\").ToArray());")
+        lines.append(f"{pad}        return Results.ValidationProblem(_vDict, type: \"https://ailang.dev/errors/validation\");")
+        lines.append(f"{pad}    }}")
+        lines.append(f"{pad}}}")
         # Track as DTO so STORE_INSERT pass-through skips it. Also register
         # schema so BRANCH field-type lookups work.
         ctx.setdefault('locals', {})[assign] = schema
@@ -2402,8 +2410,7 @@ def generate_schema_csharp(name: str, schema_def: dict) -> list[str]:
     lines.append("}")
 
     # DTO for create/update (without auto_gen fields). DataAnnotations attributes
-    # on properties drive .NET 10 AddValidation() — the framework validates the
-    # DTO before the handler runs, so no manual Validate() method is needed.
+    # on properties are evaluated by Validator.TryValidateObject in READ_BODY.
     dto_fields = {k: v for k, v in fields.items() if not v.get('auto_gen')}
     if dto_fields:
         lines.append("")
@@ -3180,13 +3187,16 @@ def generate_error_model_csharp(custom_errors: dict) -> list[str]:
         declared = entry.get('params', []) or []
         template = entry.get('message_template', tag)
         param_camel = {p: camel_case(p) for p in declared}
-        sig_params = ", ".join(f"string {param_camel[p]}" for p in declared)
+        # `object?` mirrors the legacy AiLangError factory signature so call sites
+        # passing Guid/int/JsonNode arguments continue to compile.
+        sig_params = ", ".join(f"object? {param_camel[p]}" for p in declared)
         msg_body = template_to_csharp_interpolated(template, param_camel)
         slug = tag.lower().replace('_', '-')
+        status = entry.get('http_status', 422)
         lines.append(f'    public static IResult {factory}({sig_params}) => Results.Problem(')
         lines.append(f'        type: "https://ailang.dev/errors/{slug}",')
         lines.append(f'        title: "{tag}",')
-        lines.append(f'        statusCode: 400,')
+        lines.append(f'        statusCode: {status},')
         lines.append(f'        detail: $"{msg_body}");')
         lines.append("")
     lines.append("}")
