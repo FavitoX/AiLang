@@ -1759,7 +1759,9 @@ def _aot_json_types(bc) -> list[str]:
         if any(not f.get('auto_gen') for f in fields.values()):
             types.append(f"{s}Dto")
         types.append(f"List<{s}>")
-    types += ["AiLangError", "ErrorDetail", "TokenResponse"]
+    # ProblemDetails / ValidationProblemDetails have their own source-gen JSON
+    # context shipped by ASP.NET 10; we don't need to register them here.
+    types += ["TokenResponse"]
     return types
 
 
