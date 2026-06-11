@@ -1863,6 +1863,7 @@ def generate_csharp(bc, output_dir: str, aot: bool = False):
     lines.append("// ═══════════════════════════════════════════════════════════════")
     lines.append("")
     lines.append("using System.Collections.Concurrent;")
+    lines.append("using System.ComponentModel.DataAnnotations;")
     lines.append("using System.Text.Json;")
     lines.append("using System.Text.Json.Serialization;")
     # Polly extension methods (.AddCircuitBreaker, .AddRetry, .AddTimeout) live
@@ -2436,7 +2437,9 @@ def generate_schema_csharp(name: str, schema_def: dict) -> list[str]:
         lines.append(f"    public {modifier}{csharp_type}{nullable} {prop_name} {{ get; init; }}{default}")
     lines.append("}")
 
-    # DTO for create/update (without auto_gen fields)
+    # DTO for create/update (without auto_gen fields). DataAnnotations attributes
+    # on properties drive .NET 10 AddValidation() — the framework validates the
+    # DTO before the handler runs, so no manual Validate() method is needed.
     dto_fields = {k: v for k, v in fields.items() if not v.get('auto_gen')}
     if dto_fields:
         lines.append("")
@@ -2455,47 +2458,39 @@ def generate_schema_csharp(name: str, schema_def: dict) -> list[str]:
                 modifier = ""
                 nullable = "?" if ftype in ('string', 'list', 'object') else ""
             lines.append(f'    [JsonPropertyName("{field_name}")]')
-            lines.append(f"    public {modifier}{csharp_type}{nullable} {prop_name} {{ get; init; }}")
-
-        # Validate() — mirrors Go's (d XDto) Validate() *AiLangError. Returns null
-        # on success; ensures the READ_BODY contract ("run all schema validations")
-        # holds regardless of target language.
-        lines.append("")
-        lines.append("    public AiLangError? Validate()")
-        lines.append("    {")
-        for field_name, field_def in dto_fields.items():
-            ftype = field_def.get('type')
-            required = field_def.get('required', False)
-            prop = pascal_case(field_name)
-            if ftype == 'string' and required:
+            # DataAnnotations attributes derived from the schema (run by AddValidation()).
+            data_annotations = []
+            if required:
+                data_annotations.append("Required")
+            if ftype == 'string':
                 min_len = field_def.get('min', 0)
                 max_len = field_def.get('max', 0)
-                if min_len > 0:
-                    lines.append(f'        if (string.IsNullOrWhiteSpace({prop}) || {prop}!.Length < {min_len})')
-                    lines.append(f'            return AiLangError.Validation("{field_name}", "required, min length {min_len}");')
-                else:
-                    lines.append(f'        if ({prop} == null)')
-                    lines.append(f'            return AiLangError.Validation("{field_name}", "required");')
-                if max_len > 0:
-                    lines.append(f'        if ({prop}!.Length > {max_len})')
-                    lines.append(f'            return AiLangError.Validation("{field_name}", "max length {max_len}");')
-            if ftype in ('int', 'decimal'):
+                if min_len > 0 and max_len > 0:
+                    data_annotations.append(f"StringLength({max_len}, MinimumLength = {min_len})")
+                elif max_len > 0:
+                    data_annotations.append(f"StringLength({max_len})")
+                elif min_len > 0:
+                    data_annotations.append(f"MinLength({min_len})")
+            elif ftype in ('int', 'decimal', 'long', 'double'):
                 gt = field_def.get('gt')
                 gte = field_def.get('gte')
-                suffix = 'M' if ftype == 'decimal' else ''
+                lt = field_def.get('lt')
+                lte = field_def.get('lte')
                 if gt is not None:
-                    lines.append(f'        if ({prop} <= {gt}{suffix})')
-                    lines.append(f'            return AiLangError.Validation("{field_name}", "must be > {gt}");')
+                    data_annotations.append(f"GreaterThan({gt})")
                 if gte is not None:
-                    lines.append(f'        if ({prop} < {gte}{suffix})')
-                    lines.append(f'            return AiLangError.Validation("{field_name}", "must be >= {gte}");')
-            if ftype == 'list':
+                    data_annotations.append(f"GreaterThanOrEqual({gte})")
+                if lt is not None:
+                    data_annotations.append(f"LessThan({lt})")
+                if lte is not None:
+                    data_annotations.append(f"LessThanOrEqual({lte})")
+            elif ftype == 'list':
                 min_items = field_def.get('min_items')
-                if min_items and required:
-                    lines.append(f'        if ({prop} == null || {prop}.Count < {min_items})')
-                    lines.append(f'            return AiLangError.Validation("{field_name}", "required, min {min_items} items");')
-        lines.append("        return null;")
-        lines.append("    }")
+                if min_items:
+                    data_annotations.append(f"MinLength({min_items})")
+            if data_annotations:
+                lines.append(f"    [{', '.join(data_annotations)}]")
+            lines.append(f"    public {modifier}{csharp_type}{nullable} {prop_name} {{ get; init; }}")
         lines.append("}")
 
     return lines
