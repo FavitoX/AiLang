@@ -432,42 +432,6 @@ def sql_type_to_go(sql_type: str) -> str:
 # SCHEMA GENERATOR
 # ============================================================================
 
-def generate_validation_csharp(field_name: str, field_def: dict, var_name: str) -> list[str]:
-    """Generate C# validation code from schema constraints."""
-    lines = []
-    ftype = field_def.get('type')
-    required = field_def.get('required', False)
-    prop_name = pascal_case(field_name)
-
-    if ftype == 'string' and required:
-        min_len = field_def.get('min', 0)
-        max_len = field_def.get('max', 0)
-        if min_len > 0:
-            lines.append(f'        if (string.IsNullOrWhiteSpace({var_name}.{prop_name}) || {var_name}.{prop_name}.Length < {min_len})')
-            lines.append(f'            return Results.BadRequest(AiLangError.Validation("{field_name}", "required, min length {min_len}"));')
-        if max_len > 0:
-            lines.append(f'        if ({var_name}.{prop_name}?.Length > {max_len})')
-            lines.append(f'            return Results.BadRequest(AiLangError.Validation("{field_name}", "max length {max_len}"));')
-
-    if ftype in ('int', 'decimal'):
-        gt = field_def.get('gt')
-        gte = field_def.get('gte')
-        if gt is not None:
-            lines.append(f'        if ({var_name}.{prop_name} <= {gt}{"m" if ftype == "decimal" else ""})')
-            lines.append(f'            return Results.BadRequest(AiLangError.Validation("{field_name}", "must be > {gt}"));')
-        if gte is not None:
-            lines.append(f'        if ({var_name}.{prop_name} < {gte})')
-            lines.append(f'            return Results.BadRequest(AiLangError.Validation("{field_name}", "must be >= {gte}"));')
-
-    if ftype == 'list':
-        min_items = field_def.get('min_items')
-        if min_items and required:
-            lines.append(f'        if ({var_name}.{prop_name} == null || {var_name}.{prop_name}.Count < {min_items})')
-            lines.append(f'            return Results.BadRequest(AiLangError.Validation("{field_name}", "required, min {min_items} items"));')
-
-    return lines
-
-
 def generate_validation_go(field_name: str, field_def: dict, var_name: str) -> list[str]:
     """Generate Go validation code from schema constraints."""
     lines = []
@@ -3144,67 +3108,12 @@ def generate_store_csharp(schema: str, schema_def: dict, store_def: dict = None)
 
 
 def generate_error_model_csharp(custom_errors: dict) -> list[str]:
-    """Generate the AiLangError model for C#."""
+    """Emit AiLangProblems factories + custom validation attributes for C#.
+
+    Error responses use RFC 7807 ProblemDetails via Results.Problem(...).
+    The legacy AiLangError record was removed as part of the 2026-06-10 migration.
+    """
     lines = []
-    lines.append("// ERROR MODEL: AILang native errors")
-    lines.append("public record AiLangError")
-    lines.append("{")
-    lines.append('    [JsonPropertyName("error")]')
-    lines.append("    public ErrorDetail Error { get; init; } = new();")
-    lines.append("")
-
-    # Standard error factories
-    errors = [
-        ("NotFound", [("entity", "string"), ("id", "string")], "NOT_FOUND",
-         'new() { Type = "NOT_FOUND", Entity = entity, Id = id, Message = $"{entity} with id {id} not found" }'),
-        ("Validation", [("field", "string"), ("reason", "string")], "VALIDATION",
-         'new() { Type = "VALIDATION", Field = field, Message = $"validation failed: {field} — {reason}" }'),
-        ("BusinessRule", [("rule", "string"), ("detail", "string")], "BUSINESS_RULE",
-         'new() { Type = "BUSINESS_RULE", Rule = rule, Message = detail }'),
-        ("Unauthorized", [], "UNAUTHORIZED",
-         'new() { Type = "UNAUTHORIZED", Message = "authentication required" }'),
-        ("InvalidBody", [("schema", "string"), ("detail", "string")], "INVALID_BODY",
-         'new() { Type = "INVALID_BODY", Message = $"body does not match schema {schema}: {detail}" }'),
-        ("InvalidParam", [("name", "string"), ("expected", "string")], "INVALID_PARAM",
-         'new() { Type = "INVALID_PARAM", Field = name, Message = $"parameter {name} must be {expected}" }'),
-        ("Unavailable", [("service", "string")], "UNAVAILABLE",
-         'new() { Type = "UNAVAILABLE", Message = $"service {service} is unavailable" }'),
-        ("Timeout", [("service", "string")], "TIMEOUT",
-         'new() { Type = "TIMEOUT", Message = $"service {service} timed out" }'),
-        ("Internal", [("detail", "string")], "INTERNAL",
-         'new() { Type = "INTERNAL", Message = detail }'),
-    ]
-
-    for name, params, _, init in errors:
-        param_str = ", ".join(f"string {p}" for p, _ in params)
-        lines.append(f"    public static AiLangError {name}({param_str}) => new()")
-        lines.append(f"    {{ Error = {init} }};")
-        lines.append("")
-
-    # Custom error factories — one per definition in the bytecode.
-    for err_type, entry in (custom_errors or {}).items():
-        factory = err_name_to_factory(err_type)
-        tag = err_type_tag(err_type)
-        declared = entry.get('params', []) or []
-        template = entry.get('message_template', tag)
-        param_camel = {p: camel_case(p) for p in declared}
-        sig_params = ", ".join(f"object {param_camel[p]}" for p in declared)
-        msg_body = template_to_csharp_interpolated(template, param_camel)
-        lines.append(f"    public static AiLangError {factory}({sig_params}) => new()")
-        lines.append(f'    {{ Error = new() {{ Type = "{tag}", Message = $"{msg_body}" }} }};')
-        lines.append("")
-
-    lines.append("}")
-    lines.append("")
-    lines.append("public record ErrorDetail")
-    lines.append("{")
-    for prop in [("type", "Type"), ("message", "Message")]:
-        lines.append(f'    [JsonPropertyName("{prop[0]}")] public string {prop[1]} {{ get; init; }} = "";')
-    for prop in [("entity", "Entity"), ("id", "Id"), ("field", "Field"), ("rule", "Rule")]:
-        lines.append(f'    [JsonPropertyName("{prop[0]}")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? {prop[1]} {{ get; init; }}')
-    lines.append("}")
-    lines.append("")
-
     # ── ProblemDetails factories (RFC 7807) ──
     lines.append("// ── ProblemDetails factories (RFC 7807) ──")
     lines.append("public static class AiLangProblems")
