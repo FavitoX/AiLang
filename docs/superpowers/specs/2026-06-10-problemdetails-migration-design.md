@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-10
 **Author:** Brainstormed with Claude (AILang project)
-**Status:** Approved by user; pending spec review
+**Status:** Approved by user; implemented in plan `docs/superpowers/plans/2026-06-10-problemdetails-migration.md` (T11-T12 cross-field codegen deferred — YAGNI, no current service exercises it; requires parser extension. Tracked as roadmap follow-up.)
 
 ---
 
